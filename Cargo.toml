@@ -1,0 +1,56 @@
+[package]
+name = "httproxy"
+version = "0.1.4"
+edition = "2024"
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
+
+[profile.release]
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1
+
+[dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+axum = { version = "0.8.8", features = ["http2", "macros"] }
+futures = "0.3"
+bytes = "1.5"
+httparse = "1.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "local-time",
+    "chrono",
+] }
+anyhow = "1.0"
+clap = { version = "4.5.54", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+http = "1.0"
+http-body-util = "0.1"
+rand = "0.9.2"
+wreq = "6.0.0-rc.21"
+wreq-util = "3.0.0-rc.7"
+url = "2"
+http-body = "1.0"
+serde_json = "1.0"
+tokio-socks = "0.5.2"
+tower = "0.5.2"
+tower-http = { version = "0.6", features = ["trace"] }
+singleflight-async = "0.2.0"
+rustls = "0.23.35"
+webpki-roots = "1.0.5"
+tokio-rustls = "0.26.4"
+domain = "0.11.1"
+moka = { version = "0.12", features = ["future"] }
+subtle = "2.6"
+tokio-stream = { version = "0.1", features = ["net"] }
+pin-project-lite = "0.2.16"
+rand_distr = "0.5.1"
+jsonwebtoken = { version = "10.2.0", features = ["aws_lc_rs"] }
