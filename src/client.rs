@@ -15,6 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -96,6 +97,10 @@ async fn run_server(listen: &str, config: Arc<ProxyConfig>) -> anyhow::Result<()
     let http_client = Arc::new(
         Client::builder()
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(45))
+            .tcp_keepalive_interval(Duration::from_secs(45))
+            .pool_idle_timeout(Duration::from_secs(300))
+            .pool_max_idle_per_host(6)
             .emulation(Emulation::Chrome143)
             .build()?,
     );
