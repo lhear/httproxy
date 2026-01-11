@@ -1,3 +1,4 @@
+mod log;
 mod shaper;
 
 use anyhow::{Context, Ok, Result, anyhow};
@@ -28,69 +29,56 @@ use wreq_util::Emulation;
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    #[arg(short = 'c', long, default_value = "config.json")]
+    #[arg(short = 'c', long, default_value = "config.toml")]
     config: String,
 }
 
 #[derive(Deserialize, Debug)]
 struct Config {
-    listen: String,
-    remote: String,
-    token: String,
-    #[serde(default = "default_log_level")]
-    log_level: String,
+    client: ClientConfig,
+    auth: AuthConfig,
+    log: Option<log::LogConfig>,
     traffic_shaping: shaper::TrafficConfig,
 }
 
-struct ProxyConfig {
+#[derive(Deserialize, Debug)]
+struct ClientConfig {
+    listen: String,
+    remote: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct AuthConfig {
+    token: String,
+}
+
+struct StateConfig {
     remote: Url,
     token: String,
     traffic_config: shaper::TrafficConfig,
 }
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_content = fs::read_to_string(&cli.config)?;
-    let json_config: Config = serde_json::from_str(&config_content)?;
+    let config: Config = toml::from_str(&config_content)?;
+    let _guard = log::init_tracing(&config.log.clone().unwrap_or_default());
 
-    init_tracing(&json_config.log_level);
-    run_server(
-        &json_config.listen,
-        create_proxy_config(&json_config).await?,
-    )
-    .await
+    run_server(&config.client.listen, create_proxy_config(&config).await?).await
 }
 
-fn init_tracing(log_level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-        )
-        .with_target(false)
-        .with_timer(tracing_subscriber::fmt::time::ChronoUtc::new(
-            "%Y-%m-%dT%H:%M:%S%.6f%:z".to_string(),
-        ))
-        .init();
-}
-
-async fn create_proxy_config(json_config: &Config) -> anyhow::Result<Arc<ProxyConfig>> {
-    Ok(Arc::new(ProxyConfig {
-        remote: json_config.remote.parse().context("invalid server URL")?,
-        token: format!("Bearer {}", json_config.token),
-        traffic_config: json_config.traffic_shaping.clone(),
+async fn create_proxy_config(cfg: &Config) -> anyhow::Result<Arc<StateConfig>> {
+    Ok(Arc::new(StateConfig {
+        remote: cfg.client.remote.parse().context("invalid server URL")?,
+        token: format!("Bearer {}", cfg.auth.token),
+        traffic_config: cfg.traffic_shaping.clone(),
     }))
 }
 
-async fn run_server(listen: &str, config: Arc<ProxyConfig>) -> anyhow::Result<()> {
+async fn run_server(listen: &str, config: Arc<StateConfig>) -> anyhow::Result<()> {
     let addr: SocketAddr = listen.parse().context("invalid bind address")?;
     let listener = TcpListener::bind(addr).await?;
     let listener_stream = TcpListenerStream::new(listener);
@@ -170,7 +158,7 @@ fn resolve_target_host(method: &str, url_str: &str) -> Result<String> {
 async fn handle_connection(
     socket: TcpStream,
     http_client: Arc<Client>,
-    config: Arc<ProxyConfig>,
+    config: Arc<StateConfig>,
 ) -> Result<()> {
     socket.set_nodelay(true)?;
     let (mut read_half, mut write_half) = socket.into_split();

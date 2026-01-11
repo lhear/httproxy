@@ -1,4 +1,5 @@
 mod dns;
+mod log;
 mod shaper;
 
 use anyhow::Context;
@@ -34,18 +35,10 @@ use tracing::{Instrument, info, warn};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_dns_cache_size() -> u64 {
-    1024
-}
-
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    #[arg(short = 'c', long, default_value = "config.json")]
+    #[arg(short = 'c', long, default_value = "config.toml")]
     config: String,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -66,24 +59,28 @@ enum Commands {
 
 #[derive(Deserialize, Debug)]
 struct Config {
-    listen: String,
-    path: String,
-    secret: String,
-    socks5_proxy: Option<String>,
-    #[serde(default = "default_log_level")]
-    log_level: String,
-    dns: Option<DnsConfigJson>,
+    server: ServerConfig,
+    auth: AuthConfig,
+    proxy: Option<ProxyConfig>,
+    log: Option<log::LogConfig>,
+    dns: Option<dns::DnsConfigJson>,
     traffic_shaping: shaper::TrafficConfig,
 }
 
 #[derive(Deserialize, Debug)]
-struct DnsConfigJson {
-    upstream: String,
-    protocol: String,
-    prefer_ipv6: Option<bool>,
-    client_subnet: Option<IpAddr>,
-    #[serde(default = "default_dns_cache_size")]
-    cache_size: u64,
+struct ServerConfig {
+    listen: String,
+    path: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct AuthConfig {
+    secret: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct ProxyConfig {
+    socks5: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,7 +90,7 @@ struct Claims {
 }
 
 #[derive(Clone)]
-struct ProxyConfig {
+struct StateConfig {
     decoding_key: DecodingKey,
     socks5_proxy: Option<String>,
     dns_client: Option<Arc<dns::DnsClient>>,
@@ -131,15 +128,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config_content = fs::read_to_string(&cli.config)?;
-    let json_config: Config = serde_json::from_str(&config_content)?;
-
-    init_tracing(&json_config.log_level);
-
-    let proxy_config = create_proxy_config(&json_config).await?;
+    let config: Config = toml::from_str(&config_content)?;
+    let _guard = log::init_tracing(&config.log.clone().unwrap_or_default());
+    let proxy_config = create_proxy_config(&config).await?;
 
     run_server(
-        build_router(proxy_config, &json_config.path),
-        &json_config.listen,
+        build_router(proxy_config, &config.server.path),
+        &config.server.listen,
     )
     .await
 }
@@ -155,59 +150,31 @@ fn handle_gen_token(secret: String, user: String, exp: u64) -> anyhow::Result<()
     Ok(())
 }
 
-fn init_tracing(log_level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-        )
-        .with_target(false)
-        .with_timer(tracing_subscriber::fmt::time::ChronoUtc::new(
-            "%Y-%m-%dT%H:%M:%S%.6f%:z".to_string(),
-        ))
-        .init();
-}
-
-async fn create_proxy_config(json_config: &Config) -> anyhow::Result<Arc<ProxyConfig>> {
+async fn create_proxy_config(config: &Config) -> anyhow::Result<Arc<StateConfig>> {
     let mut dns_client = None;
     let mut client_subnet = None;
 
-    if let Some(ref dc) = json_config.dns {
-        let proto = if dc.protocol.eq_ignore_ascii_case("dot") {
-            dns::Protocol::Dot
-        } else {
-            dns::Protocol::Udp
-        };
-
-        let internal_config = dns::DnsConfig {
-            upstream: dc
-                .upstream
-                .parse()
-                .context("invalid dns upstream address")?,
-            protocol: proto,
-            tls_domain: dc
-                .upstream
-                .parse::<axum::http::uri::Authority>()
-                .map(|auth| auth.host().to_string())
-                .ok(),
-            prefer_ipv6: dc.prefer_ipv6.unwrap_or_default(),
-            cache_size: dc.cache_size,
-        };
-
-        dns_client = Some(Arc::new(dns::DnsClient::new(internal_config).await?));
+    if let Some(ref dc) = config.dns {
+        dns_client = Some(dns::init_dns(dc).await?);
         client_subnet = dc.client_subnet;
     }
 
-    Ok(Arc::new(ProxyConfig {
-        decoding_key: DecodingKey::from_secret(json_config.secret.as_bytes()),
-        socks5_proxy: json_config.socks5_proxy.clone(),
+    let mut socks5_proxy = None;
+
+    if let Some(proxy) = &config.proxy {
+        socks5_proxy = proxy.socks5.clone();
+    }
+
+    Ok(Arc::new(StateConfig {
+        decoding_key: DecodingKey::from_secret(config.auth.secret.as_bytes()),
+        socks5_proxy,
         dns_client,
         client_subnet,
-        traffic_config: json_config.traffic_shaping.clone(),
+        traffic_config: config.traffic_shaping.clone(),
     }))
 }
 
-fn build_router(config: Arc<ProxyConfig>, path: &str) -> Router {
+fn build_router(config: Arc<StateConfig>, path: &str) -> Router {
     Router::new()
         .route(path, post(tunnel_handler))
         .layer(
@@ -265,7 +232,7 @@ fn validate_jwt(headers: &HeaderMap, key: &DecodingKey) -> Result<String, AppErr
     Ok(token_data.claims.sub)
 }
 
-async fn connect_upstream(state: &ProxyConfig, host: &str, port: u16) -> Result<TcpStream, String> {
+async fn connect_upstream(state: &StateConfig, host: &str, port: u16) -> Result<TcpStream, String> {
     if let Some(ref client) = state.dns_client {
         return client
             .connect(host, port, state.client_subnet, state.socks5_proxy.clone())
@@ -284,7 +251,7 @@ async fn connect_upstream(state: &ProxyConfig, host: &str, port: u16) -> Result<
 }
 
 async fn tunnel_handler(
-    State(state): State<Arc<ProxyConfig>>,
+    State(state): State<Arc<StateConfig>>,
     headers: HeaderMap,
     Query(query): Query<TunnelQuery>,
     body: Body,

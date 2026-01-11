@@ -1,14 +1,15 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use domain::base::{
     iana::{Class, Rcode, Rtype},
     opt::{ClientSubnet, Opt},
 };
 use domain::{
     base::{Message, MessageBuilder, Name, Question, Record, Ttl},
-    rdata::{Aaaa, A},
+    rdata::{A, Aaaa},
 };
 use moka::future::Cache;
 use rand::seq::SliceRandom;
+use serde::Deserialize;
 use singleflight_async::SingleFlight;
 use std::{
     collections::HashMap,
@@ -20,14 +21,14 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    sync::{mpsc, oneshot, Mutex, Semaphore},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     task::JoinSet,
-    time::{timeout, Instant},
+    time::{Instant, timeout},
 };
 use tokio_rustls::{
-    client::TlsStream,
-    rustls::{pki_types::ServerName, RootCertStore},
     TlsConnector,
+    client::TlsStream,
+    rustls::{RootCertStore, pki_types::ServerName},
 };
 use tokio_socks::tcp::Socks5Stream;
 use tracing::{debug, error, warn};
@@ -35,6 +36,14 @@ use tracing::{debug, error, warn};
 static ROOT_CERT_STORE: OnceLock<rustls::RootCertStore> = OnceLock::new();
 
 type CacheKey = (String, u16, Option<IpAddr>);
+
+fn default_dns_cache_size() -> u64 {
+    1024
+}
+
+fn default_dns_protocol() -> String {
+    "udp".into()
+}
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -50,6 +59,17 @@ struct PendingRequest {
 }
 
 type PendingMap = Arc<Mutex<HashMap<u16, PendingRequest>>>;
+
+#[derive(Deserialize, Debug)]
+pub struct DnsConfigJson {
+    upstream: String,
+    #[serde(default = "default_dns_protocol")]
+    protocol: String,
+    prefer_ipv6: Option<bool>,
+    pub client_subnet: Option<IpAddr>,
+    #[serde(default = "default_dns_cache_size")]
+    cache_size: u64,
+}
 
 #[derive(Clone)]
 pub struct DnsConfig {
@@ -572,4 +592,30 @@ impl DnsClient {
         stream.set_nodelay(true)?;
         Ok(stream)
     }
+}
+
+pub async fn init_dns(dns_cfg: &DnsConfigJson) -> anyhow::Result<Arc<DnsClient>> {
+    let proto = if dns_cfg.protocol.eq_ignore_ascii_case("dot") {
+        Protocol::Dot
+    } else {
+        Protocol::Udp
+    };
+
+    let internal_config = DnsConfig {
+        upstream: dns_cfg
+            .upstream
+            .parse()
+            .context("invalid dns upstream address")?,
+        protocol: proto,
+        tls_domain: dns_cfg
+            .upstream
+            .parse::<axum::http::uri::Authority>()
+            .map(|auth| auth.host().to_string())
+            .ok(),
+        prefer_ipv6: dns_cfg.prefer_ipv6.unwrap_or_default(),
+        cache_size: dns_cfg.cache_size,
+    };
+
+    let dns_client = Arc::new(DnsClient::new(internal_config).await?);
+    Ok(dns_client)
 }
