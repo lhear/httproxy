@@ -14,77 +14,83 @@ Generate a secure bearer token:
 
 ### Client Configuration
 
-`config.json`:
+`config.toml`:
 
-```json
-{
-  "listen": "127.0.0.1:8080",
-  "remote": "https://your-server-domain/tunnel",
-  "token": "your-token",
-  "log_level": "info",
-  "traffic_shaping": {
-    "global": {
-      "padding_threshold": 500,
-      "padding_range": [0, 1000]
-    },
-    "stages": [
-      {
-        "count": 1,
-        "padding_threshold": 0,
-        "padding_range": [900, 1500]
-      },
-      {
-        "count_range": [2, 9],
-        "padding_threshold": 2000,
-        "padding_range": [800, 1200]
-      }
-    ]
-  }
-}
+```toml
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://your-server-domain/tunnel"
+
+[auth]
+token = "your-token"
+
+# [log]
+# file_path = "client.log"
+# level = "info"
+# max_backups = 3
+
+[traffic_shaping.global]
+padding_range = [0, 1000]
+padding_threshold = 500
+
+[[traffic_shaping.stages]]
+count = 1
+padding_range = [900, 1500]
+padding_threshold = 8000
+
+[[traffic_shaping.stages]]
+count_range = [2, 9]
+padding_range = [800, 1200]
+padding_threshold = 2000
 ```
 
 ### Server Configuration
 
-`config.json`:
+`config.toml`:
 
-```json
-{
-  "listen": "/dev/shm/httproxy.sock",
-  "path": "/tunnel",
-  "secret": "your-secret",
-  "socks5_proxy": null,
-  "log_level": "info",
-  "dns": {
-    "upstream": "8.8.8.8:853",
-    "protocol": "dot",
-    "prefer_ipv6": false,
-    "client_subnet": null,
-    "cache_size": 1024
-  },
-  "traffic_shaping": {
-    "global": {
-      "padding_threshold": 500,
-      "padding_range": [0, 1000]
-    },
-    "stages": [
-      {
-        "count": 1,
-        "padding_threshold": 0,
-        "padding_range": [900, 1500]
-      },
-      {
-        "count_range": [2, 9],
-        "padding_threshold": 2000,
-        "padding_range": [800, 1200]
-      }
-    ]
-  }
-}
+```toml
+[server]
+listen = "/dev/shm/httproxy.sock"
+path = "/tunnel"
+
+[auth]
+secret = "your-secret"
+
+# [dns]
+# cache_size = 1024
+# client_subnet = "1.2.3.4"
+# prefer_ipv6 = false
+# protocol = "dot"
+# upstream = "8.8.8.8:853"
+
+# [proxy]
+# socks5 = "127.0.0.1:1080"
+
+# [log]
+# file_path = "server.log"
+# level = "info"
+# max_backups = 3
+
+[traffic_shaping.global]
+padding_range = [0, 1000]
+padding_threshold = 500
+
+[[traffic_shaping.stages]]
+count = 1
+padding_range = [900, 1500]
+padding_threshold = 8000
+
+[[traffic_shaping.stages]]
+count_range = [2, 9]
+padding_range = [800, 1200]
+padding_threshold = 2000
 ```
 
 ## Traffic Shaping Configuration
 
 The `traffic_shaping` field allows you to configure padding for outgoing packets to obfuscate traffic patterns. It consists of a `global` configuration and an array of `stages` for more granular control.
+
+> **Constraint**: To ensure packets do not exceed protocol limits, all configurations must satisfy: `max(padding_range) + padding_threshold <= 16380`
 
 ### PaddingConfig (for `global`)
 
@@ -102,32 +108,32 @@ Each stage can override the `global` padding configuration for a specific range 
 
 **Example:**
 
-```json
-"traffic_shaping": {
-  "global": {
-    "padding_threshold": 1500,
-    "padding_range": [0, 3000]
-  },
-  "stages": [
-    {
-      "count": 1,  // For the very first packet
-      "padding_threshold": 0,
-      "padding_range": [5000, 5000] // Always add 5000 bytes of padding
-    },
-    {
-      "count_range": [2, 5], // For packets 2 through 5
-      "padding_threshold": 0,
-      "padding_range": [1500, 3000]
-    }
-  ]
-}
+```toml
+[traffic_shaping.global]
+padding_range = [0, 3000]
+padding_threshold = 1500
+
+[[traffic_shaping.stages]]
+count = 1   # For the very first packet
+padding_range = [5000, 5000]   # Always add 5000 bytes of padding
+padding_threshold = 6000
+
+[[traffic_shaping.stages]]
+count = 2   # For the very second packet
+padding_range = [1000, 5000]
+padding_threshold = 3000
+
+[[traffic_shaping.stages]]
+count_range = [3, 8]   # For packets 3 through 8
+padding_range = [1500, 3000]
+padding_threshold = 3000
 ```
 
 In this example:
-- By default, if a packet's data length is less than 1500 bytes, a random padding between 0 and 3000 bytes is added.
-- The first packet will always have 5000 bytes of padding, regardless of its data length.
-- Packets from the 2nd to the 5th will have a random padding between 1500 and 3000 bytes if their data length is below the (overridden) threshold of 0 (effectively always).
-
+- Global Behavior: By default, if a packet's data length is less than 1500 bytes, a random padding between 0 and 3000 bytes is added.
+- 1st Packet: The first packet will have exactly 5000 bytes of padding added, as its data length is almost certainly below the 6000-byte threshold.
+- 2nd Packet: The second packet will have a random padding between 1000 and 5000 bytes if its data length is below 3000 bytes.
+- 3rd to 8th Packets: These packets will have a random padding between 1500 and 3000 bytes if their data length is below 3000 bytes.
 
 To hide the proxy server behind Nginx, use the following configuration:
 

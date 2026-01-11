@@ -27,20 +27,20 @@ The compiled binaries can be found in target/release/server and target/release/c
 
 ### Configuration
 
-Both the client and server are configured via a `config.json` file. Example configurations can be found in **[CONFIGURATION.md](CONFIGURATION.md)**.
+Both the client and server are configured via a `config.toml` file. Example configurations can be found in **[CONFIGURATION.md](CONFIGURATION.md)**.
 
 ### Running
 
 #### Server
 
 ```bash
-./server -c config.json
+./server -c config.toml
 ```
 
 #### Client
 
 ```bash
-./client -c config.json
+./client -c config.toml
 ```
 
 ## License
