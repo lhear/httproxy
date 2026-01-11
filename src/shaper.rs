@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pin_project_lite::pin_project;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use rand_distr::{Distribution, Normal};
 use serde::Deserialize;
 use std::{
@@ -79,17 +79,7 @@ impl TrafficShaper<()> {
 impl<R> TrafficShaper<R> {
     pub fn new(reader: R, chunk_size: usize, config: TrafficConfig) -> Self {
         let start_cursor = (rand::rng().next_u64() as usize) & TABLE_MASK;
-
-        let max_stage_padding = config
-            .stages
-            .iter()
-            .map(|s| s.padding_range[1])
-            .max()
-            .unwrap_or(0);
-        let max_padding = config.global.padding_range[1].max(max_stage_padding);
-        let capacity = 4 + chunk_size + max_padding;
-
-        let mut frame_buffer = BytesMut::with_capacity(capacity);
+        let mut frame_buffer = BytesMut::with_capacity(chunk_size);
         frame_buffer.put_u32(0);
 
         Self {
@@ -131,10 +121,11 @@ impl<R> TrafficShaper<R> {
         };
 
         let mut rng = rand::rng();
-        use rand::Rng;
+        let max_allowed_padding = this.chunk_size.saturating_sub(4).saturating_sub(actual_len);
 
         let padding_len = if actual_len < threshold {
-            rng.random_range(range[0]..=range[1])
+            let requested_padding = rng.random_range(range[0]..=range[1]);
+            requested_padding.min(max_allowed_padding)
         } else {
             0
         };
@@ -151,16 +142,7 @@ impl<R> TrafficShaper<R> {
         *this.packet_count += 1;
 
         this.frame_buffer.clear();
-        let max_stage_padding = this
-            .config
-            .stages
-            .iter()
-            .map(|s| s.padding_range[1])
-            .max()
-            .unwrap_or(0);
-        let max_padding = this.config.global.padding_range[1].max(max_stage_padding);
-        this.frame_buffer
-            .reserve(4 + *this.chunk_size + max_padding);
+        this.frame_buffer.reserve(*this.chunk_size);
         this.frame_buffer.put_u32(0);
         *this.current_data_len = 0;
 
