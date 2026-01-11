@@ -6,7 +6,7 @@
 
 - **Chrome TLS & HTTP/2 Fingerprint Emulation**: Utilizes BoringSSL to mimic Chrome's network characteristics, making proxy traffic harder to distinguish from legitimate browser traffic.
 - **Client-Server Architecture**: Designed for deployment in a `client -> Nginx -> server` topology, allowing for flexible and robust proxy setups.
-- **Traffic Shaping**: The client and server both apply traffic shaping with randomized delays between data chunks to obfuscate network patterns.
+- **Configurable Traffic Shaping**: The client and server apply configurable traffic shaping with randomized padding between data chunks to obfuscate network patterns.
 - **Token-Based Authentication**: Secure communication between the client and the server is enforced using bearer token authentication.
 
 ## Getting Started
