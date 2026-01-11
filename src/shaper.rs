@@ -1,72 +1,174 @@
-use bytes::BufMut;
-use bytes::{Bytes, BytesMut};
-use futures::Stream;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use rand::RngCore;
-use rand::seq::SliceRandom;
 use rand_distr::{Distribution, Normal};
-use std::sync::OnceLock;
+use serde::Deserialize;
 use std::{
     pin::Pin,
+    sync::OnceLock,
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::io::{AsyncRead, ReadBuf};
-use tokio::time::{Instant, Sleep};
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    time::{Instant, Sleep},
+};
 
 static JITTER_TABLE: OnceLock<Vec<u64>> = OnceLock::new();
 const TABLE_SIZE: usize = 1024;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct PaddingConfig {
+    pub padding_threshold: usize,
+    pub padding_range: [usize; 2],
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StageConfig {
+    pub count: Option<usize>,
+    pub count_range: Option<[usize; 2]>,
+    pub padding_threshold: usize,
+    pub padding_range: [usize; 2],
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TrafficConfig {
+    pub global: PaddingConfig,
+    pub stages: Vec<StageConfig>,
+}
+
 pin_project! {
+    #[project = TrafficShaperProj]
     pub struct TrafficShaper<R> {
         #[pin]
         reader: R,
-        pending_data: BytesMut,
+        frame_buffer: BytesMut,
         chunk_size: usize,
         #[pin]
         flush_timer: Sleep,
         jitter_table: &'static [u64],
         cursor: usize,
+        config: TrafficConfig,
+        packet_count: usize,
+        current_data_len: usize,
     }
 }
 
-fn get_jitter_table(avg_latency: Duration) -> &'static [u64] {
-    return JITTER_TABLE.get_or_init(|| {
-        let mean = avg_latency.as_micros() as f64;
-        let std_dev = mean / 3.0;
-        let normal = Normal::new(mean, std_dev).unwrap();
-        let mut rng = rand::rng();
-        let upper_limit = mean * 2.0;
+impl TrafficShaper<()> {
+    pub fn decode_from_buffer(src: &mut BytesMut) -> Result<Option<Bytes>, std::io::Error> {
+        if src.len() < 4 {
+            return Ok(None);
+        }
 
-        let mut table = (0..TABLE_SIZE)
-            .map(|_| {
-                let sample = normal.sample(&mut rng);
-                sample.clamp(0.0, upper_limit) as u64
-            })
-            .collect::<Vec<_>>();
+        let header = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+        let actual_len = (header >> 16) as usize;
+        let total_len = (header & 0xFFFF) as usize;
+        let full_frame_len = 4 + total_len;
 
-        table.shuffle(&mut rng);
-        table
-    });
+        if src.len() < full_frame_len {
+            return Ok(None);
+        }
+
+        let mut frame = src.split_to(full_frame_len);
+        frame.advance(4);
+        Ok(Some(frame.split_to(actual_len).freeze()))
+    }
 }
 
 impl<R> TrafficShaper<R> {
-    pub fn new(reader: R, chunk_size: usize) -> Self {
+    pub fn new(reader: R, chunk_size: usize, config: TrafficConfig) -> Self {
         let start_cursor = (rand::rng().next_u64() as usize) & TABLE_MASK;
+
+        let max_stage_padding = config
+            .stages
+            .iter()
+            .map(|s| s.padding_range[1])
+            .max()
+            .unwrap_or(0);
+        let max_padding = config.global.padding_range[1].max(max_stage_padding);
+        let capacity = 4 + chunk_size + max_padding;
+
+        let mut frame_buffer = BytesMut::with_capacity(capacity);
+        frame_buffer.put_u32(0);
 
         Self {
             reader,
-            pending_data: BytesMut::with_capacity(chunk_size),
+            frame_buffer,
             chunk_size,
             flush_timer: tokio::time::sleep_until(Instant::now()),
+            config,
+            packet_count: 0,
             jitter_table: get_jitter_table(Duration::from_millis(5)),
             cursor: start_cursor,
+            current_data_len: 0,
         }
+    }
+
+    fn seal_and_reset(this: &mut TrafficShaperProj<'_, R>) -> Bytes {
+        let actual_len = *this.current_data_len;
+        let current_packet = *this.packet_count + 1;
+        let (threshold, range) = {
+            let mut found = (
+                this.config.global.padding_threshold,
+                this.config.global.padding_range,
+            );
+            for stage in &this.config.stages {
+                if let Some(c) = stage.count {
+                    if c == current_packet {
+                        found = (stage.padding_threshold, stage.padding_range);
+                        break;
+                    }
+                }
+                if let Some([start, end]) = stage.count_range {
+                    if current_packet >= start && current_packet <= end {
+                        found = (stage.padding_threshold, stage.padding_range);
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        let mut rng = rand::rng();
+        use rand::Rng;
+
+        let padding_len = if actual_len < threshold {
+            rng.random_range(range[0]..=range[1])
+        } else {
+            0
+        };
+
+        let total_payload_len = actual_len + padding_len;
+        let header_bytes = ((actual_len as u32) << 16) | (total_payload_len as u32);
+        this.frame_buffer[0..4].copy_from_slice(&header_bytes.to_be_bytes());
+
+        if padding_len > 0 {
+            this.frame_buffer.put_bytes(0, padding_len);
+        }
+
+        let frame = this.frame_buffer.split().freeze();
+        *this.packet_count += 1;
+
+        this.frame_buffer.clear();
+        let max_stage_padding = this
+            .config
+            .stages
+            .iter()
+            .map(|s| s.padding_range[1])
+            .max()
+            .unwrap_or(0);
+        let max_padding = this.config.global.padding_range[1].max(max_stage_padding);
+        this.frame_buffer
+            .reserve(4 + *this.chunk_size + max_padding);
+        this.frame_buffer.put_u32(0);
+        *this.current_data_len = 0;
+
+        frame
     }
 }
 
-impl<R> Stream for TrafficShaper<R>
+impl<R> tokio_stream::Stream for TrafficShaper<R>
 where
     R: AsyncRead,
 {
@@ -76,46 +178,41 @@ where
         let mut this = self.project();
 
         loop {
-            let has_data = !this.pending_data.is_empty();
-            let rem = *this.chunk_size - this.pending_data.len();
+            let current_len = *this.current_data_len;
+            let is_full = current_len >= *this.chunk_size;
+            let timer_ready = current_len > 0 && this.flush_timer.as_mut().poll(cx).is_ready();
 
-            if has_data && (rem == 0 || this.flush_timer.as_mut().poll(cx).is_ready()) {
-                let chunk = this.pending_data.split();
-                return Poll::Ready(Some(Ok(chunk.freeze())));
+            if is_full || timer_ready {
+                return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this))));
             }
 
-            this.pending_data.reserve(rem);
-
-            let dst = this.pending_data.spare_capacity_mut();
+            let dst = this.frame_buffer.spare_capacity_mut();
             let mut read_buf = ReadBuf::uninit(dst);
 
             match this.reader.as_mut().poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
-
                     if n == 0 {
-                        return if !has_data {
-                            Poll::Ready(None)
-                        } else {
-                            Poll::Ready(Some(Ok(this.pending_data.split().freeze())))
-                        };
+                        if *this.current_data_len == 0 {
+                            return Poll::Ready(None);
+                        }
+                        return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this))));
                     }
 
-                    if !has_data {
+                    if *this.current_data_len == 0 {
                         let idx = *this.cursor;
-                        let delay_micros = this.jitter_table[idx];
-                        *this.cursor = (idx + 13) & TABLE_MASK;
-
+                        let delay = this.jitter_table[idx];
+                        *this.cursor = (idx + 1) & TABLE_MASK;
                         this.flush_timer
                             .as_mut()
-                            .reset(Instant::now() + Duration::from_micros(delay_micros));
-
+                            .reset(Instant::now() + Duration::from_micros(delay));
                         let _ = this.flush_timer.as_mut().poll(cx);
                     }
 
                     unsafe {
-                        this.pending_data.advance_mut(n);
+                        this.frame_buffer.advance_mut(n);
                     }
+                    *this.current_data_len += n;
                     continue;
                 }
                 Poll::Pending => return Poll::Pending,
@@ -123,4 +220,19 @@ where
             }
         }
     }
+}
+
+fn get_jitter_table(avg_latency: Duration) -> &'static [u64] {
+    JITTER_TABLE.get_or_init(|| {
+        let mean = avg_latency.as_micros() as f64;
+        let std_dev = mean / 3.0;
+        let normal = Normal::new(mean, std_dev).unwrap();
+        let mut rng = rand::rng();
+        let mut table = (0..TABLE_SIZE)
+            .map(|_| normal.sample(&mut rng).clamp(0.0, mean * 2.0) as u64)
+            .collect::<Vec<_>>();
+        use rand::seq::SliceRandom;
+        table.shuffle(&mut rng);
+        table
+    })
 }

@@ -10,9 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use bytes::BytesMut;
 use clap::Parser;
 use jsonwebtoken::{DecodingKey, Validation};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -33,7 +33,6 @@ use tower_http::trace::TraceLayer;
 use tracing::{Instrument, info, warn};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-static PADDING_POOL: &[u8; 3000] = &[b'X'; 3000];
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -74,6 +73,7 @@ struct Config {
     #[serde(default = "default_log_level")]
     log_level: String,
     dns: Option<DnsConfigJson>,
+    traffic_shaping: shaper::TrafficConfig,
 }
 
 #[derive(Deserialize, Debug)]
@@ -98,6 +98,7 @@ struct ProxyConfig {
     socks5_proxy: Option<String>,
     dns_client: Option<Arc<dns::DnsClient>>,
     client_subnet: Option<IpAddr>,
+    traffic_config: shaper::TrafficConfig,
 }
 
 #[derive(Deserialize)]
@@ -202,6 +203,7 @@ async fn create_proxy_config(json_config: &Config) -> anyhow::Result<Arc<ProxyCo
         socks5_proxy: json_config.socks5_proxy.clone(),
         dns_client,
         client_subnet,
+        traffic_config: json_config.traffic_shaping.clone(),
     }))
 }
 
@@ -316,25 +318,27 @@ async fn tunnel_handler(
     tokio::spawn(
         async move {
             let mut body_stream = body.into_data_stream();
-            while let Some(Ok(chunk)) = body_stream.next().await {
-                if let Err(e) = upstream_write.write_all(&chunk).await {
-                    warn!("body forward write error: {}", e);
-                    return;
+            let mut buffer = BytesMut::new();
+            while let Some(chunk) = body_stream.next().await {
+                let data = chunk.context("stream error")?;
+                buffer.extend_from_slice(&data);
+                while let Some(decoded_data) =
+                    shaper::TrafficShaper::decode_from_buffer(&mut buffer)?
+                {
+                    upstream_write.write_all(&decoded_data).await?;
                 }
             }
-            let _ = upstream_write.shutdown().await;
+            upstream_write.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
         }
         .instrument(tracing::Span::current()),
     );
 
-    let padding_len = rand::rng().random_range(1500..=3000);
-    let shaper_stream = shaper::TrafficShaper::new(upstream_read, 16 * 1024);
+    let shaper_stream =
+        shaper::TrafficShaper::new(upstream_read, 16 * 1024, state.traffic_config.clone());
 
     Ok((
-        [
-            ("X-Padding", &PADDING_POOL[..padding_len]),
-            ("Cache-Control", b"no-store" as &[u8]),
-        ],
+        [("Cache-Control", b"no-store" as &[u8])],
         Body::from_stream(shaper_stream),
     ))
 }

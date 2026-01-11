@@ -6,7 +6,6 @@ use clap::Parser;
 use futures::StreamExt;
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
-use rand::Rng;
 use serde::Deserialize;
 use std::{
     fs,
@@ -28,7 +27,6 @@ use wreq::{Body, Client};
 use wreq_util::Emulation;
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-static PADDING_POOL: &[u8; 3000] = &[b'X'; 3000];
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -48,11 +46,13 @@ struct Config {
     token: String,
     #[serde(default = "default_log_level")]
     log_level: String,
+    traffic_shaping: shaper::TrafficConfig,
 }
 
 struct ProxyConfig {
     remote: Url,
     token: String,
+    traffic_config: shaper::TrafficConfig,
 }
 
 #[tokio::main]
@@ -86,6 +86,7 @@ async fn create_proxy_config(json_config: &Config) -> anyhow::Result<Arc<ProxyCo
     Ok(Arc::new(ProxyConfig {
         remote: json_config.remote.parse().context("invalid server URL")?,
         token: format!("Bearer {}", json_config.token),
+        traffic_config: json_config.traffic_shaping.clone(),
     }))
 }
 
@@ -190,9 +191,12 @@ async fn handle_connection(
 
     info!("connecting to {}", target_host);
 
-    let padding_len = rand::rng().random_range(1500..=3000);
     let request_stream_reader = AsyncReadExt::chain(std::io::Cursor::new(payload), read_half);
-    let shaper_stream = shaper::TrafficShaper::new(request_stream_reader, 16 * 1024);
+    let shaper_stream = shaper::TrafficShaper::new(
+        request_stream_reader,
+        16 * 1024,
+        config.traffic_config.clone(),
+    );
     let body_stream = shaper_stream.map(|item| item.map(Frame::data));
 
     let mut remote_url = config.remote.clone();
@@ -203,7 +207,6 @@ async fn handle_connection(
     let response = http_client
         .post(remote_url.as_str())
         .header("Authorization", &config.token)
-        .header("X-Padding", &PADDING_POOL[..padding_len])
         .body(Body::wrap(StreamBody::new(body_stream)))
         .send()
         .await
@@ -213,10 +216,14 @@ async fn handle_connection(
         return Err(anyhow!("upstream rejected: {}", response.status()));
     }
     let mut remote_stream = response.into_data_stream();
+    let mut buffer = BytesMut::new();
 
     while let Some(chunk) = remote_stream.next().await {
         let data = chunk.context("stream error")?;
-        write_half.write_all(&data).await?;
+        buffer.extend_from_slice(&data);
+        while let Some(decoded_data) = shaper::TrafficShaper::decode_from_buffer(&mut buffer)? {
+            write_half.write_all(&decoded_data).await?;
+        }
     }
     write_half.shutdown().await?;
 
