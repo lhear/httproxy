@@ -21,7 +21,25 @@ Generate a secure bearer token:
   "listen": "127.0.0.1:8080",
   "remote": "https://your-server-domain/tunnel",
   "token": "your-token",
-  "log_level": "info"
+  "log_level": "info",
+  "traffic_shaping": {
+    "global": {
+      "padding_threshold": 500,
+      "padding_range": [0, 1000]
+    },
+    "stages": [
+      {
+        "count": 1,
+        "padding_threshold": 0,
+        "padding_range": [900, 1500]
+      },
+      {
+        "count_range": [2, 9],
+        "padding_threshold": 2000,
+        "padding_range": [800, 1200]
+      }
+    ]
+  }
 }
 ```
 
@@ -42,11 +60,74 @@ Generate a secure bearer token:
     "prefer_ipv6": false,
     "client_subnet": null,
     "cache_size": 1024
+  },
+  "traffic_shaping": {
+    "global": {
+      "padding_threshold": 500,
+      "padding_range": [0, 1000]
+    },
+    "stages": [
+      {
+        "count": 1,
+        "padding_threshold": 0,
+        "padding_range": [900, 1500]
+      },
+      {
+        "count_range": [2, 9],
+        "padding_threshold": 2000,
+        "padding_range": [800, 1200]
+      }
+    ]
   }
 }
 ```
 
-## Nginx Reverse Proxy
+## Traffic Shaping Configuration
+
+The `traffic_shaping` field allows you to configure padding for outgoing packets to obfuscate traffic patterns. It consists of a `global` configuration and an array of `stages` for more granular control.
+
+### PaddingConfig (for `global`)
+
+- `padding_threshold`: (usize) If the actual data length of a packet is below this threshold, padding will be applied.
+- `padding_range`: ([usize; 2]) A tuple specifying the minimum and maximum random padding length to add when padding is applied. For example, `[0, 3000]` means padding will be a random length between 0 and 3000 bytes.
+
+### StageConfig (for `stages` array)
+
+Each stage can override the `global` padding configuration for a specific range of packets.
+
+- `count`: (Option<usize>) Applies the stage configuration to a specific packet count (1-indexed). If `count_range` is also specified, `count` takes precedence.
+- `count_range`: (Option<[usize; 2]>) Applies the stage configuration to a range of packet counts. For example, `[2, 5]` applies to the 2nd, 3rd, 4th, and 5th packets.
+- `padding_threshold`: (usize) Override for the global `padding_threshold` for this stage.
+- `padding_range`: ([usize; 2]) Override for the global `padding_range` for this stage.
+
+**Example:**
+
+```json
+"traffic_shaping": {
+  "global": {
+    "padding_threshold": 1500,
+    "padding_range": [0, 3000]
+  },
+  "stages": [
+    {
+      "count": 1,  // For the very first packet
+      "padding_threshold": 0,
+      "padding_range": [5000, 5000] // Always add 5000 bytes of padding
+    },
+    {
+      "count_range": [2, 5], // For packets 2 through 5
+      "padding_threshold": 0,
+      "padding_range": [1500, 3000]
+    }
+  ]
+}
+```
+
+In this example:
+- By default, if a packet's data length is less than 1500 bytes, a random padding between 0 and 3000 bytes is added.
+- The first packet will always have 5000 bytes of padding, regardless of its data length.
+- Packets from the 2nd to the 5th will have a random padding between 1500 and 3000 bytes if their data length is below the (overridden) threshold of 0 (effectively always).
+
 
 To hide the proxy server behind Nginx, use the following configuration:
 
