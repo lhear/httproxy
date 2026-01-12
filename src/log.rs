@@ -57,7 +57,7 @@ pub fn init_tracing(log_cfg: &LogConfig) -> Option<WorkerGuard> {
             .with_ansi(false)
             .with_target(false)
             .with_timer(tracing_subscriber::fmt::time::ChronoUtc::new(
-                "%Y-%m-%dT%H:%M:%S%.6f".to_string(),
+                "%Y-%m-%dT%H:%M:%S%.6fZ".to_string(),
             ))
             .boxed();
 
@@ -72,7 +72,7 @@ pub fn init_tracing(log_cfg: &LogConfig) -> Option<WorkerGuard> {
             .with_ansi(true)
             .with_target(false)
             .with_timer(tracing_subscriber::fmt::time::ChronoUtc::new(
-                "%Y-%m-%dT%H:%M:%S%.6f".to_string(),
+                "%Y-%m-%dT%H:%M:%S%.6fZ".to_string(),
             ))
             .boxed();
         (layer, None)
