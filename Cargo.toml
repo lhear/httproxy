@@ -34,7 +34,7 @@ moka = {version = "0.12", features = ["future"]}
 pin-project-lite = "0.2.16"
 rand = "0.9.2"
 rand_distr = "0.5.1"
-rustls = "0.23.35"
+rustls = "0.23.36"
 serde = {version = "1.0", features = ["derive"]}
 singleflight-async = "0.2.0"
 tokio = {version = "1.49.0", features = ["full"]}
@@ -53,5 +53,5 @@ tracing-subscriber = {version = "0.3", features = [
 ]}
 url = "2"
 webpki-roots = "1.0.5"
-wreq = "6.0.0-rc.21"
-wreq-util = "3.0.0-rc.7"
+wreq = "6.0.0-rc.26"
+wreq-util = "3.0.0-rc.9"
