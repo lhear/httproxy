@@ -175,18 +175,19 @@ async fn create_proxy_config(config: &Config) -> anyhow::Result<Arc<StateConfig>
 }
 
 fn build_router(config: Arc<StateConfig>, path: &str) -> Router {
+    use tracing::field::Empty;
     Router::new()
         .route(path, post(tunnel_handler))
         .layer(
             ServiceBuilder::new().layer(TraceLayer::new_for_http().make_span_with(
                 |req: &axum::http::Request<Body>| {
                     let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-                    let addr = req
+                    let client = req
                         .headers()
                         .get("X-Forwarded-For")
                         .and_then(|h| h.to_str().ok())
                         .unwrap_or("-");
-                    tracing::info_span!("", id, addr, user = tracing::field::Empty)
+                    tracing::error_span!("session", id, client, user = Empty, target = Empty)
                 },
             )),
         )
@@ -257,6 +258,7 @@ async fn tunnel_handler(
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
     tracing::Span::current().record("user", &validate_jwt(&headers, &state.decoding_key)?);
+    tracing::Span::current().record("target", &query.target);
 
     let auth = query
         .target
@@ -268,7 +270,7 @@ async fn tunnel_handler(
         .port_u16()
         .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "port required".into()))?;
 
-    info!("connecting to {}", query.target);
+    info!("connecting");
 
     let upstream_conn = tokio::time::timeout(
         Duration::from_secs(10),

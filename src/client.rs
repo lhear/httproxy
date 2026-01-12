@@ -5,6 +5,7 @@ use anyhow::{Context, Ok, Result, anyhow};
 use bytes::{Buf, BytesMut};
 use clap::Parser;
 use futures::StreamExt;
+use http::uri::Authority;
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use serde::Deserialize;
@@ -22,7 +23,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tokio_stream::wrappers::TcpListenerStream;
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, error_span, info, warn};
 use url::Url;
 use wreq::{Body, Client};
 use wreq_util::Emulation;
@@ -60,6 +61,7 @@ struct StateConfig {
     token: String,
     traffic_config: shaper::TrafficConfig,
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -93,34 +95,45 @@ async fn run_server(listen: &str, config: Arc<StateConfig>) -> anyhow::Result<()
             .emulation(Emulation::Chrome143)
             .build()?,
     );
-
-    info!("listening on {}", addr);
+    info!(listen = %addr, "server started");
 
     listener_stream
-        .for_each_concurrent(1000, |res| {
-            let http_client = Arc::clone(&http_client);
-            let config = Arc::clone(&config);
-
+        .filter_map(|res| async move { res.ok() })
+        .for_each_concurrent(1000, |socket| {
+            let (http_client, config) = (Arc::clone(&http_client), Arc::clone(&config));
+            let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+            let client = socket
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "-".into());
             async move {
-                if let std::result::Result::Ok(socket) = res {
-                    let addr = socket
-                        .peer_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "-".to_string());
-                    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-                    let span = tracing::info_span!("", id, addr);
-                    async move {
-                        if let Err(e) = handle_connection(socket, http_client, config).await {
-                            warn!("connection error: {}", e.root_cause());
-                        }
+                if let Err(e) = handle_connection(socket, http_client, config).await {
+                    if !is_silent_error(e.root_cause()) {
+                        warn!(reason = %e, "connection aborted");
                     }
-                    .instrument(span)
-                    .await;
                 }
             }
+            .instrument(error_span!(
+                "session",
+                id,
+                client,
+                target = tracing::field::Empty
+            ))
         })
         .await;
     Ok(())
+}
+
+fn is_silent_error(root: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind::*;
+    if let Some(e) = root.downcast_ref::<h2::Error>() {
+        return e.is_reset() || e.is_library();
+    }
+    if let Some(e) = root.downcast_ref::<std::io::Error>() {
+        return matches!(e.kind(), ConnectionReset | UnexpectedEof | NotConnected);
+    }
+    root.to_string()
+        .contains("connection closed during header parsing")
 }
 
 async fn parse_proxy_request(
@@ -145,14 +158,22 @@ async fn parse_proxy_request(
 }
 
 fn resolve_target_host(method: &str, url_str: &str) -> Result<String> {
-    if method == "CONNECT" {
-        Ok(url_str.to_string())
+    let auth_str = if method == "CONNECT" {
+        url_str.to_string()
     } else {
         let url = Url::parse(url_str).context("invalid proxy URL")?;
         let host = url.host_str().context("URL has no host")?;
-        let port = url.port_or_known_default().unwrap_or(80);
-        Ok(format!("{}:{}", host, port))
-    }
+        let port = url.port_or_known_default().context("port required")?;
+        format!("{}:{}", host, port)
+    };
+    let auth = auth_str
+        .parse::<Authority>()
+        .map_err(|_| anyhow!("invalid target format: {}", auth_str))?;
+    let host = auth.host();
+    let port = auth
+        .port_u16()
+        .ok_or_else(|| anyhow!("port required for target: {}", auth_str))?;
+    Ok(format!("{}:{}", host, port))
 }
 
 async fn handle_connection(
@@ -165,49 +186,47 @@ async fn handle_connection(
 
     let (payload, target_host) = {
         let mut buffer = BytesMut::with_capacity(8192);
-        let (method, header_size, url_str) =
-            parse_proxy_request(&mut read_half, &mut buffer).await?;
+        let (method, len, url) = parse_proxy_request(&mut read_half, &mut buffer).await?;
         if method == "CONNECT" {
-            buffer.advance(header_size);
+            buffer.advance(len);
             write_half
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
         }
-        let target_host = resolve_target_host(&method, &url_str)?;
-        (buffer.split().freeze(), target_host)
-    };
+        let target = resolve_target_host(&method, &url)?;
+        tracing::Span::current().record("target", target.as_str());
+        Ok((buffer.split().freeze(), target))
+    }?;
 
-    info!("connecting to {}", target_host);
+    info!("connecting");
 
-    let request_stream_reader = AsyncReadExt::chain(std::io::Cursor::new(payload), read_half);
-    let shaper_stream = shaper::TrafficShaper::new(
-        request_stream_reader,
-        16 * 1024,
-        config.traffic_config.clone(),
-    );
-    let body_stream = shaper_stream.map(|item| item.map(Frame::data));
+    let response = {
+        let mut url = config.remote.clone();
+        url.query_pairs_mut().append_pair("target", &target_host);
 
-    let mut remote_url = config.remote.clone();
-    remote_url
-        .query_pairs_mut()
-        .append_pair("target", &target_host);
+        let reader = AsyncReadExt::chain(std::io::Cursor::new(payload), read_half);
+        let body_stream =
+            shaper::TrafficShaper::new(reader, 16 * 1024, config.traffic_config.clone())
+                .map(|item| item.map(Frame::data));
 
-    let response = http_client
-        .post(remote_url.as_str())
-        .header("Authorization", &config.token)
-        .body(Body::wrap(StreamBody::new(body_stream)))
-        .send()
-        .await
-        .context("upstream request failed")?;
+        http_client
+            .post(url.as_str())
+            .header("Authorization", &config.token)
+            .body(Body::wrap(StreamBody::new(body_stream)))
+            .send()
+            .await
+            .context("http post failed")
+    }?;
 
     if !response.status().is_success() {
-        return Err(anyhow!("upstream rejected: {}", response.status()));
+        return Err(anyhow!("upstream rejected status: {}", response.status()));
     }
+
     let mut remote_stream = response.into_data_stream();
     let mut buffer = BytesMut::new();
 
     while let Some(chunk) = remote_stream.next().await {
-        let data = chunk.context("stream error")?;
+        let data = chunk.context("stream read error")?;
         buffer.extend_from_slice(&data);
         while let Some(decoded_data) = shaper::TrafficShaper::decode_from_buffer(&mut buffer)? {
             write_half.write_all(&decoded_data).await?;

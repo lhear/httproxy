@@ -47,6 +47,10 @@ pub fn init_tracing(log_cfg: &LogConfig) -> Option<WorkerGuard> {
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
         let layer = fmt::layer()
+            .json()
+            .with_span_list(false)
+            .with_current_span(true)
+            .flatten_event(true)
             .with_writer(non_blocking)
             .with_ansi(false)
             .with_target(false)
@@ -58,6 +62,10 @@ pub fn init_tracing(log_cfg: &LogConfig) -> Option<WorkerGuard> {
         (layer, Some(guard))
     } else {
         let layer = fmt::layer()
+            .json()
+            .with_span_list(false)
+            .with_current_span(true)
+            .flatten_event(true)
             .with_writer(std::io::stdout)
             .with_ansi(true)
             .with_target(false)
