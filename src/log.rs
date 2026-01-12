@@ -44,7 +44,9 @@ pub fn init_tracing(log_cfg: &LogConfig) -> Option<WorkerGuard> {
             .build(directory)
             .expect("failed to initialize rolling log file");
 
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(1024)
+            .finish(file_appender);
 
         let layer = fmt::layer()
             .json()
