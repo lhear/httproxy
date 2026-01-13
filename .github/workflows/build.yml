@@ -12,7 +12,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
   build-linux-musl:
+    needs: lint-audit
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -33,6 +42,7 @@ jobs:
             target/${{ matrix.target }}/release/server
 
   build-windows:
+    needs: lint-audit
     runs-on: windows-latest
     strategy:
       matrix:
@@ -58,6 +68,7 @@ jobs:
             target/${{ matrix.target }}/release/server.exe
 
   build-darwin-arm64:
+    needs: lint-audit
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +85,7 @@ jobs:
             target/aarch64-apple-darwin/release/server
 
   build-android:
+    needs: lint-audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +113,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Generate Full License Bundle
+        run: |
+          cargo install cargo-bundle-licenses
+          cargo bundle-licenses --format yaml --output THIRD-PARTY-LICENSES.txt
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -110,7 +126,7 @@ jobs:
           mkdir dist
           for dir in artifacts/*/; do
             name=$(basename "$dir")
-            zip -j "dist/${name}.zip" "$dir"/* CONFIGURATION.md README.md LICENSE || true
+            zip -j "dist/${name}.zip" "$dir"/* CONFIGURATION.md README.md LICENSE THIRD-PARTY-LICENSES.txt || true
           done
       - name: Upload Release
         uses: softprops/action-gh-release@v2
