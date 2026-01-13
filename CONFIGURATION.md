@@ -6,20 +6,30 @@
 
 ## Token Generation
 
-Generate a secure bearer token:
+Generate a secure bearer token. **The secret used here must match the `secret` in your server configuration.**
 
 ```bash
-./server gen-token -h
+./server gen-token --secret <SECRET_KEY> --user <USERNAME> --exp <UNIX_TIMESTAMP>
 ```
 
-### Client Configuration
+### Arguments
+* `--secret` / `-s`: Secret key string used for signing.
+* `--user` / `-u`: Username or subject identifier.
+* `--exp` / `-e`: Expiration timestamp in Unix seconds.
+
+### Examples
+```bash
+./server gen-token --secret "my_secret_key" --user "admin" --exp 1768281600
+```
+
+## Client Configuration
 
 `config.toml`:
 
 ```toml
 [client]
 listen = "127.0.0.1:8080"
-remote = "https://your-server-domain/tunnel"
+remote = "https://your-server-domain/YOUR_SECRET_PATH"
 
 [auth]
 token = "your-token"
@@ -44,17 +54,17 @@ padding_range = [800, 1200]
 padding_threshold = 2000
 ```
 
-### Server Configuration
+## Server Configuration
 
 `config.toml`:
 
 ```toml
 [server]
 listen = "/dev/shm/httproxy.sock"
-path = "/tunnel"
+path = "/YOUR_SECRET_PATH"
 
 [auth]
-secret = "your-secret"
+secret = "my_secret_key"
 
 # [dns]
 # cache_size = 1024
@@ -95,16 +105,14 @@ The `traffic_shaping` field allows you to configure padding for outgoing packets
 ### PaddingConfig (for `global`)
 
 - `padding_threshold`: (usize) If the actual data length of a packet is below this threshold, padding will be applied.
-- `padding_range`: ([usize; 2]) A tuple specifying the minimum and maximum random padding length to add when padding is applied. For example, `[0, 3000]` means padding will be a random length between 0 and 3000 bytes.
+- `padding_range`: ([usize; 2]) A tuple specifying the minimum and maximum random padding length to add when padding is applied.
 
 ### StageConfig (for `stages` array)
 
 Each stage can override the `global` padding configuration for a specific range of packets.
 
-- `count`: (Option<usize>) Applies the stage configuration to a specific packet count (1-indexed). If `count_range` is also specified, `count` takes precedence.
-- `count_range`: (Option<[usize; 2]>) Applies the stage configuration to a range of packet counts. For example, `[2, 5]` applies to the 2nd, 3rd, 4th, and 5th packets.
-- `padding_threshold`: (usize) Override for the global `padding_threshold` for this stage.
-- `padding_range`: ([usize; 2]) Override for the global `padding_range` for this stage.
+- `count`: (Option<usize>) Applies the stage configuration to a specific packet count (1-indexed).
+- `count_range`: (Option<[usize; 2]>) Applies the stage configuration to a range of packet counts.
 
 **Example:**
 
@@ -114,26 +122,28 @@ padding_range = [0, 3000]
 padding_threshold = 1500
 
 [[traffic_shaping.stages]]
-count = 1   # For the very first packet
-padding_range = [5000, 5000]   # Always add 5000 bytes of padding
+count = 1
+padding_range = [5000, 5000]
 padding_threshold = 6000
 
 [[traffic_shaping.stages]]
-count = 2   # For the very second packet
+count = 2
 padding_range = [1000, 5000]
 padding_threshold = 3000
 
 [[traffic_shaping.stages]]
-count_range = [3, 8]   # For packets 3 through 8
+count_range = [3, 8]
 padding_range = [1500, 3000]
 padding_threshold = 3000
 ```
 
-In this example:
-- Global Behavior: By default, if a packet's data length is less than 1500 bytes, a random padding between 0 and 3000 bytes is added.
-- 1st Packet: The first packet will have exactly 5000 bytes of padding added, as its data length is almost certainly below the 6000-byte threshold.
-- 2nd Packet: The second packet will have a random padding between 1000 and 5000 bytes if its data length is below 3000 bytes.
-- 3rd to 8th Packets: These packets will have a random padding between 1500 and 3000 bytes if their data length is below 3000 bytes.
+**In this example:**
+- **Global Behavior**: By default, if a packet's data length is less than 1500 bytes, a random padding between 0 and 3000 bytes is added.
+- **1st Packet**: The first packet will have exactly 5000 bytes of padding added, as its data length is almost certainly below the 6000-byte threshold.
+- **2nd Packet**: The second packet will have a random padding between 1000 and 5000 bytes if its data length is below 3000 bytes.
+- **3rd to 8th Packets**: These packets will have a random padding between 1500 and 3000 bytes if their data length is below 3000 bytes.
+
+## Nginx Configuration
 
 To hide the proxy server behind Nginx, use the following configuration:
 
@@ -150,7 +160,7 @@ server {
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
     ssl_prefer_server_ciphers off;
 
-    location ^~ /tunnel {
+    location ^~ /YOUR_SECRET_PATH {
         access_log off;
         proxy_pass http://httproxy_backend;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
