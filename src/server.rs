@@ -14,6 +14,7 @@ use axum::{
 use bytes::BytesMut;
 use clap::Parser;
 use jsonwebtoken::{DecodingKey, Validation};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -34,6 +35,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{Instrument, info, warn};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+static PADDING_POOL: [u8; 62] = [b'X'; 62];
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -305,9 +307,13 @@ async fn tunnel_handler(
 
     let shaper_stream =
         shaper::TrafficShaper::new(upstream_read, 16 * 1024, state.traffic_config.clone());
+    let padding_len = rand::rng().random_range(30..=PADDING_POOL.len());
 
     Ok((
-        [("Cache-Control", b"no-store" as &[u8])],
+        [
+            ("Cache-Control", b"no-store" as &[u8]),
+            ("X-Padding", &PADDING_POOL[..padding_len]),
+        ],
         Body::from_stream(shaper_stream),
     ))
 }

@@ -8,6 +8,7 @@ use futures::StreamExt;
 use http::uri::Authority;
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
+use rand::Rng;
 use serde::Deserialize;
 use std::{
     fs,
@@ -29,6 +30,7 @@ use wreq::{Body, Client};
 use wreq_util::Emulation;
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+static PADDING_POOL: [u8; 32] = [b'X'; 32];
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -203,15 +205,16 @@ async fn handle_connection(
     let response = {
         let mut url = config.remote.clone();
         url.query_pairs_mut().append_pair("target", &target_host);
-
         let reader = AsyncReadExt::chain(std::io::Cursor::new(payload), read_half);
         let body_stream =
             shaper::TrafficShaper::new(reader, 16 * 1024, config.traffic_config.clone())
                 .map(|item| item.map(Frame::data));
+        let padding_len = rand::rng().random_range(16..PADDING_POOL.len());
 
         http_client
             .post(url.as_str())
             .header("Authorization", &config.token)
+            .header("X-Padding", &PADDING_POOL[..padding_len])
             .body(Body::wrap(StreamBody::new(body_stream)))
             .send()
             .await
