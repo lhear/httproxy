@@ -2,7 +2,7 @@
 edition = "2024"
 license = "MPL-2.0"
 name = "httproxy"
-version = "0.1.10"
+version = "0.1.11"
 
 [[bin]]
 name = "server"
