@@ -65,7 +65,7 @@ struct Config {
     auth: AuthConfig,
     proxy: Option<ProxyConfig>,
     log: Option<log::LogConfig>,
-    dns: Option<dns::DnsConfigJson>,
+    dns: Option<dns::DnsConfig>,
     traffic_shaping: shaper::TrafficConfig,
 }
 
@@ -130,9 +130,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config_content = fs::read_to_string(&cli.config)?;
-    let config: Config = toml::from_str(&config_content)?;
+    let mut config: Config = toml::from_str(&config_content)?;
     let _guard = log::init_tracing(&config.log.clone().unwrap_or_default());
-    let proxy_config = create_proxy_config(&config).await?;
+    let proxy_config = create_proxy_config(&mut config).await?;
 
     run_server(
         build_router(proxy_config, &config.server.path),
@@ -152,13 +152,13 @@ fn handle_gen_token(secret: String, user: String, exp: u64) -> anyhow::Result<()
     Ok(())
 }
 
-async fn create_proxy_config(config: &Config) -> anyhow::Result<Arc<StateConfig>> {
+async fn create_proxy_config(config: &mut Config) -> anyhow::Result<Arc<StateConfig>> {
     let mut dns_client = None;
     let mut client_subnet = None;
 
-    if let Some(ref dc) = config.dns {
+    if let Some(ref mut dc) = config.dns {
         dns_client = Some(dns::init_dns(dc).await?);
-        client_subnet = dc.client_subnet;
+        client_subnet = dc.options.client_subnet;
     }
 
     let mut socks5_proxy = None;

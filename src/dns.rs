@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, anyhow};
-use domain::base::{
-    iana::{Class, Rcode, Rtype},
-    opt::{ClientSubnet, Opt},
-};
 use domain::{
-    base::{Message, MessageBuilder, Name, Question, Record, Ttl},
+    base::{
+        Message, MessageBuilder, Name, Question, Record, Ttl,
+        iana::{Class, Rcode, Rtype},
+        opt::{ClientSubnet, Opt},
+    },
     rdata::{A, Aaaa},
 };
 use moka::future::Cache;
@@ -15,7 +15,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU16, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -37,12 +40,12 @@ static ROOT_CERT_STORE: OnceLock<rustls::RootCertStore> = OnceLock::new();
 
 type CacheKey = (String, u16, Option<IpAddr>);
 
-fn default_dns_cache_size() -> u64 {
-    1024
-}
-
-fn default_dns_protocol() -> String {
-    "udp".into()
+fn deserialize_upstream<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse().map_err(serde::de::Error::custom)
 }
 
 #[derive(Clone)]
@@ -50,6 +53,7 @@ struct CacheEntry {
     ips: Vec<IpAddr>,
     created_at: Instant,
     ttl: Duration,
+    is_refreshing: Arc<AtomicBool>,
 }
 
 type SharedDnsResult = Result<(Vec<IpAddr>, Duration), Arc<anyhow::Error>>;
@@ -60,27 +64,50 @@ struct PendingRequest {
 
 type PendingMap = Arc<Mutex<HashMap<u16, PendingRequest>>>;
 
-#[derive(Deserialize, Debug)]
-pub struct DnsConfigJson {
-    upstream: String,
-    #[serde(default = "default_dns_protocol")]
-    protocol: String,
-    prefer_ipv6: Option<bool>,
-    pub client_subnet: Option<IpAddr>,
-    #[serde(default = "default_dns_cache_size")]
-    cache_size: u64,
+#[derive(Clone, Deserialize, Debug)]
+pub struct DnsConfig {
+    #[serde(deserialize_with = "deserialize_upstream")]
+    pub upstream: SocketAddr,
+    pub tls_domain: Option<String>,
+    #[serde(flatten, default)]
+    pub options: DnsOptions,
 }
 
-#[derive(Clone)]
-pub struct DnsConfig {
-    pub upstream: SocketAddr,
+#[derive(Clone, Deserialize, Debug)]
+#[serde(default)]
+pub struct DnsOptions {
+    #[serde(rename = "protocol")]
     pub protocol: Protocol,
-    pub tls_domain: Option<String>,
     pub prefer_ipv6: bool,
     pub cache_size: u64,
+    pub client_subnet: Option<IpAddr>,
+    pub min_ttl: u64,
+    pub max_ttl: u64,
+    pub swr_ttl: u64,
+    pub empty_ttl: u64,
+    pub happy_eyeballs_delay_ms: u64,
+    pub max_concurrent_queries: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+impl Default for DnsOptions {
+    fn default() -> Self {
+        Self {
+            protocol: Protocol::Udp,
+            prefer_ipv6: false,
+            cache_size: 1024,
+            client_subnet: None,
+            min_ttl: 30,
+            max_ttl: 3600,
+            swr_ttl: 3600,
+            empty_ttl: 300,
+            happy_eyeballs_delay_ms: 250,
+            max_concurrent_queries: 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Udp,
     Dot,
@@ -116,7 +143,7 @@ impl UdpTransport {
                     }
                     Err(e) => {
                         error!("UDP recv error: {}", e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                 }
             }
@@ -248,7 +275,7 @@ impl DotTransport {
         connector: &TlsConnector,
         server_name: ServerName<'static>,
     ) -> Result<TlsStream<TcpStream>> {
-        let stream = timeout(Duration::from_secs(3), TcpStream::connect(upstream)).await??;
+        let stream = timeout(Duration::from_secs(5), TcpStream::connect(upstream)).await??;
         stream.set_nodelay(true)?;
         let tls_stream = connector.connect(server_name, stream).await?;
         Ok(tls_stream)
@@ -261,7 +288,7 @@ impl DotTransport {
             return Err(anyhow!("DoT actor closed"));
         }
 
-        match timeout(Duration::from_secs(4), rx).await {
+        match timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => Err(anyhow!("DoT response channel closed")),
             Err(_) => Err(anyhow!("DoT query timeout")),
@@ -278,88 +305,131 @@ pub struct DnsClient {
     semaphore: Arc<Semaphore>,
     udp_transport: Option<UdpTransport>,
     dot_transport: Option<DotTransport>,
+    next_id: AtomicU16,
 }
 
 impl DnsClient {
-    pub async fn new(config: DnsConfig) -> Result<Self> {
-        let (udp_transport, dot_transport) = match config.protocol {
-            Protocol::Udp => {
-                let transport = UdpTransport::new(config.upstream).await?;
-                (Some(transport), None)
-            }
-            Protocol::Dot => {
-                let root_store = ROOT_CERT_STORE.get_or_init(|| {
-                    RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-                });
-                let client_config = rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store.clone())
-                    .with_no_client_auth();
-
-                let domain_str = config
-                    .tls_domain
-                    .clone()
-                    .unwrap_or_else(|| "cloudflare-dns.com".to_string());
-                let server_name = ServerName::try_from(domain_str)?.to_owned();
-                let connector = TlsConnector::from(Arc::new(client_config));
-
-                let transport = DotTransport::new(config.upstream, connector, server_name);
-                (None, Some(transport))
-            }
+    pub async fn new(config: &DnsConfig) -> Result<Self> {
+        let (udp_transport, dot_transport) = match config.options.protocol {
+            Protocol::Udp => (Some(UdpTransport::new(config.upstream).await?), None),
+            Protocol::Dot => (None, Some(Self::init_dot_transport(config).await?)),
         };
 
         Ok(Self {
             config: config.clone(),
             cache: Cache::builder()
-                .max_capacity(config.cache_size)
-                .time_to_live(Duration::from_secs(3600))
+                .max_capacity(config.options.cache_size)
+                .time_to_live(Duration::from_secs(
+                    config.options.max_ttl + config.options.swr_ttl,
+                ))
                 .build(),
             single_flight: SingleFlight::new(),
-            semaphore: Arc::new(Semaphore::new(1024)),
+            semaphore: Arc::new(Semaphore::new(config.options.max_concurrent_queries)),
             udp_transport,
             dot_transport,
+            next_id: 0.into(),
         })
     }
 
+    async fn init_dot_transport(config: &DnsConfig) -> Result<DotTransport> {
+        let domain = config
+            .tls_domain
+            .as_deref()
+            .context("DoT requires a TLS domain")?;
+
+        let server_name = ServerName::try_from(domain)
+            .map_err(|_| anyhow!("invalid TLS domain: {domain}"))?
+            .to_owned();
+
+        let root_store = ROOT_CERT_STORE.get_or_init(|| {
+            RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        });
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store.clone())
+            .with_no_client_auth();
+
+        Ok(DotTransport::new(
+            config.upstream,
+            TlsConnector::from(Arc::new(client_config)),
+            server_name,
+        ))
+    }
+
     pub async fn lookup(
-        &self,
+        self: &Arc<Self>,
         domain: &str,
         rtype: Rtype,
         ecs: Option<IpAddr>,
     ) -> Result<Vec<IpAddr>> {
         let key = (domain.to_string(), rtype.to_int(), ecs);
-
         if let Some(entry) = self.cache.get(&key).await {
-            if entry.created_at.elapsed() < entry.ttl {
-                debug!("cache hit for {} {:?}", domain, rtype);
+            let elapsed = entry.created_at.elapsed();
+            if elapsed < entry.ttl {
+                debug!("cache hit: {} {:?}, ips: {:?}", domain, rtype, entry.ips);
                 return Ok(entry.ips);
             }
-            self.cache.invalidate(&key).await;
-        }
+            if elapsed < entry.ttl + Duration::from_secs(self.config.options.swr_ttl) {
+                if entry
+                    .is_refreshing
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let self_clone = self.clone();
+                    let key_clone = key.clone();
+                    let domain_clone = domain.to_string();
+                    let refreshing_flag = entry.is_refreshing.clone();
 
-        let result = self
-            .single_flight
+                    tokio::spawn(async move {
+                        debug!("background refresh triggered: {} {:?}", domain_clone, rtype);
+                        let _ = self_clone
+                            .single_flight
+                            .work(key_clone.clone(), || async {
+                                self_clone
+                                    .query_upstream_and_cache(&domain_clone, rtype, ecs, key_clone)
+                                    .await
+                            })
+                            .await;
+                        refreshing_flag.store(false, Ordering::Release);
+                    });
+                }
+                debug!("stale hit: {} {:?}, ips: {:?}", domain, rtype, entry.ips);
+                return Ok(entry.ips);
+            }
+        }
+        self.single_flight
             .work(key.clone(), || async {
-                self.query_upstream(domain, rtype, ecs)
-                    .await
-                    .map_err(Arc::new)
+                self.query_upstream_and_cache(domain, rtype, ecs, key).await
             })
-            .await;
+            .await
+            .map(|(ips, _)| ips)
+            .map_err(|e| anyhow!("DNS resolution error: {}", e))
+    }
 
-        let (ips, ttl) = result.map_err(|e| anyhow!("DNS resolution error: {}", e))?;
-
-        if !ips.is_empty() {
-            self.cache
-                .insert(
-                    key,
-                    CacheEntry {
-                        ips: ips.clone(),
-                        created_at: Instant::now(),
-                        ttl,
-                    },
-                )
-                .await;
-        }
-        Ok(ips)
+    async fn query_upstream_and_cache(
+        &self,
+        domain: &str,
+        rtype: Rtype,
+        ecs: Option<IpAddr>,
+        key: CacheKey,
+    ) -> SharedDnsResult {
+        let (ips, ttl) = self
+            .query_upstream(domain, rtype, ecs)
+            .await
+            .map_err(Arc::new)?;
+        let effective_ttl = if ips.is_empty() {
+            Duration::from_secs(self.config.options.empty_ttl)
+        } else {
+            ttl
+        };
+        let entry = CacheEntry {
+            ips: ips.clone(),
+            created_at: Instant::now(),
+            ttl: effective_ttl,
+            is_refreshing: Arc::new(AtomicBool::new(false)),
+        };
+        self.cache.insert(key, entry).await;
+        Ok((ips, effective_ttl))
     }
 
     async fn query_upstream(
@@ -369,15 +439,13 @@ impl DnsClient {
         ecs: Option<IpAddr>,
     ) -> Result<(Vec<IpAddr>, Duration)> {
         let _permit = self.semaphore.acquire().await?;
-        let request_id: u16 = rand::random();
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let query_bytes = self.build_query(domain, rtype, ecs, request_id)?;
 
-        let response_bytes = if let Some(ref udp) = self.udp_transport {
-            udp.send(&query_bytes, request_id).await?
-        } else if let Some(ref dot) = self.dot_transport {
-            dot.send(&query_bytes, request_id).await?
-        } else {
-            return Err(anyhow!("no transport configured"));
+        let response_bytes = match (&self.udp_transport, &self.dot_transport) {
+            (Some(udp), _) => udp.send(&query_bytes, request_id).await?,
+            (_, Some(dot)) => dot.send(&query_bytes, request_id).await?,
+            _ => return Err(anyhow!("no transport configured")),
         };
 
         self.parse_response(&response_bytes, request_id, rtype)
@@ -427,44 +495,50 @@ impl DnsClient {
         if msg.header().id() != request_id {
             return Err(anyhow!("DNS ID mismatch"));
         }
-        if msg.header().rcode() != Rcode::NOERROR {
-            return Err(anyhow!("DNS Rcode Error: {}", msg.header().rcode()));
+        let rcode = msg.header().rcode();
+        if rcode != Rcode::NOERROR {
+            if rcode == Rcode::NXDOMAIN {
+                return Ok((
+                    Vec::new(),
+                    Duration::from_secs(self.config.options.empty_ttl),
+                ));
+            }
+            return Err(anyhow!("DNS Rcode Error: {}", rcode));
         }
 
         let mut ips = Vec::new();
         let mut min_ttl_secs = u32::MAX;
-        let mut found_records = false;
 
         if let Ok(section) = msg.answer() {
-            for record in section.flatten() {
-                if record.rtype() == qtype {
-                    found_records = true;
-                    min_ttl_secs = min_ttl_secs.min(record.ttl().as_secs());
-                    match qtype {
-                        Rtype::A => {
-                            if let Ok(Some(rec)) = record.into_record::<A>() {
-                                ips.push(IpAddr::V4(rec.data().addr()));
-                            }
-                        }
-                        Rtype::AAAA => {
-                            if let Ok(Some(rec)) = record.into_record::<Aaaa>() {
-                                ips.push(IpAddr::V6(rec.data().addr()));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+            for record in section.flatten().filter(|r| r.rtype() == qtype) {
+                min_ttl_secs = min_ttl_secs.min(record.ttl().as_secs());
+                ips.extend(match qtype {
+                    Rtype::A => record
+                        .into_record::<A>()
+                        .ok()
+                        .and_then(|r| r.map(|inner| IpAddr::V4(inner.data().addr()))),
+                    Rtype::AAAA => record
+                        .into_record::<Aaaa>()
+                        .ok()
+                        .and_then(|r| r.map(|inner| IpAddr::V6(inner.data().addr()))),
+                    _ => None,
+                });
             }
         }
-        if !found_records || ips.is_empty() {
-            return Err(anyhow!("no records found"));
-        }
-        let effective_ttl = Duration::from_secs(min_ttl_secs.max(30).min(3600) as u64);
+        let effective_ttl = if ips.is_empty() {
+            Duration::from_secs(self.config.options.empty_ttl)
+        } else {
+            Duration::from_secs(
+                (min_ttl_secs as u64)
+                    .max(self.config.options.min_ttl)
+                    .min(self.config.options.max_ttl),
+            )
+        };
         Ok((ips, effective_ttl))
     }
 
     pub async fn connect(
-        &self,
+        self: &Arc<Self>,
         host: &str,
         port: u16,
         ecs: Option<IpAddr>,
@@ -501,7 +575,7 @@ impl DnsClient {
 
     fn interleave_ips(&self, v4: Vec<IpAddr>, v6: Vec<IpAddr>) -> Vec<IpAddr> {
         let mut result = Vec::with_capacity(v4.len() + v6.len());
-        let (mut primary, mut secondary) = if self.config.prefer_ipv6 {
+        let (mut primary, mut secondary) = if self.config.options.prefer_ipv6 {
             (v6.into_iter(), v4.into_iter())
         } else {
             (v4.into_iter(), v6.into_iter())
@@ -537,7 +611,7 @@ impl DnsClient {
             let p = proxy.clone();
             join_set.spawn(Self::connect_single(first_ip, port, (*p).clone()));
         }
-        let delay = Duration::from_millis(250);
+        let delay = Duration::from_millis(self.config.options.happy_eyeballs_delay_ms);
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         let mut all_started = false;
@@ -575,7 +649,7 @@ impl DnsClient {
         socks5_proxy: Option<String>,
     ) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
         let target_addr = SocketAddr::new(ip, port);
-        let connect_timeout = Duration::from_secs(3);
+        let connect_timeout = Duration::from_secs(10);
 
         let stream = match socks5_proxy {
             Some(proxy_url) => {
@@ -594,28 +668,10 @@ impl DnsClient {
     }
 }
 
-pub async fn init_dns(dns_cfg: &DnsConfigJson) -> anyhow::Result<Arc<DnsClient>> {
-    let proto = if dns_cfg.protocol.eq_ignore_ascii_case("dot") {
-        Protocol::Dot
-    } else {
-        Protocol::Udp
-    };
-
-    let internal_config = DnsConfig {
-        upstream: dns_cfg
-            .upstream
-            .parse()
-            .context("invalid dns upstream address")?,
-        protocol: proto,
-        tls_domain: dns_cfg
-            .upstream
-            .parse::<axum::http::uri::Authority>()
-            .map(|auth| auth.host().to_string())
-            .ok(),
-        prefer_ipv6: dns_cfg.prefer_ipv6.unwrap_or_default(),
-        cache_size: dns_cfg.cache_size,
-    };
-
-    let dns_client = Arc::new(DnsClient::new(internal_config).await?);
+pub async fn init_dns(config: &mut DnsConfig) -> Result<Arc<DnsClient>> {
+    if config.options.protocol == Protocol::Dot && config.tls_domain.is_none() {
+        config.tls_domain = Some(config.upstream.ip().to_string());
+    }
+    let dns_client = Arc::new(DnsClient::new(config).await?);
     Ok(dns_client)
 }
