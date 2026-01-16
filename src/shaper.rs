@@ -38,6 +38,12 @@ pub struct TrafficConfig {
     pub stages: Vec<StageConfig>,
 }
 
+struct FlattenedStage {
+    end_at: usize,
+    threshold: usize,
+    range: [usize; 2],
+}
+
 pin_project! {
     #[project = TrafficShaperProj]
     pub struct TrafficShaper<R> {
@@ -52,6 +58,9 @@ pin_project! {
         config: TrafficConfig,
         packet_count: usize,
         current_data_len: usize,
+        stages_cache: Vec<FlattenedStage>,
+        current_stage_idx: usize,
+        max_data_allowed: usize,
     }
 }
 
@@ -82,6 +91,22 @@ impl<R> TrafficShaper<R> {
         let mut frame_buffer = BytesMut::with_capacity(chunk_size);
         frame_buffer.put_u32(0);
 
+        let mut stages_cache: Vec<FlattenedStage> = config
+            .stages
+            .iter()
+            .map(|s| {
+                let end_at = s
+                    .count
+                    .unwrap_or_else(|| s.count_range.map(|[_, b]| b).unwrap_or(0));
+                FlattenedStage {
+                    end_at,
+                    threshold: s.padding_threshold,
+                    range: s.padding_range,
+                }
+            })
+            .collect();
+        stages_cache.sort_by_key(|s| s.end_at);
+
         Self {
             reader,
             frame_buffer,
@@ -92,40 +117,41 @@ impl<R> TrafficShaper<R> {
             jitter_table: get_jitter_table(Duration::from_millis(5)),
             cursor: start_cursor,
             current_data_len: 0,
+            stages_cache,
+            current_stage_idx: 0,
+            max_data_allowed: chunk_size.saturating_sub(4),
         }
     }
 
     fn seal_and_reset(this: &mut TrafficShaperProj<'_, R>) -> Bytes {
         let actual_len = *this.current_data_len;
         let current_packet = *this.packet_count + 1;
-        let (threshold, range) = {
-            let mut found = (
+        if *this.current_stage_idx < this.stages_cache.len()
+            && current_packet > this.stages_cache[*this.current_stage_idx].end_at
+        {
+            *this.current_stage_idx += 1;
+        }
+
+        let (threshold, range) = if let Some(s) = this.stages_cache.get(*this.current_stage_idx) {
+            if current_packet <= s.end_at {
+                (s.threshold, s.range)
+            } else {
+                (
+                    this.config.global.padding_threshold,
+                    this.config.global.padding_range,
+                )
+            }
+        } else {
+            (
                 this.config.global.padding_threshold,
                 this.config.global.padding_range,
-            );
-            for stage in &this.config.stages {
-                if let Some(c) = stage.count {
-                    if c == current_packet {
-                        found = (stage.padding_threshold, stage.padding_range);
-                        break;
-                    }
-                }
-                if let Some([start, end]) = stage.count_range {
-                    if current_packet >= start && current_packet <= end {
-                        found = (stage.padding_threshold, stage.padding_range);
-                        break;
-                    }
-                }
-            }
-            found
+            )
         };
 
-        let mut rng = rand::rng();
-        let max_allowed_padding = this.chunk_size.saturating_sub(4).saturating_sub(actual_len);
-
         let padding_len = if actual_len < threshold {
-            let requested_padding = rng.random_range(range[0]..=range[1]);
-            requested_padding.min(max_allowed_padding)
+            rand::rng()
+                .random_range(range[0]..=range[1])
+                .min(this.chunk_size.saturating_sub(4 + actual_len))
         } else {
             0
         };
@@ -161,15 +187,16 @@ where
 
         loop {
             let current_len = *this.current_data_len;
-            let is_full = current_len >= *this.chunk_size;
-            let timer_ready = current_len > 0 && this.flush_timer.as_mut().poll(cx).is_ready();
+            let is_full = current_len == *this.max_data_allowed;
 
-            if is_full || timer_ready {
+            if is_full || (current_len > 0 && this.flush_timer.as_mut().poll(cx).is_ready()) {
                 return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this))));
             }
 
+            let remaining_space = this.max_data_allowed.saturating_sub(current_len);
             let dst = this.frame_buffer.spare_capacity_mut();
-            let mut read_buf = ReadBuf::uninit(dst);
+            let read_limit = remaining_space.min(dst.len());
+            let mut read_buf = ReadBuf::uninit(&mut dst[..read_limit]);
 
             match this.reader.as_mut().poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
@@ -181,7 +208,7 @@ where
                         return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this))));
                     }
 
-                    if *this.current_data_len == 0 {
+                    if *this.current_data_len == 0 && n < *this.max_data_allowed {
                         let idx = *this.cursor;
                         let delay = this.jitter_table[idx];
                         *this.cursor = (idx + 1) & TABLE_MASK;
