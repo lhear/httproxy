@@ -95,7 +95,7 @@ jobs:
         run: cargo install cargo-ndk
       - name: Build
         run: |
-          cargo ndk --target aarch64-linux-android --platform 21 build --release
+          cargo ndk --target aarch64-linux-android --platform 28 build --release
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
