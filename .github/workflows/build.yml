@@ -1,15 +1,14 @@
-name: Cross-Build
+name: build
 
 on:
   push:
-    branches: [ main ]
-    tags:
-      - 'v*'
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   lint-audit:
@@ -20,116 +19,245 @@ jobs:
         with:
           command: check licenses
 
-  build-linux-musl:
+  linux-gnu:
     needs: lint-audit
+    name: Build Linux (GNU)
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64-unknown-linux-musl]
+        include:
+          - target: x86_64
+            target_triple: x86_64-unknown-linux-gnu
+            apt_packages: ""
+            custom_env: {}
+          - target: arm64
+            target_triple: aarch64-unknown-linux-gnu
+            apt_packages: crossbuild-essential-arm64
+            custom_env:
+              CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
+              CC: aarch64-linux-gnu-gcc
+              CXX: aarch64-linux-gnu-g++
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-g++
+              RUSTC_LINKER: aarch64-linux-gnu-g++
     steps:
       - uses: actions/checkout@v4
-      - name: Install Cross
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target_triple }}
+      - name: Install base dependencies
         run: |
-          curl -L https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
-      - name: Build with Cross
-        run: cross build --release --target ${{ matrix.target }}
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake perl pkg-config libclang-dev
+      - name: Install target dependencies
+        if: ${{ matrix.apt_packages != '' }}
+        run: sudo apt-get install -y ${{ matrix.apt_packages }}
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target_triple }}
+      - name: Build
+        env: ${{ matrix.custom_env }}
+        run: cargo build --release --target ${{ matrix.target_triple }}
+      - name: Archive
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target_triple }}/release/client dist/
+          cp target/${{ matrix.target_triple }}/release/server dist/
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: httproxy-linux-musl-${{ matrix.target == 'aarch64-unknown-linux-musl' && 'arm64' || 'x86_64' }}
-          path: |
-            target/${{ matrix.target }}/release/client
-            target/${{ matrix.target }}/release/server
+          name: httproxy-linux-${{ matrix.target }}
+          path: dist/
 
-  build-windows:
+  linux-musl:
     needs: lint-audit
+    name: Build Linux (musl)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            target_triple: x86_64-unknown-linux-musl
+            package: x86_64-linux-musl-cross
+            custom_env:
+              CC: x86_64-linux-musl-gcc
+              CXX: x86_64-linux-musl-g++
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-g++
+              RUSTC_LINKER: x86_64-linux-musl-g++
+          - target: arm64
+            target_triple: aarch64-unknown-linux-musl
+            package: aarch64-linux-musl-cross
+            custom_env:
+              CC: aarch64-linux-musl-gcc
+              CXX: aarch64-linux-musl-g++
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-g++
+              RUSTC_LINKER: aarch64-linux-musl-g++
+              BINDGEN_EXTRA_CLANG_ARGS: "--sysroot=/opt/aarch64-linux-musl-cross/aarch64-linux-musl"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target_triple }}
+      - name: Install base dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake perl pkg-config libclang-dev musl-tools
+      - name: Prepare musl cross-compiler
+        run: |
+          wget https://github.com/musl-cc/musl.cc/releases/latest/download/${{ matrix.package }}.tgz
+          tar xzf ${{ matrix.package }}.tgz -C /opt
+          echo "/opt/${{ matrix.package }}/bin/" >> $GITHUB_PATH
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target_triple }}
+      - name: Build
+        env: ${{ matrix.custom_env }}
+        run: cargo build --release --target ${{ matrix.target_triple }}
+      - name: Archive
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target_triple }}/release/client dist/
+          cp target/${{ matrix.target_triple }}/release/server dist/
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: httproxy-linux-${{ matrix.target }}-musl
+          path: dist/
+
+  windows:
+    needs: lint-audit
+    name: Build Windows
     runs-on: windows-latest
     strategy:
       matrix:
         include:
-          - target: x86_64-pc-windows-msvc
-            arch: x86_64
-          - target: aarch64-pc-windows-msvc
-            arch: arm64
+          - target: x86_64
+            target_triple: x86_64-pc-windows-msvc
+          - target: arm64
+            target_triple: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Rust
-        run: rustup target add ${{ matrix.target }}
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: swatinem/rust-cache@v2
         with:
-          name: httproxy-windows-${{ matrix.arch }}
-          path: |
-            target/${{ matrix.target }}/release/client.exe
-            target/${{ matrix.target }}/release/server.exe
-
-  build-darwin-arm64:
-    needs: lint-audit
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        run: rustup target add aarch64-apple-darwin
+          key: ${{ matrix.target_triple }}
+      - name: Install dependencies
+        run: choco install cmake strawberryperl pkgconfiglite llvm nasm -y
+        shell: cmd
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: httproxy-darwin-arm64
-          path: |
-            target/aarch64-apple-darwin/release/client
-            target/aarch64-apple-darwin/release/server
-
-  build-android:
-    needs: lint-audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        run: rustup target add aarch64-linux-android
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk
-      - name: Build
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
-          cargo ndk --target aarch64-linux-android --platform 28 build --release
+          rustup target add ${{ matrix.target_triple }}
+          cargo build --release --target ${{ matrix.target_triple }}
+      - name: Archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target\${{ matrix.target_triple }}\release\client.exe" -Destination dist\
+          Copy-Item "target\${{ matrix.target_triple }}\release\server.exe" -Destination dist\
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: httproxy-android-arm64
-          path: |
-            target/aarch64-linux-android/release/client
-            target/aarch64-linux-android/release/server
+          name: httproxy-windows-${{ matrix.target }}
+          path: dist/
+
+  darwin:
+    needs: lint-audit
+    name: Build Darwin
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            target_triple: x86_64-apple-darwin
+          - target: arm64
+            target_triple: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target_triple }}
+      - name: Install dependencies
+        run: brew install llvm
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target_triple }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target_triple }}
+      - name: Archive
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target_triple }}/release/client dist/
+          cp target/${{ matrix.target_triple }}/release/server dist/
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: httproxy-darwin-${{ matrix.target }}
+          path: dist/
+
+  android:
+    needs: lint-audit
+    name: Build Android
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            target_triple: x86_64-linux-android
+          - target: arm64
+            target_triple: aarch64-linux-android
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target_triple }}
+      - name: Install Android Tools
+        run: cargo install cargo-ndk
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target_triple }}
+      - name: Build
+        run: cargo ndk --target ${{ matrix.target_triple }} --platform 28 build --release
+      - name: Archive
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target_triple }}/release/client dist/
+          cp target/${{ matrix.target_triple }}/release/server dist/
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: httproxy-android-${{ matrix.target }}
+          path: dist/
 
   create-release:
-    needs: [build-linux-musl, build-windows, build-darwin-arm64, build-android]
+    needs: [linux-gnu, linux-musl, windows, darwin, android]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Generate Full License Bundle
+      - uses: actions/checkout@v4
+      - name: Generate Third-Party Licenses
         run: |
           cargo install cargo-bundle-licenses
           cargo bundle-licenses --format yaml --output THIRD-PARTY-LICENSES.txt
-      - name: Download all artifacts
+      - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Package Assets
+      - name: Final Packaging
         run: |
-          mkdir dist
+          mkdir final_dist
           for dir in artifacts/*/; do
             name=$(basename "$dir")
-            zip -j "dist/${name}.zip" "$dir"/* CONFIGURATION.md README.md LICENSE THIRD-PARTY-LICENSES.txt || true
+            zip -j "final_dist/${name}.zip" "$dir"/* CONFIGURATION.md README.md LICENSE THIRD-PARTY-LICENSES.txt
           done
-      - name: Upload Release
+          cd final_dist
+          sha256sum *.zip > sha256sums.txt
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            final_dist/*.zip
+            final_dist/sha256sums.txt
           generate_release_notes: true
