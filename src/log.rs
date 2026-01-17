@@ -32,15 +32,21 @@ pub fn init_tracing(log_cfg: &LogConfig) -> Option<WorkerGuard> {
             .unwrap_or_else(|| std::path::Path::new("."));
         let _ = std::fs::create_dir_all(directory);
 
+        let file_stem = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("invalid log path");
+
+        let file_extension = file_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("log");
+
         let file_appender = rolling::Builder::new()
             .max_log_files(log_cfg.max_backups)
             .rotation(rolling::Rotation::DAILY)
-            .filename_prefix(
-                file_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("app.log"),
-            )
+            .filename_prefix(file_stem)
+            .filename_suffix(file_extension)
             .build(directory)
             .expect("failed to initialize rolling log file");
 
