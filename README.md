@@ -1,5 +1,7 @@
 # httproxy
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lhear/httproxy)
+
 `httproxy` is a high-performance HTTP proxy written in Rust, designed to emulate Chrome's TLS fingerprints and HTTP/2 parameters for enhanced stealth and network compatibility.
 
 ## Features
@@ -27,7 +29,8 @@ The compiled binaries can be found in target/release/server and target/release/c
 
 ### Configuration
 
-Both the client and server are configured via a `config.toml` file. Example configurations can be found in **[CONFIGURATION.md](CONFIGURATION.md)**.
+Both the client and server are configured via a `config.toml` file.
+Example configurations can be found in **[CONFIGURATION.md](CONFIGURATION.md)**.
 
 ### Running
 
