@@ -305,8 +305,7 @@ async fn tunnel_handler(
         .instrument(tracing::Span::current()),
     );
 
-    let shaper_stream =
-        shaper::TrafficShaper::new(upstream_read, 16 * 1024, state.traffic_config.clone());
+    let shaper_stream = shaper::TrafficShaper::new(upstream_read, state.traffic_config.clone());
     let padding_len = rand::rng().random_range(30..=PADDING_POOL.len());
 
     Ok((
