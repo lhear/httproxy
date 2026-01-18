@@ -17,6 +17,8 @@ use tokio::{
 static JITTER_TABLE: OnceLock<Vec<u64>> = OnceLock::new();
 const TABLE_SIZE: usize = 1024;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
+const CHUNK_SIZE: usize = 16 * 1024;
+const AVG_LATENCY: u128 = Duration::from_millis(5).as_micros();
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PaddingConfig {
@@ -38,29 +40,18 @@ pub struct TrafficConfig {
     pub stages: Vec<StageConfig>,
 }
 
-struct FlattenedStage {
-    end_at: usize,
-    threshold: usize,
-    range: [usize; 2],
-}
-
 pin_project! {
     #[project = TrafficShaperProj]
     pub struct TrafficShaper<R> {
         #[pin]
         reader: R,
         frame_buffer: BytesMut,
-        chunk_size: usize,
         #[pin]
         flush_timer: Sleep,
-        jitter_table: &'static [u64],
         cursor: usize,
         config: TrafficConfig,
         packet_count: usize,
-        current_data_len: usize,
-        stages_cache: Vec<FlattenedStage>,
         current_stage_idx: usize,
-        max_data_allowed: usize,
     }
 }
 
@@ -79,86 +70,74 @@ impl TrafficShaper<()> {
             return Ok(None);
         }
 
-        let mut frame = src.split_to(full_frame_len);
-        frame.advance(4);
-        Ok(Some(frame.split_to(actual_len).freeze()))
+        let mut full_frame = src.split_to(4 + total_len);
+        full_frame.advance(4);
+        full_frame.truncate(actual_len);
+        Ok(Some(full_frame.freeze()))
     }
 }
 
 impl<R> TrafficShaper<R> {
-    pub fn new(reader: R, chunk_size: usize, config: TrafficConfig) -> Self {
+    pub fn new(reader: R, mut config: TrafficConfig) -> Self {
         let start_cursor = (rand::rng().next_u64() as usize) & TABLE_MASK;
-        let mut frame_buffer = BytesMut::with_capacity(chunk_size);
-        frame_buffer.put_u32(0);
+        let mut frame_buffer = BytesMut::with_capacity(CHUNK_SIZE);
 
-        let mut stages_cache: Vec<FlattenedStage> = config
-            .stages
-            .iter()
-            .map(|s| {
-                let end_at = s
-                    .count
-                    .unwrap_or_else(|| s.count_range.map(|[_, b]| b).unwrap_or(0));
-                FlattenedStage {
-                    end_at,
-                    threshold: s.padding_threshold,
-                    range: s.padding_range,
-                }
-            })
-            .collect();
-        stages_cache.sort_by_key(|s| s.end_at);
+        unsafe { frame_buffer.advance_mut(4) }
+
+        config.stages.sort_by_key(|s| {
+            s.count
+                .or_else(|| s.count_range.map(|[_, b]| b))
+                .unwrap_or(0)
+        });
 
         Self {
             reader,
             frame_buffer,
-            chunk_size,
             flush_timer: tokio::time::sleep_until(Instant::now()),
             config,
             packet_count: 0,
-            jitter_table: get_jitter_table(Duration::from_millis(5)),
             cursor: start_cursor,
-            current_data_len: 0,
-            stages_cache,
             current_stage_idx: 0,
-            max_data_allowed: chunk_size.saturating_sub(4),
         }
     }
 
-    fn seal_and_reset(this: &mut TrafficShaperProj<'_, R>) -> Bytes {
-        let actual_len = *this.current_data_len;
+    fn seal_and_reset(this: &mut TrafficShaperProj<'_, R>, actual_len: usize) -> Bytes {
         let current_packet = *this.packet_count + 1;
-        if *this.current_stage_idx < this.stages_cache.len()
-            && current_packet > this.stages_cache[*this.current_stage_idx].end_at
-        {
-            *this.current_stage_idx += 1;
+
+        if let Some(stage) = this.config.stages.get(*this.current_stage_idx) {
+            let end = stage
+                .count
+                .or_else(|| stage.count_range.map(|r| r[1]))
+                .unwrap_or(0);
+            if current_packet > end {
+                *this.current_stage_idx += 1;
+            }
         }
 
-        let (threshold, range) = if let Some(s) = this.stages_cache.get(*this.current_stage_idx) {
-            if current_packet <= s.end_at {
-                (s.threshold, s.range)
-            } else {
-                (
-                    this.config.global.padding_threshold,
-                    this.config.global.padding_range,
-                )
-            }
-        } else {
-            (
+        let (threshold, range) = this
+            .config
+            .stages
+            .get(*this.current_stage_idx)
+            .map(|s| (s.padding_threshold, s.padding_range))
+            .unwrap_or((
                 this.config.global.padding_threshold,
                 this.config.global.padding_range,
-            )
-        };
+            ));
 
         let padding_len = if actual_len < threshold {
             rand::rng()
                 .random_range(range[0]..=range[1])
-                .min(this.chunk_size.saturating_sub(4 + actual_len))
+                .min(CHUNK_SIZE - 4 - actual_len)
         } else {
             0
         };
 
         let total_payload_len = actual_len + padding_len;
         let header_bytes = ((actual_len as u32) << 16) | (total_payload_len as u32);
-        this.frame_buffer[0..4].copy_from_slice(&header_bytes.to_be_bytes());
+        unsafe {
+            let ptr = this.frame_buffer.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(header_bytes.to_be_bytes().as_ptr(), ptr, 4);
+        }
 
         if padding_len > 0 {
             this.frame_buffer.put_bytes(0, padding_len);
@@ -167,10 +146,8 @@ impl<R> TrafficShaper<R> {
         let frame = this.frame_buffer.split().freeze();
         *this.packet_count += 1;
 
-        this.frame_buffer.clear();
-        this.frame_buffer.reserve(*this.chunk_size);
-        this.frame_buffer.put_u32(0);
-        *this.current_data_len = 0;
+        this.frame_buffer.reserve(CHUNK_SIZE);
+        unsafe { this.frame_buffer.advance_mut(4) }
 
         frame
     }
@@ -186,31 +163,29 @@ where
         let mut this = self.project();
 
         loop {
-            let current_len = *this.current_data_len;
-            let is_full = current_len == *this.max_data_allowed;
+            let actual_len = this.frame_buffer.len() - 4;
+            let is_full = actual_len == CHUNK_SIZE - 4;
 
-            if is_full || (current_len > 0 && this.flush_timer.as_mut().poll(cx).is_ready()) {
-                return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this))));
+            if is_full || (actual_len > 0 && this.flush_timer.as_mut().poll(cx).is_ready()) {
+                return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this, actual_len))));
             }
 
-            let remaining_space = this.max_data_allowed.saturating_sub(current_len);
             let dst = this.frame_buffer.spare_capacity_mut();
-            let read_limit = remaining_space.min(dst.len());
-            let mut read_buf = ReadBuf::uninit(&mut dst[..read_limit]);
+            let mut read_buf = ReadBuf::uninit(dst);
 
             match this.reader.as_mut().poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
                     if n == 0 {
-                        if *this.current_data_len == 0 {
+                        if actual_len == 0 {
                             return Poll::Ready(None);
                         }
-                        return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this))));
+                        return Poll::Ready(Some(Ok(Self::seal_and_reset(&mut this, actual_len))));
                     }
 
-                    if *this.current_data_len == 0 && n < *this.max_data_allowed {
+                    if actual_len == 0 && n < CHUNK_SIZE - 4 {
                         let idx = *this.cursor;
-                        let delay = this.jitter_table[idx];
+                        let delay = jitter_table()[idx];
                         *this.cursor = (idx + 1) & TABLE_MASK;
                         this.flush_timer
                             .as_mut()
@@ -221,7 +196,6 @@ where
                     unsafe {
                         this.frame_buffer.advance_mut(n);
                     }
-                    *this.current_data_len += n;
                     continue;
                 }
                 Poll::Pending => return Poll::Pending,
@@ -231,9 +205,9 @@ where
     }
 }
 
-fn get_jitter_table(avg_latency: Duration) -> &'static [u64] {
+fn jitter_table() -> &'static [u64] {
     JITTER_TABLE.get_or_init(|| {
-        let mean = avg_latency.as_micros() as f64;
+        let mean = AVG_LATENCY as f64;
         let std_dev = mean / 3.0;
         let normal = Normal::new(mean, std_dev).unwrap();
         let mut rng = rand::rng();
