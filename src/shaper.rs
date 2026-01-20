@@ -4,6 +4,7 @@ use rand::{Rng, RngCore};
 use rand_distr::{Distribution, Normal};
 use serde::Deserialize;
 use std::{
+    io::{Error, ErrorKind},
     pin::Pin,
     sync::OnceLock,
     task::{Context, Poll},
@@ -66,11 +67,15 @@ impl TrafficShaper<()> {
         let total_len = (header & 0xFFFF) as usize;
         let full_frame_len = 4 + total_len;
 
+        if total_len > CHUNK_SIZE - 4 || actual_len > total_len {
+            return Err(Error::new(ErrorKind::InvalidData, "invalid frame size"));
+        }
+
         if src.len() < full_frame_len {
             return Ok(None);
         }
 
-        let mut full_frame = src.split_to(4 + total_len);
+        let mut full_frame = src.split_to(full_frame_len);
         full_frame.advance(4);
         full_frame.truncate(actual_len);
         Ok(Some(full_frame.freeze()))
