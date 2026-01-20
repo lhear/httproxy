@@ -11,7 +11,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use bytes::BytesMut;
 use clap::Parser;
 use jsonwebtoken::{DecodingKey, Validation};
 use rand::Rng;
@@ -29,7 +28,6 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tokio_socks::tcp::Socks5Stream;
-use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{Instrument, info, warn};
@@ -288,17 +286,8 @@ async fn tunnel_handler(
 
     tokio::spawn(
         async move {
-            let mut body_stream = body.into_data_stream();
-            let mut buffer = BytesMut::new();
-            while let Some(chunk) = body_stream.next().await {
-                let data = chunk.context("stream error")?;
-                buffer.extend_from_slice(&data);
-                while let Some(decoded_data) =
-                    shaper::TrafficShaper::decode_from_buffer(&mut buffer)?
-                {
-                    upstream_write.write_all(&decoded_data).await?;
-                }
-            }
+            shaper::TrafficShaper::decode_to_writer(body.into_data_stream(), &mut upstream_write)
+                .await?;
             upstream_write.shutdown().await?;
             Ok::<(), anyhow::Error>(())
         }

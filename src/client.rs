@@ -224,16 +224,7 @@ async fn handle_connection(
         return Err(anyhow!("upstream rejected status: {}", response.status()));
     }
 
-    let mut remote_stream = response.into_data_stream();
-    let mut buffer = BytesMut::new();
-
-    while let Some(chunk) = remote_stream.next().await {
-        let data = chunk.context("stream read error")?;
-        buffer.extend_from_slice(&data);
-        while let Some(decoded_data) = shaper::TrafficShaper::decode_from_buffer(&mut buffer)? {
-            write_half.write_all(&decoded_data).await?;
-        }
-    }
+    shaper::TrafficShaper::decode_to_writer(response.into_data_stream(), &mut write_half).await?;
     write_half.shutdown().await?;
 
     Ok(())

@@ -4,16 +4,17 @@ use rand::{Rng, RngCore};
 use rand_distr::{Distribution, Normal};
 use serde::Deserialize;
 use std::{
-    io::{Error, ErrorKind},
+    collections::VecDeque,
     pin::Pin,
     sync::OnceLock,
     task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, ReadBuf},
+    io::{AsyncRead, AsyncWriteExt, ReadBuf},
     time::{Instant, Sleep},
 };
+use tokio_stream::StreamExt;
 
 static JITTER_TABLE: OnceLock<Vec<u64>> = OnceLock::new();
 const TABLE_SIZE: usize = 1024;
@@ -56,29 +57,114 @@ pin_project! {
     }
 }
 
+struct MultiBuf(VecDeque<Bytes>);
+
+impl Buf for MultiBuf {
+    fn remaining(&self) -> usize {
+        self.0.iter().map(|b| b.len()).sum()
+    }
+    fn chunk(&self) -> &[u8] {
+        self.0.front().map(|b| b.as_ref()).unwrap_or(&[])
+    }
+    fn advance(&mut self, mut cnt: usize) {
+        while cnt > 0 {
+            if let Some(front) = self.0.front_mut() {
+                if front.len() <= cnt {
+                    cnt -= front.len();
+                    self.0.pop_front();
+                } else {
+                    front.advance(cnt);
+                    cnt = 0;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
+        let mut n = 0;
+        for (chunk, slot) in self.0.iter().zip(dst.iter_mut()) {
+            *slot = std::io::IoSlice::new(chunk.as_ref());
+            n += 1;
+        }
+        n
+    }
+}
+
 impl TrafficShaper<()> {
-    pub fn decode_from_buffer(src: &mut BytesMut) -> Result<Option<Bytes>, std::io::Error> {
-        if src.len() < 4 {
-            return Ok(None);
+    pub async fn decode_to_writer<S, W, E>(mut reader: S, writer: &mut W) -> std::io::Result<()>
+    where
+        S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+        E: std::fmt::Display,
+    {
+        let mut queue = MultiBuf(VecDeque::new());
+
+        while let Some(chunk) = reader.next().await {
+            let data =
+                chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            queue.0.push_back(data);
+
+            while queue.remaining() >= 4 {
+                let header = {
+                    let mut head_bytes = [0u8; 4];
+                    let mut temp_cursor = 0;
+                    for b in &queue.0 {
+                        let take = (4 - temp_cursor).min(b.len());
+                        head_bytes[temp_cursor..temp_cursor + take].copy_from_slice(&b[..take]);
+                        temp_cursor += take;
+                        if temp_cursor == 4 {
+                            break;
+                        }
+                    }
+                    u32::from_be_bytes(head_bytes)
+                };
+
+                let actual_data_len = (header >> 16) as usize;
+                let total_frame_payload = (header & 0xFFFF) as usize;
+
+                if total_frame_payload > CHUNK_SIZE - 4 || actual_data_len > total_frame_payload {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "corrupt frame",
+                    ));
+                }
+
+                if queue.remaining() < 4 + total_frame_payload {
+                    break;
+                }
+
+                queue.advance(4);
+
+                let mut to_write = actual_data_len;
+                while to_write > 0 {
+                    let mut slices = [std::io::IoSlice::new(&[]); 16];
+                    let cnt = queue.chunks_vectored(&mut slices);
+
+                    let mut batch_size = 0;
+                    let mut take_cnt = 0;
+                    for (i, chunk) in queue.0.iter().enumerate().take(cnt) {
+                        let s_len = chunk.len();
+                        if batch_size + s_len > to_write {
+                            let rem = to_write - batch_size;
+                            slices[i] = std::io::IoSlice::new(&chunk[..rem]);
+                            take_cnt = i + 1;
+                            break;
+                        }
+                        batch_size += s_len;
+                        take_cnt = i + 1;
+                    }
+                    let n = writer.write_vectored(&slices[..take_cnt]).await?;
+                    queue.advance(n);
+                    to_write -= n;
+                }
+                let padding = total_frame_payload - actual_data_len;
+                if padding > 0 {
+                    queue.advance(padding);
+                }
+            }
         }
-
-        let header = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
-        let actual_len = (header >> 16) as usize;
-        let total_len = (header & 0xFFFF) as usize;
-        let full_frame_len = 4 + total_len;
-
-        if total_len > CHUNK_SIZE || actual_len > total_len {
-            return Err(Error::new(ErrorKind::InvalidData, "invalid frame size"));
-        }
-
-        if src.len() < full_frame_len {
-            return Ok(None);
-        }
-
-        let mut full_frame = src.split_to(full_frame_len);
-        full_frame.advance(4);
-        full_frame.truncate(actual_len);
-        Ok(Some(full_frame.freeze()))
+        Ok(())
     }
 }
 
