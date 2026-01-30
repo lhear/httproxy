@@ -95,6 +95,7 @@ async fn run_server(listen: &str, config: Arc<StateConfig>) -> anyhow::Result<()
             .pool_idle_timeout(Duration::from_secs(300))
             .pool_max_idle_per_host(6)
             .emulation(Emulation::Chrome143)
+            .no_proxy()
             .build()?,
     );
     info!(listen = %addr, "server started");
