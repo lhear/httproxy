@@ -45,11 +45,6 @@ Example configurations can be found in **[CONFIGURATION.md](CONFIGURATION.md)**.
 ./client -c config.toml
 ```
 
-## Integrations
-
-### Android
-- **[Cromite-Patcher](https://github.com/lhear/cromite-patcher)**: An automated toolchain that integrates `httproxy` into the Cromite browser.
-
 ## License
 
 This project is licensed under the **[Mozilla Public License Version 2.0](LICENSE)**.
