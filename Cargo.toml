@@ -54,5 +54,5 @@ tracing-subscriber = {version = "0.3", features = [
 ]}
 url = "2.5"
 webpki-roots = "1.0"
-wreq = "6.0.0-rc.26"
+wreq = "6.0.0-rc.27"
 wreq-util = "3.0.0-rc.9"
