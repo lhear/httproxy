@@ -168,6 +168,9 @@ server {
         proxy_http_version 1.1;
         client_max_body_size 0;
         proxy_buffering off;
+        proxy_buffer_size 16k;
+        proxy_buffers 2 16k;
+        proxy_busy_buffers_size 16k;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_set_header Connection "";
