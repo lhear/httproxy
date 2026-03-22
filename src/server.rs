@@ -36,6 +36,7 @@ use tracing::{Instrument, info, warn};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 static PADDING_POOL: [u8; 62] = [b'X'; 62];
+static DECODE_BUF_CAPACITY: usize = 16 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -92,9 +93,10 @@ struct Claims {
 }
 
 #[derive(Clone)]
-struct StateConfig {
+struct AppState {
     decoding_key: DecodingKey,
-    socks5_proxy: Option<String>,
+    jwt_validation: Validation,
+    socks5_proxy: Option<Arc<str>>,
     dns_client: Option<Arc<dns::DnsClient>>,
     client_subnet: Option<IpAddr>,
     traffic_config: shaper::TrafficConfig,
@@ -106,18 +108,43 @@ struct TunnelQuery {
 }
 
 struct AppError(StatusCode, String);
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         (self.0, self.1).into_response()
     }
 }
 
-impl<E> From<E> for AppError
-where
-    E: std::error::Error,
-{
+impl AppError {
+    #[inline]
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, msg.into())
+    }
+
+    #[inline]
+    fn bad_gateway(msg: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_GATEWAY, msg.into())
+    }
+
+    #[inline]
+    fn gateway_timeout(msg: impl Into<String>) -> Self {
+        Self(StatusCode::GATEWAY_TIMEOUT, msg.into())
+    }
+
+    #[inline]
+    fn unauthorized(msg: impl Into<String>) -> Self {
+        Self(StatusCode::UNAUTHORIZED, msg.into())
+    }
+
+    #[inline]
+    fn internal(msg: impl Into<String>) -> Self {
+        Self(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
+    }
+}
+
+impl<E: std::error::Error> From<E> for AppError {
     fn from(err: E) -> Self {
-        Self(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        Self::internal(err.to_string())
     }
 }
 
@@ -126,58 +153,57 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(Commands::GenToken { secret, user, exp }) = cli.command {
-        return handle_gen_token(secret, user, exp);
+        return gen_token(&secret, user, exp);
     }
 
-    let config_content = fs::read_to_string(&cli.config)?;
-    let mut config: Config = toml::from_str(&config_content)?;
-    let _guard = log::init_tracing(&config.log.clone().unwrap_or_default());
-    let proxy_config = create_proxy_config(&mut config).await?;
+    let mut config: Config = toml::from_str(&fs::read_to_string(&cli.config)?)?;
+    let _guard = log::init_tracing(&config.log.as_ref().cloned().unwrap_or_default());
+    let state = build_state(&mut config).await?;
 
     run_server(
-        build_router(proxy_config, &config.server.path),
+        build_router(state, &config.server.path),
         &config.server.listen,
     )
     .await
 }
 
-fn handle_gen_token(secret: String, user: String, exp: u64) -> anyhow::Result<()> {
-    let claims = Claims { sub: user, exp };
+fn gen_token(secret: &str, user: String, exp: u64) -> anyhow::Result<()> {
     let token = jsonwebtoken::encode(
         &jsonwebtoken::Header::default(),
-        &claims,
+        &Claims { sub: user, exp },
         &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
     )?;
-    println!("{}", token);
+    println!("{token}");
     Ok(())
 }
 
-async fn create_proxy_config(config: &mut Config) -> anyhow::Result<Arc<StateConfig>> {
-    let mut dns_client = None;
-    let mut client_subnet = None;
+async fn build_state(config: &mut Config) -> anyhow::Result<Arc<AppState>> {
+    let (dns_client, client_subnet) = match config.dns {
+        Some(ref mut dc) => {
+            let mut dc = dc.clone();
+            let client = dns::init_dns(&mut dc).await?;
+            (Some(client), dc.options.client_subnet)
+        }
+        None => (None, None),
+    };
 
-    if let Some(ref mut dc) = config.dns {
-        dns_client = Some(dns::init_dns(dc).await?);
-        client_subnet = dc.options.client_subnet;
-    }
-
-    let mut socks5_proxy = None;
-
-    if let Some(proxy) = &config.proxy {
-        socks5_proxy = proxy.socks5.clone();
-    }
-
-    Ok(Arc::new(StateConfig {
+    Ok(Arc::new(AppState {
         decoding_key: DecodingKey::from_secret(config.auth.secret.as_bytes()),
-        socks5_proxy,
+        jwt_validation: Validation::default(),
+        socks5_proxy: config
+            .proxy
+            .as_ref()
+            .and_then(|p| p.socks5.as_deref())
+            .map(Arc::from),
         dns_client,
         client_subnet,
         traffic_config: config.traffic_shaping.clone(),
     }))
 }
 
-fn build_router(config: Arc<StateConfig>, path: &str) -> Router {
+fn build_router(state: Arc<AppState>, path: &str) -> Router {
     use tracing::field::Empty;
+
     Router::new()
         .route(path, post(tunnel_handler))
         .layer(
@@ -193,7 +219,7 @@ fn build_router(config: Arc<StateConfig>, path: &str) -> Router {
                 },
             )),
         )
-        .with_state(config)
+        .with_state(state)
 }
 
 async fn run_server(app: Router, listen: &str) -> anyhow::Result<()> {
@@ -205,47 +231,63 @@ async fn run_server(app: Router, listen: &str) -> anyhow::Result<()> {
         }
         let listener = tokio::net::UnixListener::bind(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
-        info!("listening on unix:{}", listen);
+        info!("listening on unix:{listen}");
         return Ok(axum::serve(listener, app.into_make_service()).await?);
     }
 
     let addr: SocketAddr = listen.parse().context("invalid bind address")?;
-    info!("listening on {}", addr);
+    info!("listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-fn validate_jwt(headers: &HeaderMap, key: &DecodingKey) -> Result<String, AppError> {
-    let auth_header = headers
+#[inline]
+fn validate_jwt(
+    headers: &HeaderMap,
+    key: &DecodingKey,
+    validation: &Validation,
+) -> Result<String, AppError> {
+    let token = headers
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| {
             warn!("rejected: missing or invalid authorization header");
-            AppError(StatusCode::UNAUTHORIZED, "invalid header".into())
+            AppError::unauthorized("invalid header")
         })?;
 
-    let token_data = jsonwebtoken::decode::<Claims>(auth_header, key, &Validation::default())
+    jsonwebtoken::decode::<Claims>(token, key, validation)
+        .map(|td| td.claims.sub)
         .map_err(|_| {
             warn!("rejected: invalid token");
-            AppError(StatusCode::UNAUTHORIZED, "invalid token".into())
-        })?;
-
-    Ok(token_data.claims.sub)
+            AppError::unauthorized("invalid token")
+        })
 }
 
-async fn connect_upstream(state: &StateConfig, host: &str, port: u16) -> Result<TcpStream, String> {
-    if let Some(ref client) = state.dns_client {
+async fn connect_upstream(
+    dns_client: Option<&Arc<dns::DnsClient>>,
+    client_subnet: Option<IpAddr>,
+    socks5_proxy: Option<&Arc<str>>,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, String> {
+    if let Some(client) = dns_client {
         return client
-            .connect(host, port, state.client_subnet, state.socks5_proxy.clone())
+            .connect(
+                host,
+                port,
+                client_subnet,
+                socks5_proxy.map(|s| s.to_string()),
+            )
             .await
             .map_err(|e| format!("dns error: {e}"));
     }
-    match state.socks5_proxy.as_deref() {
-        Some(p) => Socks5Stream::connect(p, (host, port))
+
+    match socks5_proxy {
+        Some(p) => Socks5Stream::connect(p.as_ref(), (host, port))
             .await
-            .map(|s| s.into_inner())
+            .map(Socks5Stream::into_inner)
             .map_err(|e| e.to_string()),
         None => TcpStream::connect((host, port))
             .await
@@ -254,49 +296,57 @@ async fn connect_upstream(state: &StateConfig, host: &str, port: u16) -> Result<
 }
 
 async fn tunnel_handler(
-    State(state): State<Arc<StateConfig>>,
+    State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<TunnelQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
-    tracing::Span::current().record("user", &validate_jwt(&headers, &state.decoding_key)?);
-    tracing::Span::current().record("target", &query.target);
+    let span = tracing::Span::current();
+    span.record(
+        "user",
+        validate_jwt(&headers, &state.decoding_key, &state.jwt_validation)?,
+    );
+    span.record("target", &query.target);
 
     let auth = query
         .target
         .parse::<axum::http::uri::Authority>()
-        .map_err(|_| AppError(StatusCode::BAD_REQUEST, "invalid target format".into()))?;
+        .map_err(|_| AppError::bad_request("invalid target format"))?;
 
     let host = auth.host();
     let port = auth
         .port_u16()
-        .ok_or_else(|| AppError(StatusCode::BAD_REQUEST, "port required".into()))?;
+        .ok_or_else(|| AppError::bad_request("port required"))?;
 
     info!("connecting");
 
-    let upstream_conn = tokio::time::timeout(
+    let upstream = tokio::time::timeout(
         Duration::from_secs(10),
-        connect_upstream(&state, host, port),
+        connect_upstream(
+            state.dns_client.as_ref(),
+            state.client_subnet,
+            state.socks5_proxy.as_ref(),
+            host,
+            port,
+        ),
     )
     .await
-    .map_err(|_| AppError(StatusCode::GATEWAY_TIMEOUT, "connect timeout".into()))?
-    .map_err(|e| AppError(StatusCode::BAD_GATEWAY, e))?;
+    .map_err(|_| AppError::gateway_timeout("connect timeout"))?
+    .map_err(AppError::bad_gateway)?;
 
-    upstream_conn.set_nodelay(true)?;
+    upstream.set_nodelay(true)?;
 
-    let (upstream_read, mut upstream_write) = upstream_conn.into_split();
+    let (upstream_read, mut upstream_write) = upstream.into_split();
 
     tokio::spawn(
         async move {
-            let mut body_stream = body.into_data_stream();
-            let mut buffer = BytesMut::new();
-            while let Some(chunk) = body_stream.next().await {
+            let mut stream = body.into_data_stream();
+            let mut buf = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
+            while let Some(chunk) = stream.next().await {
                 let data = chunk.context("stream error")?;
-                buffer.extend_from_slice(&data);
-                while let Some(decoded_data) =
-                    shaper::TrafficShaper::decode_from_buffer(&mut buffer)?
-                {
-                    upstream_write.write_all(&decoded_data).await?;
+                buf.extend_from_slice(&data);
+                while let Some(decoded) = shaper::TrafficShaper::decode_from_buffer(&mut buf)? {
+                    upstream_write.write_all(&decoded).await?;
                 }
             }
             upstream_write.shutdown().await?;
