@@ -14,7 +14,7 @@ jobs:
   lint-audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses
@@ -40,7 +40,7 @@ jobs:
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-g++
               RUSTC_LINKER: aarch64-linux-gnu-g++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
@@ -63,7 +63,7 @@ jobs:
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: httproxy-linux-${{ matrix.target }}
           path: dist/
@@ -93,7 +93,7 @@ jobs:
               RUSTC_LINKER: aarch64-linux-musl-g++
               BINDGEN_EXTRA_CLANG_ARGS: "--sysroot=/opt/aarch64-linux-musl-cross/aarch64-linux-musl"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
@@ -118,7 +118,7 @@ jobs:
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: httproxy-linux-${{ matrix.target }}-musl
           path: dist/
@@ -135,7 +135,7 @@ jobs:
           - target: arm64
             target_triple: aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
@@ -156,7 +156,7 @@ jobs:
           Copy-Item "target\${{ matrix.target_triple }}\release\client.exe" -Destination dist\
           Copy-Item "target\${{ matrix.target_triple }}\release\server.exe" -Destination dist\
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: httproxy-windows-${{ matrix.target }}
           path: dist/
@@ -173,7 +173,7 @@ jobs:
           - target: arm64
             target_triple: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
@@ -190,7 +190,7 @@ jobs:
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: httproxy-darwin-${{ matrix.target }}
           path: dist/
@@ -207,7 +207,7 @@ jobs:
           - target: arm64
             target_triple: aarch64-linux-android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
@@ -224,7 +224,7 @@ jobs:
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: httproxy-android-${{ matrix.target }}
           path: dist/
@@ -236,13 +236,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Generate Third-Party Licenses
         run: |
           cargo install cargo-bundle-licenses
           cargo bundle-licenses --format yaml --output THIRD-PARTY-LICENSES.txt
       - name: Download All Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Final Packaging
