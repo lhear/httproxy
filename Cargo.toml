@@ -38,7 +38,7 @@ rand_distr = "0.5"
 rustls = "0.23"
 serde = {version = "1.0", features = ["derive"]}
 singleflight-async = "0.2"
-tokio = {version = "1.49", features = ["rt-multi-thread"]}
+tokio = {version = "1.50", features = ["rt-multi-thread"]}
 tokio-rustls = "0.26"
 tokio-socks = "0.5"
 tokio-stream = {version = "0.1", features = ["net"]}
@@ -54,5 +54,5 @@ tracing-subscriber = {version = "0.3", features = [
 ]}
 url = "2.5"
 webpki-roots = "1.0"
-wreq = "6.0.0-rc.27"
-wreq-util = "3.0.0-rc.9"
+wreq = "6.0.0-rc.28"
+wreq-util = "3.0.0-rc.10"
