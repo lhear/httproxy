@@ -102,6 +102,8 @@ The `traffic_shaping` field allows you to configure padding for outgoing packets
 
 > **Constraint**: To ensure packets do not exceed protocol limits, all configurations must satisfy: `max(padding_range) + padding_threshold <= 16380`
 
+> **Important**: Stages are processed sequentially based on the packet sequence. If you want a specific configuration for the 3rd packet only, you MUST define stages for the 1st and 2nd packets as placeholders.
+
 ### PaddingConfig (for `global`)
 
 - `padding_threshold`: (usize) If the actual data length of a packet is below this threshold, padding will be applied.
@@ -111,8 +113,8 @@ The `traffic_shaping` field allows you to configure padding for outgoing packets
 
 Each stage can override the `global` padding configuration for a specific range of packets.
 
-- `count`: (Option<usize>) Applies the stage configuration to a specific packet count (1-indexed).
-- `count_range`: (Option<[usize; 2]>) Applies the stage configuration to a range of packet counts.
+- `count`: (Option<usize>) The last packet number for this stage (1-indexed).
+- `count_range`: (Option<[usize; 2]>) A range where the second value (hi) is used as the stage's end point.
 
 **Example:**
 
