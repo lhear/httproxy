@@ -34,9 +34,10 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{Instrument, info, warn};
 
+const PADDING_POOL: [u8; 62] = [b'X'; 62];
+const DECODE_BUF_CAPACITY: usize = 16 * 1024;
+
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-static PADDING_POOL: [u8; 62] = [b'X'; 62];
-static DECODE_BUF_CAPACITY: usize = 16 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -342,12 +343,14 @@ async fn tunnel_handler(
         async move {
             let mut stream = body.into_data_stream();
             let mut buf = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
+            let mut upstream_write = tokio::io::BufWriter::new(upstream_write);
             while let Some(chunk) = stream.next().await {
                 let data = chunk.context("stream error")?;
                 buf.extend_from_slice(&data);
                 while let Some(decoded) = shaper::TrafficShaper::decode_from_buffer(&mut buf)? {
                     upstream_write.write_all(&decoded).await?;
                 }
+                upstream_write.flush().await?;
             }
             upstream_write.shutdown().await?;
             Ok::<(), anyhow::Error>(())
