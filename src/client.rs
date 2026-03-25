@@ -231,18 +231,15 @@ async fn handle_connection(
         return Err(anyhow!("upstream rejected: {}", response.status()));
     }
 
-    let mut writer = BufWriter::new(write_half);
     let mut data_stream = response.into_data_stream();
 
     while let Some(chunk) = data_stream.next().await {
         buffer.extend_from_slice(&chunk.context("stream read error")?);
-
         while let Some(frame) = shaper::TrafficShaper::decode_from_buffer(&mut buffer)? {
-            writer.write_all(&frame).await?;
+            write_half.write_all(&frame).await?;
         }
-        writer.flush().await?;
     }
 
-    writer.shutdown().await?;
+    write_half.shutdown().await?;
     Ok(())
 }
