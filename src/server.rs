@@ -35,8 +35,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{Instrument, info, warn};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-static PADDING_POOL: [u8; 62] = [b'X'; 62];
-static DECODE_BUF_CAPACITY: usize = 16 * 1024;
+
+const PADDING_POOL: [u8; 62] = [b'X'; 62];
+const DECODE_BUF_CAPACITY: usize = 16 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
