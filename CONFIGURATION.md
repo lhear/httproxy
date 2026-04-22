@@ -34,6 +34,11 @@ remote = "https://your-server-domain/YOUR_SECRET_PATH"
 [auth]
 token = "your-token"
 
+[bypass]
+bypass_files = [
+  "./bypass.json",
+]
+
 # [log]
 # file_path = "client.log"
 # level = "info"
@@ -52,6 +57,24 @@ padding_threshold = 8000
 count_range = [2, 9]
 padding_range = [800, 1200]
 padding_threshold = 2000
+```
+
+## Bypass Configuration
+
+`bypass.json`:
+
+```json
+{
+    "domain_suffix": [
+        "localhost"
+    ],
+    "ip_cidr": [
+        "10.0.0.0/8",
+        "192.168.0.0/16",
+        "172.16.0.0/16"
+        "127.0.0.1/32",
+    ]
+}
 ```
 
 ## Server Configuration
