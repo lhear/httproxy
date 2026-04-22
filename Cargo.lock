@@ -902,6 +902,7 @@ dependencies = [
  "rand_distr",
  "rustls",
  "serde",
+ "serde_json",
  "singleflight-async",
  "tokio",
  "tokio-rustls",
