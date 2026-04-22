@@ -1,3 +1,4 @@
+mod bypass;
 mod log;
 mod shaper;
 
@@ -27,6 +28,7 @@ use tracing::{Instrument, error_span, info, warn};
 use url::Url;
 use wreq::{Body, Client};
 use wreq_util::Emulation;
+use bypass::{BypassConfig, BypassRules};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -49,6 +51,8 @@ struct Config {
     auth: AuthConfig,
     log: Option<log::LogConfig>,
     traffic_shaping: shaper::TrafficConfig,
+    #[serde(default)]
+    bypass: BypassConfig,
 }
 
 #[derive(Deserialize, Debug)]
@@ -66,6 +70,7 @@ struct SharedState {
     remote: Url,
     auth_header: String,
     traffic_config: shaper::TrafficConfig,
+    bypass: Option<Arc<BypassRules>>,
 }
 
 #[tokio::main]
@@ -78,10 +83,22 @@ async fn main() -> Result<()> {
 }
 
 fn build_state(cfg: &Config) -> Result<SharedState> {
+    let bypass = if cfg.bypass.bypass_files.is_empty() {
+        None
+    } else {
+        let rules = BypassRules::load(&cfg.bypass).context("failed to load bypass rules")?;
+        if rules.is_empty() {
+            None
+        } else {
+            Some(Arc::new(rules))
+        }
+    };
+
     Ok(SharedState {
         remote: cfg.client.remote.parse().context("invalid server URL")?,
         auth_header: format!("Bearer {}", cfg.auth.token),
         traffic_config: cfg.traffic_shaping.clone(),
+        bypass,
     })
 }
 
@@ -203,9 +220,18 @@ async fn handle_connection(
 
     let target_host = resolve_target_host(&method, &url)?;
     tracing::Span::current().record("target", target_host.as_str());
+
+    if let Some(bypass) = &state.bypass {
+        if bypass.should_bypass(&target_host) {
+            info!(mode = "bypass", "direct connect");
+            let payload = buffer.split().freeze();
+            return handle_bypass(read_half, write_half, &target_host, payload).await;
+        }
+    }
+
     let payload = buffer.split().freeze();
 
-    info!("connecting");
+    info!(mode = "proxy", "connecting");
 
     let mut remote_url = state.remote.clone();
     remote_url
@@ -241,5 +267,34 @@ async fn handle_connection(
     }
 
     write_half.shutdown().await?;
+    Ok(())
+}
+
+async fn handle_bypass(
+    mut read_half: tokio::net::tcp::OwnedReadHalf,
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    target: &str,
+    initial_payload: bytes::Bytes,
+) -> Result<()> {
+    let mut remote = TcpStream::connect(target)
+        .await
+        .with_context(|| format!("bypass connect to {target} failed"))?;
+    remote.set_nodelay(true)?;
+
+    if !initial_payload.is_empty() {
+        remote.write_all(&initial_payload).await?;
+    }
+
+    let (mut remote_read, mut remote_write) = remote.into_split();
+
+    let client_to_remote = tokio::io::copy(&mut read_half, &mut remote_write);
+    let remote_to_client = tokio::io::copy(&mut remote_read, &mut write_half);
+
+    tokio::select! {
+        result = client_to_remote => { result.context("bypass client→remote")?; }
+        result = remote_to_client => { result.context("bypass remote→client")?; }
+    }
+
+    let _ = write_half.shutdown().await;
     Ok(())
 }
