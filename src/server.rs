@@ -14,7 +14,7 @@ use axum::{
 use bytes::BytesMut;
 use clap::Parser;
 use jsonwebtoken::{DecodingKey, Validation};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
