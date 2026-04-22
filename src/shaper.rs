@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use pin_project_lite::pin_project;
-use rand::{Rng, RngCore, seq::SliceRandom};
+use rand::{Rng, RngExt, seq::SliceRandom};
 use rand_distr::{Distribution, Normal};
 use serde::Deserialize;
 use std::{

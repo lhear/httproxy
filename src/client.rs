@@ -3,13 +3,14 @@ mod log;
 mod shaper;
 
 use anyhow::{Context, Result, anyhow};
+use bypass::{BypassConfig, BypassRules};
 use bytes::{Buf, BytesMut};
 use clap::Parser;
 use futures::StreamExt;
 use http::uri::Authority;
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use std::{
     fs,
@@ -28,7 +29,6 @@ use tracing::{Instrument, error_span, info, warn};
 use url::Url;
 use wreq::{Body, Client};
 use wreq_util::Emulation;
-use bypass::{BypassConfig, BypassRules};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
