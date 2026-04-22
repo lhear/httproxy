@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use fst::{Set, SetBuilder};
+use ip_network::IpNetwork;
+use ip_network_table::IpNetworkTable;
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str::FromStr,
@@ -21,115 +23,238 @@ struct BypassFile {
     ip_cidr: Vec<String>,
 }
 
-#[derive(Default)]
-struct DomainTrieNode {
-    children: HashMap<Box<str>, DomainTrieNode>,
+const MAX_DOMAIN_LEN: usize = 253;
 
-    is_terminal: bool,
+#[inline]
+fn domain_to_fst_key(domain: &str) -> Option<Box<[u8]>> {
+    let domain = domain.trim_matches('.');
+    if domain.is_empty() {
+        return None;
+    }
+
+    let bytes = domain.as_bytes();
+    let mut buf = Vec::with_capacity(bytes.len());
+
+    let mut end = bytes.len();
+    let mut first = true;
+    while end > 0 {
+        let mut start = end;
+        while start > 0 && bytes[start - 1] != b'.' {
+            start -= 1;
+        }
+
+        if !first {
+            buf.push(b'\x00');
+        }
+        first = false;
+
+        buf.extend(bytes[start..end].iter().map(|b| b.to_ascii_lowercase()));
+
+        end = if start > 0 { start - 1 } else { 0 };
+    }
+
+    Some(buf.into_boxed_slice())
 }
 
-impl DomainTrieNode {
-    fn insert(&mut self, domain: &str) {
-        let domain = domain.strip_prefix('.').unwrap_or(domain);
+struct DomainFst {
+    set: Set<Vec<u8>>,
+}
 
-        let mut node = self;
-        for label in domain.split('.').rev() {
-            node = node
-                .children
-                .entry(label.into())
-                .or_insert_with(DomainTrieNode::default);
+impl DomainFst {
+    fn from_sorted_keys(keys: Vec<Box<[u8]>>) -> Result<Self> {
+        let mut builder = SetBuilder::memory();
+        for key in &keys {
+            builder.insert(key).context("fst insert domain key")?;
         }
-        node.is_terminal = true;
+
+        drop(keys);
+
+        let fst_bytes = builder.into_inner().context("fst finalize")?;
+        let set = Set::new(fst_bytes).context("fst build set")?;
+        Ok(Self { set })
     }
 
+    #[inline]
     fn matches(&self, domain: &str) -> bool {
-        let domain = domain.trim_end_matches('.');
-        let labels: Vec<&str> = domain.split('.').collect();
-        Self::search(self, &labels, labels.len())
-    }
-
-    fn search(node: &DomainTrieNode, labels: &[&str], idx: usize) -> bool {
-        if node.is_terminal {
-            return true;
-        }
-        if idx == 0 {
+        let domain = domain.trim_matches('.');
+        if domain.is_empty() {
             return false;
         }
-        let label = labels[idx - 1];
 
-        if let Some(child) = node.children.get(label) {
-            if Self::search(child, labels, idx - 1) {
+        let bytes = domain.as_bytes();
+        if bytes.len() <= MAX_DOMAIN_LEN {
+            self.matches_stack(bytes)
+        } else {
+            self.matches_heap(bytes)
+        }
+    }
+
+    #[inline]
+    fn matches_stack(&self, bytes: &[u8]) -> bool {
+        let mut buf = [0u8; MAX_DOMAIN_LEN];
+        let mut len = 0usize;
+        let mut end = bytes.len();
+        let mut first = true;
+
+        while end > 0 {
+            let mut start = end;
+            while start > 0 && bytes[start - 1] != b'.' {
+                start -= 1;
+            }
+
+            if !first {
+                buf[len] = b'\x00';
+                len += 1;
+            }
+            first = false;
+
+            for &b in &bytes[start..end] {
+                buf[len] = b.to_ascii_lowercase();
+                len += 1;
+            }
+
+            if self.set.contains(&buf[..len]) {
                 return true;
             }
+
+            end = if start > 0 { start - 1 } else { 0 };
         }
+
         false
     }
-}
 
-#[derive(Default)]
-struct IpTrieNode {
-    children: [Option<Box<IpTrieNode>>; 2],
-    is_terminal: bool,
-}
+    fn matches_heap(&self, bytes: &[u8]) -> bool {
+        let mut buf = Vec::with_capacity(bytes.len());
+        let mut end = bytes.len();
+        let mut first = true;
 
-impl IpTrieNode {
-    fn insert_bits(&mut self, bits: &[u8]) {
-        let mut node = self;
-        for &bit in bits {
-            let idx = bit as usize;
-            node = node.children[idx].get_or_insert_with(|| Box::new(IpTrieNode::default()));
-
-            if node.is_terminal {
-                return;
+        while end > 0 {
+            let mut start = end;
+            while start > 0 && bytes[start - 1] != b'.' {
+                start -= 1;
             }
-        }
-        node.is_terminal = true;
 
-        node.children = [None, None];
-    }
+            if !first {
+                buf.push(b'\x00');
+            }
+            first = false;
 
-    fn match_bits(&self, bits: &[u8]) -> bool {
-        let mut node = self;
-        for &bit in bits {
-            if node.is_terminal {
+            buf.extend(bytes[start..end].iter().map(|b| b.to_ascii_lowercase()));
+
+            if self.set.contains(&buf) {
                 return true;
             }
-            match &node.children[bit as usize] {
-                Some(child) => node = child,
-                None => return false,
-            }
+
+            end = if start > 0 { start - 1 } else { 0 };
         }
-        node.is_terminal
+
+        false
+    }
+
+    fn is_empty(&self) -> bool {
+        self.set.is_empty()
     }
 }
 
-fn ipv4_to_bits(addr: Ipv4Addr, prefix_len: u8) -> Vec<u8> {
-    let n = u32::from(addr);
-    (0..prefix_len)
-        .map(|i| ((n >> (31 - i)) & 1) as u8)
-        .collect()
+struct IpCidrTable {
+    table: IpNetworkTable<()>,
 }
 
-fn ipv6_to_bits(addr: Ipv6Addr, prefix_len: u8) -> Vec<u8> {
-    let n = u128::from(addr);
-    (0..prefix_len)
-        .map(|i| ((n >> (127 - i)) & 1) as u8)
-        .collect()
+impl IpCidrTable {
+    fn new() -> Self {
+        Self {
+            table: IpNetworkTable::new(),
+        }
+    }
+
+    fn insert_v4(&mut self, addr: Ipv4Addr, prefix_len: u8) -> Result<()> {
+        let net = IpNetwork::new(IpAddr::V4(addr), prefix_len)
+            .with_context(|| format!("invalid IPv4 CIDR {addr}/{prefix_len}"))?;
+        self.table.insert(net, ());
+        Ok(())
+    }
+
+    fn insert_v6(&mut self, addr: Ipv6Addr, prefix_len: u8) -> Result<()> {
+        let net = IpNetwork::new(IpAddr::V6(addr), prefix_len)
+            .with_context(|| format!("invalid IPv6 CIDR {addr}/{prefix_len}"))?;
+        self.table.insert(net, ());
+        Ok(())
+    }
+
+    #[inline]
+    fn contains(&self, ip: IpAddr) -> bool {
+        self.table.longest_match(ip).is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        let (v4len, v6len) = self.table.len();
+        v4len == 0 && v6len == 0
+    }
+}
+
+pub struct BypassRulesBuilder {
+    domain_keys: Vec<Box<[u8]>>,
+    ip_table: IpCidrTable,
+}
+
+impl BypassRulesBuilder {
+    pub fn new() -> Self {
+        Self {
+            domain_keys: Vec::new(),
+            ip_table: IpCidrTable::new(),
+        }
+    }
+
+    pub fn add_domain(&mut self, domain: &str) {
+        if let Some(key) = domain_to_fst_key(domain) {
+            self.domain_keys.push(key);
+        }
+    }
+
+    pub fn add_cidr(&mut self, cidr: &str) -> Result<()> {
+        let (addr_str, prefix_str) = cidr
+            .split_once('/')
+            .with_context(|| format!("missing '/' in CIDR `{cidr}`"))?;
+        let prefix_len: u8 = prefix_str
+            .parse()
+            .with_context(|| format!("invalid prefix length in `{cidr}`"))?;
+
+        match IpAddr::from_str(addr_str)
+            .with_context(|| format!("invalid IP address in `{cidr}`"))?
+        {
+            IpAddr::V4(addr) => {
+                anyhow::ensure!(prefix_len <= 32, "IPv4 prefix > 32 in `{cidr}`");
+                self.ip_table.insert_v4(addr, prefix_len)?;
+            }
+            IpAddr::V6(addr) => {
+                anyhow::ensure!(prefix_len <= 128, "IPv6 prefix > 128 in `{cidr}`");
+                self.ip_table.insert_v6(addr, prefix_len)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn build(mut self) -> Result<BypassRules> {
+        self.domain_keys.sort_unstable();
+        self.domain_keys.dedup();
+
+        let domain_fst = DomainFst::from_sorted_keys(self.domain_keys)?;
+
+        Ok(BypassRules {
+            domain_fst,
+            ip_table: self.ip_table,
+        })
+    }
 }
 
 pub struct BypassRules {
-    domain_trie: DomainTrieNode,
-    ipv4_trie: IpTrieNode,
-    ipv6_trie: IpTrieNode,
+    domain_fst: DomainFst,
+    ip_table: IpCidrTable,
 }
 
 impl BypassRules {
     pub fn load(cfg: &BypassConfig) -> Result<Self> {
-        let mut rules = Self {
-            domain_trie: DomainTrieNode::default(),
-            ipv4_trie: IpTrieNode::default(),
-            ipv6_trie: IpTrieNode::default(),
-        };
+        let mut builder = BypassRulesBuilder::new();
 
         for path in &cfg.bypass_files {
             let content =
@@ -138,54 +263,26 @@ impl BypassRules {
                 .with_context(|| format!("parse bypass file: {path}"))?;
 
             for domain in &file.domain_suffix {
-                rules.domain_trie.insert(domain);
+                builder.add_domain(domain);
             }
             for cidr in &file.ip_cidr {
-                rules
-                    .insert_cidr(cidr)
-                    .with_context(|| format!("invalid cidr `{cidr}` in {path}"))?;
+                builder
+                    .add_cidr(cidr)
+                    .with_context(|| format!("in file {path}"))?;
             }
         }
 
-        Ok(rules)
+        builder.build()
     }
 
-    fn insert_cidr(&mut self, cidr: &str) -> Result<()> {
-        let (addr_str, prefix_str) = cidr
-            .split_once('/')
-            .with_context(|| "missing '/' in cidr")?;
-        let prefix_len: u8 = prefix_str.parse().context("invalid prefix length")?;
-
-        match IpAddr::from_str(addr_str).context("invalid IP address")? {
-            IpAddr::V4(addr) => {
-                anyhow::ensure!(prefix_len <= 32, "IPv4 prefix length > 32");
-                let bits = ipv4_to_bits(addr, prefix_len);
-                self.ipv4_trie.insert_bits(&bits);
-            }
-            IpAddr::V6(addr) => {
-                anyhow::ensure!(prefix_len <= 128, "IPv6 prefix length > 128");
-                let bits = ipv6_to_bits(addr, prefix_len);
-                self.ipv6_trie.insert_bits(&bits);
-            }
-        }
-        Ok(())
-    }
-
+    #[inline]
     pub fn match_domain(&self, domain: &str) -> bool {
-        self.domain_trie.matches(domain)
+        self.domain_fst.matches(domain)
     }
 
+    #[inline]
     pub fn match_ip(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(addr) => {
-                let bits = ipv4_to_bits(addr, 32);
-                self.ipv4_trie.match_bits(&bits)
-            }
-            IpAddr::V6(addr) => {
-                let bits = ipv6_to_bits(addr, 128);
-                self.ipv6_trie.match_bits(&bits)
-            }
-        }
+        self.ip_table.contains(ip)
     }
 
     pub fn should_bypass(&self, target: &str) -> bool {
@@ -197,40 +294,31 @@ impl BypassRules {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.domain_trie.children.is_empty()
-            && self.ipv4_trie.children[0].is_none()
-            && self.ipv4_trie.children[1].is_none()
-            && self.ipv6_trie.children[0].is_none()
-            && self.ipv6_trie.children[1].is_none()
+        self.domain_fst.is_empty() && self.ip_table.is_empty()
     }
 }
 
+#[inline]
 fn extract_host(target: &str) -> &str {
     if let Some(rest) = target.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(target);
     }
-
     target.split(':').next().unwrap_or(target)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     fn make_rules(domains: &[&str], cidrs: &[&str]) -> BypassRules {
-        let mut rules = BypassRules {
-            domain_trie: DomainTrieNode::default(),
-            ipv4_trie: IpTrieNode::default(),
-            ipv6_trie: IpTrieNode::default(),
-        };
+        let mut b = BypassRulesBuilder::new();
         for d in domains {
-            rules.domain_trie.insert(d);
+            b.add_domain(d);
         }
         for c in cidrs {
-            rules.insert_cidr(c).unwrap();
+            b.add_cidr(c).unwrap();
         }
-        rules
+        b.build().unwrap()
     }
 
     #[test]
@@ -264,6 +352,21 @@ mod tests {
         assert!(r.match_domain("anything.com"));
         assert!(r.match_domain("a.b.c.com"));
         assert!(!r.match_domain("anything.net"));
+    }
+
+    #[test]
+    fn domain_case_insensitive() {
+        let r = make_rules(&["Example.COM"], &[]);
+        assert!(r.match_domain("example.com"));
+        assert!(r.match_domain("Sub.Example.Com"));
+        assert!(!r.match_domain("other.net"));
+    }
+
+    #[test]
+    fn domain_dedup() {
+        let r = make_rules(&["example.com", "example.com", ".example.com"], &[]);
+        assert!(r.match_domain("example.com"));
+        assert!(r.match_domain("sub.example.com"));
     }
 
     #[test]

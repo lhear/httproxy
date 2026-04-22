@@ -24,12 +24,15 @@ axum = {version = "0.8.9", features = ["http2", "macros"]}
 bytes = "1.11"
 clap = {version = "4.6.1", features = ["derive"]}
 domain = "0.11"
+fst = "0.4.7"
 futures = "0.3"
 h2 = "0.4"
 http = "1.4"
 http-body = "1.0"
 http-body-util = "0.1"
 httparse = "1.10"
+ip_network = "0.4.1"
+ip_network_table = "0.2.0"
 jsonwebtoken = {version = "10.2", features = ["aws_lc_rs"]}
 moka = {version = "0.12", features = ["future"]}
 pin-project-lite = "0.2"
