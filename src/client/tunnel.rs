@@ -1,0 +1,234 @@
+use anyhow::{Context, Result, anyhow};
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::{FutureExt, StreamExt};
+use http_body_util::BodyExt;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
+use tracing::warn;
+
+use crate::client::constants::{
+    DECODE_BUF_CAPACITY, MAX_BATCH_BYTES, MAX_IN_FLIGHT_BYTES, UPLOAD_CONCURRENCY,
+    UPLOAD_REQUEST_TIMEOUT,
+};
+use crate::client::utils;
+use crate::crypto::AesFrameCipher;
+use crate::shaper::{self, EncodingType, FrameCipher};
+
+use super::state::SharedState;
+
+#[inline]
+pub async fn send_upload_post(
+    http_client: &wreq::Client,
+    state: &SharedState,
+    body: Bytes,
+    session_cookie_val: &str,
+) -> Result<()> {
+    debug_assert!(!body.is_empty(), "empty upload body");
+    let mut cookie = String::new();
+    utils::build_tunnel_cookie(&mut cookie, session_cookie_val);
+    let mut req = http_client
+        .post(state.remote_str.as_str())
+        .header("Accept-Encoding", "identity")
+        .header("Cache-Control", "no-store, no-transform")
+        .header("Content-Type", "application/octet-stream")
+        .header("Cookie", cookie);
+    if state.server_public_key.is_none() {
+        req = req.header("Authorization", state.auth_header.as_str());
+    }
+    let response = tokio::time::timeout(
+        UPLOAD_REQUEST_TIMEOUT,
+        req.body(wreq::Body::from(body)).send(),
+    )
+    .await
+    .context("upload POST timed out")?
+    .context("http post failed")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let _ = response.bytes().await;
+        return Err(anyhow!("upstream rejected upload: {status}"));
+    }
+    response.bytes().await.context("drain upload response")?;
+    Ok(())
+}
+
+pub async fn upload_loop(
+    http_client: Arc<wreq::Client>,
+    state: Arc<SharedState>,
+    initial_payload: Bytes,
+    read_half: tokio::net::tcp::OwnedReadHalf,
+    cipher: Option<Arc<AesFrameCipher>>,
+    encrypted_session: String,
+    start_seq: u64,
+) -> Result<()> {
+    let reader = AsyncReadExt::chain(std::io::Cursor::new(initial_payload), read_half);
+    let traffic_cipher: Option<Arc<dyn FrameCipher>> = cipher
+        .as_ref()
+        .map(|c| Arc::clone(c) as Arc<dyn FrameCipher>);
+
+    let mut shaped = Box::pin(shaper::TrafficShaper::with_seq(
+        reader,
+        state.traffic_config.clone(),
+        traffic_cipher,
+        start_seq,
+    ));
+
+    let request_sem = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
+    let bytes_sem = Arc::new(Semaphore::new(MAX_IN_FLIGHT_BYTES));
+
+    let mut tasks = JoinSet::new();
+    let mut leftover: Option<Bytes> = None;
+
+    loop {
+        let mut batch_buf = BytesMut::with_capacity(8 * 1024);
+        let mut stream_ended = false;
+        let mut bytes_permits: Vec<OwnedSemaphorePermit> = Vec::new();
+
+        if let Some(data) = leftover.take() {
+            let size = data.len() as u32;
+            let permit = bytes_sem
+                .clone()
+                .acquire_many_owned(size)
+                .await
+                .map_err(|_| anyhow!("bytes semaphore closed"))?;
+            batch_buf.put_slice(&data);
+            bytes_permits.push(permit);
+        }
+
+        if batch_buf.is_empty() {
+            match shaped.next().await {
+                Some(Ok((_seq, data))) => {
+                    let size = data.len() as u32;
+                    let permit = bytes_sem
+                        .clone()
+                        .acquire_many_owned(size)
+                        .await
+                        .map_err(|_| anyhow!("bytes semaphore closed"))?;
+                    batch_buf.put_slice(&data);
+                    bytes_permits.push(permit);
+                }
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            }
+        }
+
+        loop {
+            match shaped.next().now_or_never() {
+                Some(Some(Ok((_seq, data)))) => {
+                    let frame_size = data.len();
+                    if batch_buf.len() + frame_size > MAX_BATCH_BYTES {
+                        leftover = Some(data);
+                        break;
+                    }
+                    match bytes_sem.clone().try_acquire_many_owned(frame_size as u32) {
+                        Ok(permit) => {
+                            batch_buf.put_slice(&data);
+                            bytes_permits.push(permit);
+                        }
+                        Err(_) => {
+                            leftover = Some(data);
+                            break;
+                        }
+                    }
+                }
+                Some(Some(Err(e))) => return Err(e.into()),
+                Some(None) => {
+                    stream_ended = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        if batch_buf.is_empty() {
+            if stream_ended {
+                break;
+            }
+            continue;
+        }
+
+        let req_permit = request_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("request semaphore closed"))?;
+
+        let body = batch_buf.freeze();
+        let http_client = Arc::clone(&http_client);
+        let state_ref = Arc::clone(&state);
+        let session_val = encrypted_session.clone();
+
+        tasks.spawn(async move {
+            let _req_guard = req_permit;
+            let _bytes_guards = bytes_permits;
+            send_upload_post(&http_client, &state_ref, body, &session_val).await
+        });
+
+        while let Some(result) = tasks.try_join_next() {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.context("upload POST failed")),
+                Err(join_err) => return Err(anyhow!("upload task panicked: {}", join_err)),
+            }
+        }
+
+        if stream_ended {
+            break;
+        }
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) => return Err(anyhow!("upload task panicked: {}", join_err)),
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn download_loop(
+    response: wreq::Response,
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    cipher: Option<Arc<AesFrameCipher>>,
+    encoding: EncodingType,
+) -> Result<()> {
+    let mut buffer = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
+    let mut data_stream = response.into_data_stream();
+    let cipher_ref: Option<&dyn FrameCipher> = cipher.as_deref().map(|c| c as &dyn FrameCipher);
+    let mut expected_seq: u64 = 0;
+
+    let result: Result<()> = async {
+        while let Some(chunk) = data_stream.next().await {
+            buffer.extend_from_slice(&chunk.context("response read error")?);
+            while let Some((seq, frame)) =
+                shaper::decode_from_buffer(&mut buffer, cipher_ref, encoding)?
+            {
+                if seq != expected_seq {
+                    return Err(anyhow!(
+                        "download frame seq {} out of order, expected {}",
+                        seq,
+                        expected_seq
+                    ));
+                }
+                expected_seq += 1;
+                write_half.write_all(&frame).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if !buffer.is_empty() {
+        warn!(
+            remaining = buffer.len(),
+            "download stream ended with undecoded data"
+        );
+    }
+
+    let _ = write_half.shutdown().await;
+    result
+}
