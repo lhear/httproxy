@@ -10,6 +10,7 @@ use crate::config::ClientTopConfig;
 use crate::crypto;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 
@@ -36,12 +37,22 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
     let remote: url::Url = cfg.client.remote.parse().context("invalid server URL")?;
     let remote_str = remote.as_str().to_owned();
 
+    let proxy_auth = cfg.client.auth.as_ref().map(|a| {
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", a.username, a.password))
+        );
+        (expected, a.username.clone())
+    });
+
     Ok(Arc::new(state::SharedState {
         remote_str,
         auth_header: format!("Bearer {}", cfg.auth.token),
         traffic_config: cfg.traffic_shaping.clone(),
         bypass,
         server_public_key,
+        proxy_auth,
         initial_master: Mutex::new(None),
         handshake_lock: OnceCell::new(),
     }))

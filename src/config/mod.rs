@@ -55,6 +55,15 @@ pub struct ClientSection {
     pub address: Option<String>,
     #[serde(default)]
     pub public_key: Option<String>,
+    #[serde(default)]
+    pub auth: Option<ClientProxyAuth>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ClientProxyAuth {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Deserialize, Debug)]

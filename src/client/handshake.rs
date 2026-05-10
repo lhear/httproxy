@@ -20,6 +20,7 @@ use crate::client::constants::{
     DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, MIN_PADDING, PADDING_POOL,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub async fn try_pq_connect(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
@@ -139,6 +140,7 @@ pub async fn try_pq_connect(
     result
 }
 
+#[allow(clippy::explicit_auto_deref)]
 pub async fn full_handshake(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,

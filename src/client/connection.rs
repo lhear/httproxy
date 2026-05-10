@@ -7,7 +7,10 @@ use tokio::net::TcpStream;
 use tracing::{Instrument, info, warn};
 
 use crate::client::{
-    constants::{CONNECT_RESPONSE, DOWNLOAD_CONNECT_TIMEOUT, EARLY_READ_WINDOW},
+    constants::{
+        CONNECT_RESPONSE, DOWNLOAD_CONNECT_TIMEOUT, EARLY_READ_WINDOW,
+        PROXY_AUTH_REQUIRED_RESPONSE, PROXY_REQUEST_PARSE_TIMEOUT,
+    },
     handshake::{self, try_pq_connect},
     proxy,
     state::SharedState,
@@ -23,7 +26,27 @@ pub async fn handle_connection(
     let (mut read_half, mut write_half) = socket.into_split();
 
     let mut buffer = BytesMut::with_capacity(16 * 1024);
-    let (method, header_len, url) = proxy::parse_proxy_request(&mut read_half, &mut buffer).await?;
+
+    let (method, header_len, url) = loop {
+        let (method, header_len, url, proxy_auth_header) = tokio::time::timeout(
+            PROXY_REQUEST_PARSE_TIMEOUT,
+            proxy::parse_proxy_request(&mut read_half, &mut buffer),
+        )
+        .await
+        .map_err(|_| anyhow!("proxy request parse timeout"))??;
+
+        if let Some((ref expected_auth, _)) = state.proxy_auth
+            && proxy_auth_header
+                .as_ref()
+                .is_none_or(|h| h.trim() != expected_auth.as_str())
+        {
+            write_half.write_all(PROXY_AUTH_REQUIRED_RESPONSE).await?;
+            write_half.flush().await?;
+            buffer.advance(header_len);
+            continue;
+        }
+        break (method, header_len, url);
+    };
 
     if method == "CONNECT" {
         buffer.advance(header_len);
