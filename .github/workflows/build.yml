@@ -19,8 +19,21 @@ jobs:
         with:
           command: check licenses
 
-  linux-gnu:
+  test:
     needs: lint-audit
+    name: cargo test --lib
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: test-ubuntu
+      - name: Run unit tests
+        run: cargo test --lib
+
+  linux-gnu:
+    needs: [lint-audit, test]
     name: Build Linux (GNU)
     runs-on: ubuntu-latest
     strategy:
@@ -29,7 +42,8 @@ jobs:
           - target: x86_64
             target_triple: x86_64-unknown-linux-gnu
             apt_packages: ""
-            custom_env: {}
+            custom_env:
+              RUSTFLAGS: -C target-cpu=x86-64-v3
           - target: arm64
             target_triple: aarch64-unknown-linux-gnu
             apt_packages: crossbuild-essential-arm64
@@ -69,7 +83,7 @@ jobs:
           path: dist/
 
   linux-musl:
-    needs: lint-audit
+    needs: [lint-audit, test]
     name: Build Linux (musl)
     runs-on: ubuntu-latest
     strategy:
@@ -83,6 +97,7 @@ jobs:
               CXX: x86_64-linux-musl-g++
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-g++
               RUSTC_LINKER: x86_64-linux-musl-g++
+              RUSTFLAGS: -C target-cpu=x86-64-v3
           - target: arm64
             target_triple: aarch64-unknown-linux-musl
             package: aarch64-linux-musl-cross
@@ -124,7 +139,7 @@ jobs:
           path: dist/
 
   windows:
-    needs: lint-audit
+    needs: [lint-audit, test]
     name: Build Windows
     runs-on: windows-latest
     strategy:
@@ -132,6 +147,8 @@ jobs:
         include:
           - target: x86_64
             target_triple: x86_64-pc-windows-msvc
+            custom_env:
+              RUSTFLAGS: -C target-cpu=x86-64-v3
           - target: arm64
             target_triple: aarch64-pc-windows-msvc
     steps:
@@ -162,7 +179,7 @@ jobs:
           path: dist/
 
   darwin:
-    needs: lint-audit
+    needs: [lint-audit, test]
     name: Build Darwin
     runs-on: macos-latest
     strategy:
@@ -196,7 +213,7 @@ jobs:
           path: dist/
 
   android:
-    needs: lint-audit
+    needs: [lint-audit, test]
     name: Build Android
     runs-on: ubuntu-latest
     strategy:

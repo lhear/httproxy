@@ -22,6 +22,16 @@ Generate a secure bearer token. **The secret used here must match the `secret` i
 ./server gen-token --secret "my_secret_key" --user "admin" --exp 1768281600
 ```
 
+## Keypair Generation
+
+Generate an X25519 keypair for end-to-end encryption. **The public key will be used in the client configuration, while the private key must be kept secure on the server.**
+
+> **Note**: End-to-end encryption is optional. If the `public_key` is not configured in the client, encryption will be disabled.
+
+```bash
+./server gen-key
+```
+
 ## Client Configuration
 
 `config.toml`:
@@ -30,6 +40,8 @@ Generate a secure bearer token. **The secret used here must match the `secret` i
 [client]
 listen = "127.0.0.1:8080"
 remote = "https://your-server-domain/YOUR_SECRET_PATH"
+# address = "your-server-ip"
+# public_key = "your-public-key"
 
 [auth]
 token = "your-token"
@@ -85,6 +97,7 @@ padding_threshold = 2000
 [server]
 listen = "/dev/shm/httproxy.sock"
 path = "/YOUR_SECRET_PATH"
+# private_key = "your-private-key"
 
 [auth]
 secret = "my_secret_key"
@@ -191,7 +204,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_request_buffering off;
         proxy_http_version 1.1;
-        client_max_body_size 0;
+        client_max_body_size 1m;
         proxy_buffering off;
         proxy_buffer_size 16k;
         proxy_buffers 2 16k;
