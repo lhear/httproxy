@@ -26,7 +26,7 @@ pub async fn stream_janitor(streams: Arc<DashMap<String, Arc<UploadStream>>>) {
 }
 
 pub async fn master_and_nonce_janitor(
-    master_store: Arc<DashMap<String, (String, zeroize::Zeroizing<[u8; 32]>, std::time::Instant)>>,
+    master_store: Arc<DashMap<String, super::MasterStoreEntry>>,
     used_nonces: Arc<DashMap<String, DashSet<[u8; 16]>>>,
 ) {
     let mut interval = tokio::time::interval(NONCE_CLEANUP_INTERVAL);

@@ -7,6 +7,8 @@ use zeroize::Zeroizing;
 use crate::bypass::BypassRules;
 use crate::shaper::TrafficConfig;
 
+pub type InitialMasterEntry = (String, Zeroizing<[u8; 32]>, Instant);
+
 pub struct ManualResolver {
     pub target_addr: String,
 }
@@ -37,6 +39,7 @@ pub struct SharedState {
     pub traffic_config: TrafficConfig,
     pub bypass: Option<Arc<BypassRules>>,
     pub server_public_key: Option<x25519_dalek::PublicKey>,
-    pub initial_master: Mutex<Option<(String, Zeroizing<[u8; 32]>, Instant)>>,
+    pub proxy_auth: Option<(String, String)>,
+    pub initial_master: Mutex<Option<InitialMasterEntry>>,
     pub handshake_lock: OnceCell<tokio::sync::Mutex<()>>,
 }

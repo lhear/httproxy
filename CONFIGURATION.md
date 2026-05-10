@@ -43,6 +43,10 @@ remote = "https://your-server-domain/YOUR_SECRET_PATH"
 # address = "your-server-ip"
 # public_key = "your-public-key"
 
+# [client.auth]
+# username = "proxyuser"
+# password = "proxypass"
+
 [auth]
 token = "your-token"
 

@@ -190,6 +190,7 @@ async fn handle_plaintext_download(
     Ok(resp)
 }
 
+#[allow(clippy::explicit_auto_deref)]
 async fn handle_fresh_handshake(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -315,6 +316,7 @@ async fn handle_fresh_handshake(
     Ok(resp)
 }
 
+#[allow(clippy::explicit_auto_deref)]
 async fn handle_pq_download(
     state: Arc<AppState>,
     cookie_val: &str,

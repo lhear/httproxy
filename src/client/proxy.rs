@@ -7,7 +7,7 @@ use url::Url;
 pub async fn parse_proxy_request(
     reader: &mut (impl AsyncReadExt + Unpin),
     buffer: &mut BytesMut,
-) -> Result<(String, usize, String)> {
+) -> Result<(String, usize, String, Option<String>)> {
     const MAX_HEADER_LEN: usize = 16 * 1024;
 
     loop {
@@ -17,16 +17,25 @@ pub async fn parse_proxy_request(
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         if let httparse::Status::Complete(amt) = req.parse(buffer)? {
+            let proxy_auth = extract_header(req.headers, "proxy-authorization");
             return Ok((
                 req.method.context("no method")?.to_owned(),
                 amt,
                 req.path.context("no path")?.to_owned(),
+                proxy_auth,
             ));
         }
         if buffer.len() > MAX_HEADER_LEN {
             return Err(anyhow!("header too large"));
         }
     }
+}
+
+fn extract_header(headers: &[httparse::Header<'_>], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|h| String::from_utf8_lossy(h.value).into_owned())
 }
 
 #[inline]

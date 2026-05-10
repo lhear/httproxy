@@ -197,6 +197,12 @@ pub struct BypassRulesBuilder {
     ip_table: IpCidrTable,
 }
 
+impl Default for BypassRulesBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BypassRulesBuilder {
     pub fn new() -> Self {
         Self {
