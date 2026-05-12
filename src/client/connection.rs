@@ -1,14 +1,13 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::{Buf, Bytes, BytesMut};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{Instrument, info, warn};
 
 use crate::client::{
     constants::{
-        CONNECT_RESPONSE, DOWNLOAD_CONNECT_TIMEOUT, EARLY_READ_WINDOW,
+        CONNECT_RESPONSE, DOWNLOAD_CONNECT_TIMEOUT, EARLY_READ_WINDOW, MASTER_RESUME_WINDOW_SECS,
         PROXY_AUTH_REQUIRED_RESPONSE, PROXY_REQUEST_PARSE_TIMEOUT,
     },
     handshake::{self, try_pq_connect},
@@ -119,7 +118,7 @@ async fn handle_pq_proxy(
     {
         let mut master_guard = state.initial_master.lock().await;
         if let Some((session_id, master, created)) = master_guard.as_ref() {
-            if created.elapsed() < Duration::from_secs(1200 - 30) {
+            if crate::now_secs().saturating_sub(*created) < MASTER_RESUME_WINDOW_SECS {
                 let (session_id, master) = (session_id.clone(), **master);
                 drop(master_guard);
                 match try_pq_connect(
@@ -158,7 +157,7 @@ async fn handle_pq_proxy(
         {
             let master_guard = state.initial_master.lock().await;
             if let Some((session_id, master, created)) = master_guard.as_ref()
-                && created.elapsed() < Duration::from_secs(1200 - 30)
+                && crate::now_secs().saturating_sub(*created) < MASTER_RESUME_WINDOW_SECS
             {
                 let (session_id, master) = (session_id.clone(), **master);
                 drop(master_guard);

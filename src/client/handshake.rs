@@ -264,7 +264,7 @@ pub async fn full_handshake(
         *lock = Some((
             session_id.clone(),
             Zeroizing::new(*master),
-            std::time::Instant::now(),
+            crate::now_secs(),
         ));
     }
 

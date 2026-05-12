@@ -280,7 +280,7 @@ async fn handle_fresh_handshake(
     let session_id = uuid::Uuid::new_v4().to_string();
     state.master_store.insert(
         session_id.clone(),
-        (user.clone(), master, std::time::Instant::now()),
+        (user.clone(), master, crate::now_secs()),
     );
 
     info!(session_id = %session_id, user = %user, "handshake: master key derived");
@@ -342,7 +342,7 @@ async fn handle_pq_download(
     master.copy_from_slice(&**master_z);
     let username = username.clone();
     let created = *created;
-    if created.elapsed() > MASTER_EXPIRY {
+    if crate::now_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
         drop(entry);
         state.master_store.remove(session_id);
         return Err(ServerError::precondition_required("master key expired"));

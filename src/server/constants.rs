@@ -1,7 +1,4 @@
-use std::{
-    sync::LazyLock,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
 pub const MAX_UPLOAD_BODY_SIZE: usize = 1024 * 1024;
 
@@ -21,9 +18,4 @@ pub const MASTER_EXPIRY: Duration = Duration::from_secs(1200);
 
 pub const PADDING_POOL: &[u8] = b"padding=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 
-pub static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-#[inline(always)]
-pub fn now_secs() -> u64 {
-    START.elapsed().as_secs()
-}
+pub use crate::now_secs;

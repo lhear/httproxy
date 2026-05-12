@@ -21,14 +21,13 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
 };
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use zeroize::Zeroizing;
 
-pub type MasterStoreEntry = (String, Zeroizing<[u8; 32]>, Instant);
+pub type MasterStoreEntry = (String, Zeroizing<[u8; 32]>, u64);
 
 pub static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
