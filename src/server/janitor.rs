@@ -2,7 +2,7 @@ use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::server::constants::{JANITOR_INTERVAL, MASTER_EXPIRY, NONCE_CLEANUP_INTERVAL};
+use crate::server::constants::{JANITOR_INTERVAL, MASTER_EXPIRY, NONCE_CLEANUP_INTERVAL, now_secs};
 use crate::server::state::UploadStream;
 
 pub async fn stream_janitor(streams: Arc<DashMap<String, Arc<UploadStream>>>) {
@@ -34,7 +34,7 @@ pub async fn master_and_nonce_janitor(
     loop {
         interval.tick().await;
         master_store.retain(|session_id, (_, _master, created)| {
-            if created.elapsed() >= MASTER_EXPIRY {
+            if now_secs().saturating_sub(*created) >= MASTER_EXPIRY.as_secs() {
                 used_nonces.remove(session_id);
                 false
             } else {

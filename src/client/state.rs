@@ -1,13 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{Mutex, OnceCell};
 use zeroize::Zeroizing;
 
 use crate::bypass::BypassRules;
 use crate::shaper::TrafficConfig;
 
-pub type InitialMasterEntry = (String, Zeroizing<[u8; 32]>, Instant);
+pub type InitialMasterEntry = (String, Zeroizing<[u8; 32]>, u64);
 
 pub struct ManualResolver {
     pub target_addr: String,

@@ -15,5 +15,7 @@ pub const UPLOAD_CONCURRENCY: usize = 128;
 
 pub const DECODE_BUF_CAPACITY: usize = 16 * 1024 + 2396;
 
+pub const MASTER_RESUME_WINDOW_SECS: u64 = 1170;
+
 pub const PADDING_POOL: &[u8] = b"padding=XXXXXXXXXXXXXXXXXXXXXXXXXX";
 pub const MIN_PADDING: usize = 16;

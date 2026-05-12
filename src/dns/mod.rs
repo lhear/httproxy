@@ -51,7 +51,7 @@ fn deserialize_upstream<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Socket
 #[derive(Clone)]
 struct CacheEntry {
     ips: Vec<IpAddr>,
-    created_at: Instant,
+    created_at: u64,
     ttl: Duration,
     is_refreshing: Arc<AtomicBool>,
 }
@@ -376,14 +376,14 @@ impl DnsClient {
         let key = (domain.to_string(), rtype.to_int(), ecs);
 
         if let Some(entry) = self.cache.get(&key).await {
-            let elapsed = entry.created_at.elapsed();
+            let elapsed = crate::now_secs().saturating_sub(entry.created_at);
 
-            if elapsed < entry.ttl {
+            if elapsed < entry.ttl.as_secs() {
                 debug!("cache hit: {} {:?}, ips: {:?}", domain, rtype, entry.ips);
                 return Ok(entry.ips);
             }
 
-            if elapsed < entry.ttl + Duration::from_secs(self.config.options.swr_ttl) {
+            if elapsed < entry.ttl.as_secs() + self.config.options.swr_ttl {
                 if entry
                     .is_refreshing
                     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -433,7 +433,7 @@ impl DnsClient {
             .map_err(Arc::new)?;
         let entry = CacheEntry {
             ips: ips.clone(),
-            created_at: Instant::now(),
+            created_at: crate::now_secs(),
             ttl,
             is_refreshing: Arc::new(false.into()),
         };
