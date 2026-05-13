@@ -140,7 +140,7 @@ padding_threshold = 2000
 
 The `traffic_shaping` field allows you to configure padding for outgoing packets to obfuscate traffic patterns. It consists of a `global` configuration and an array of `stages` for more granular control.
 
-> **Constraint**: To ensure packets do not exceed protocol limits, all configurations must satisfy: `max(padding_range) + padding_threshold <= 16380`
+> **Constraint**: The maximum padding must not exceed `MAX_RAW_PAYLOAD - raw_len` (up to 16383). Any `padding_range[1]` value beyond this threshold will be silently truncated.
 
 > **Important**: Stages are processed sequentially based on the packet sequence. If you want a specific configuration for the 3rd packet only, you MUST define stages for the 1st and 2nd packets as placeholders.
 
