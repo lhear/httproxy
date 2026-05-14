@@ -348,20 +348,16 @@ async fn handle_pq_download(
         return Err(ServerError::precondition_required("master key expired"));
     }
 
-    let cookie_master_key = crypto::derive_cookie_master_key(&*master);
+    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&*master);
 
     let enc_target = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(enc_target_b64)
         .map_err(|_| ServerError::bad_request("invalid cookie encoding"))?;
-    let target_bytes = crypto::decrypt_bytes(&cookie_master_key, &enc_target)
-        .map_err(|_| ServerError::bad_request("failed to decrypt target"))?;
-    let target = String::from_utf8(target_bytes)
-        .map_err(|_| ServerError::bad_request("invalid target utf8"))?;
 
     let enc_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(enc_nonce_b64)
         .map_err(|_| ServerError::bad_request("invalid cookie encoding"))?;
-    let conn_nonce_bytes = crypto::decrypt_bytes(&cookie_master_key, &enc_nonce)
+    let conn_nonce_bytes = crypto::decrypt_bytes(&cookie_nonce_key, &enc_nonce)
         .map_err(|_| ServerError::bad_request("failed to decrypt conn_nonce"))?;
     let conn_nonce: [u8; 16] = conn_nonce_bytes
         .try_into()
@@ -378,7 +374,14 @@ async fn handle_pq_download(
 
     drop(entry);
 
-    let (upload_key, download_key) = crypto::derive_connection_keys(&*master, &conn_nonce);
+    let (upload_key, download_key, target_key) =
+        crypto::derive_connection_keys(&*master, &conn_nonce);
+
+    let target_bytes = crypto::decrypt_bytes(&target_key, &enc_target)
+        .map_err(|_| ServerError::bad_request("failed to decrypt target"))?;
+    let target = String::from_utf8(target_bytes)
+        .map_err(|_| ServerError::bad_request("invalid target utf8"))?;
+
     let upload_cipher = Arc::new(AesFrameCipher::new(upload_key));
     let download_cipher = Arc::new(AesFrameCipher::new(download_key));
 

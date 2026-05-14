@@ -23,28 +23,33 @@ pub fn derive_initial_master(mlkem_ss: &[u8], x25519_ss: &[u8]) -> Zeroizing<[u8
     master
 }
 
-pub fn derive_cookie_master_key(master: &[u8; 32]) -> AesKey {
+pub fn derive_cookie_nonce_key(master: &[u8; 32]) -> AesKey {
     let hkdf = Hkdf::<Sha256>::new(None, master);
     let mut key = [0u8; 32];
-    hkdf.expand(b"cookie_master_key", &mut key)
+    hkdf.expand(b"cookie_nonce_key", &mut key)
         .expect("32 bytes is valid for HKDF");
     key.into()
 }
 
-pub fn derive_connection_keys(master: &[u8; 32], conn_nonce: &[u8; 16]) -> (AesKey, AesKey) {
+pub fn derive_connection_keys(
+    master: &[u8; 32],
+    conn_nonce: &[u8; 16],
+) -> (AesKey, AesKey, AesKey) {
     let hkdf = Hkdf::<Sha256>::new(None, master);
     let mut info = Vec::with_capacity(16 + 15);
     info.extend_from_slice(conn_nonce);
     info.extend_from_slice(b"connection_keys");
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; 96];
     hkdf.expand(&info, &mut buf)
-        .expect("64 bytes is valid for HKDF");
+        .expect("96 bytes is valid for HKDF");
 
     let mut upload_key = [0u8; 32];
     let mut download_key = [0u8; 32];
+    let mut target_key = [0u8; 32];
     upload_key.copy_from_slice(&buf[..32]);
-    download_key.copy_from_slice(&buf[32..]);
-    (upload_key.into(), download_key.into())
+    download_key.copy_from_slice(&buf[32..64]);
+    target_key.copy_from_slice(&buf[64..]);
+    (upload_key.into(), download_key.into(), target_key.into())
 }
 
 #[cfg(test)]
@@ -72,10 +77,11 @@ mod tests {
     fn connection_keys_deterministic() {
         let master = [0xBBu8; 32];
         let nonce = [0xCCu8; 16];
-        let (up1, dn1) = derive_connection_keys(&master, &nonce);
-        let (up2, dn2) = derive_connection_keys(&master, &nonce);
+        let (up1, dn1, tg1) = derive_connection_keys(&master, &nonce);
+        let (up2, dn2, tg2) = derive_connection_keys(&master, &nonce);
         assert_eq!(up1, up2);
         assert_eq!(dn1, dn2);
+        assert_eq!(tg1, tg2);
     }
 
     #[test]
@@ -83,8 +89,8 @@ mod tests {
         let master = [0xBBu8; 32];
         let n1 = [0xCCu8; 16];
         let n2 = [0xDDu8; 16];
-        let (up1, _) = derive_connection_keys(&master, &n1);
-        let (up2, _) = derive_connection_keys(&master, &n2);
+        let (up1, _, _) = derive_connection_keys(&master, &n1);
+        let (up2, _, _) = derive_connection_keys(&master, &n2);
         assert_ne!(up1, up2);
     }
 }
