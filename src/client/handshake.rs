@@ -34,13 +34,15 @@ pub async fn try_pq_connect(
     info!(session_id = %session_id, target = %target_host, "session resumption: attempting to reuse session");
 
     let conn_nonce: [u8; 16] = rand::rng().random();
-    let (upload_key, download_key) = crypto::derive_connection_keys(master, &conn_nonce);
+    let (upload_key, download_key, target_key) =
+        crypto::derive_connection_keys(master, &conn_nonce);
     let upload_cipher = Arc::new(AesFrameCipher::new(upload_key));
     let download_cipher = Arc::new(AesFrameCipher::new(download_key));
 
-    let cookie_master_key = crypto::derive_cookie_master_key(master);
-    let enc_target = crypto::encrypt_bytes(&cookie_master_key, target_host.as_bytes())?;
-    let enc_conn_nonce = crypto::encrypt_bytes(&cookie_master_key, &conn_nonce)?;
+    let enc_target = crypto::encrypt_bytes(&target_key, target_host.as_bytes())?;
+
+    let cookie_nonce_key = crypto::derive_cookie_nonce_key(master);
+    let enc_conn_nonce = crypto::encrypt_bytes(&cookie_nonce_key, &conn_nonce)?;
 
     let cookie_val = format!(
         "{}:{}:{}",
@@ -269,13 +271,15 @@ pub async fn full_handshake(
     }
 
     let conn_nonce: [u8; 16] = rand::rng().random();
-    let (upload_key, download_key) = crypto::derive_connection_keys(&*master, &conn_nonce);
+    let (upload_key, download_key, target_key) =
+        crypto::derive_connection_keys(&*master, &conn_nonce);
     let upload_cipher = Arc::new(AesFrameCipher::new(upload_key));
     let download_cipher = Arc::new(AesFrameCipher::new(download_key));
 
-    let cookie_master_key = crypto::derive_cookie_master_key(&*master);
-    let enc_target = crypto::encrypt_bytes(&cookie_master_key, target_host.as_bytes())?;
-    let enc_conn_nonce = crypto::encrypt_bytes(&cookie_master_key, &conn_nonce)?;
+    let enc_target = crypto::encrypt_bytes(&target_key, target_host.as_bytes())?;
+
+    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&*master);
+    let enc_conn_nonce = crypto::encrypt_bytes(&cookie_nonce_key, &conn_nonce)?;
 
     let cookie_val = format!(
         "{}:{}:{}",
