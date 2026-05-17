@@ -86,6 +86,7 @@ mod tests {
             },
             stages: vec![],
             encoding_type: Default::default(),
+            max_download_bytes: None,
         };
         let (body, remaining, seq) =
             encode_initial_payload(b"", shaper::MAX_RAW_PAYLOAD, None, &config).unwrap();

@@ -55,5 +55,6 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         proxy_auth,
         initial_master: Mutex::new(None),
         handshake_lock: OnceCell::new(),
+        max_download_bytes: cfg.traffic_shaping.max_download_bytes,
     }))
 }
