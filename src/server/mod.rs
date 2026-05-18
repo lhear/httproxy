@@ -45,7 +45,7 @@ pub struct AppState {
     pub dns_client: Option<Arc<DnsClient>>,
     pub client_subnet: Option<IpAddr>,
     pub traffic_config: Arc<TrafficConfig>,
-    pub streams: Arc<DashMap<String, Arc<state::UploadStream>>>,
+    pub streams: Arc<DashMap<String, Arc<state::StreamBundle>>>,
     pub private_key: Option<x25519_dalek::StaticSecret>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
     pub used_nonces: Arc<DashMap<String, DashSet<[u8; 16]>>>,
@@ -168,6 +168,7 @@ mod tests {
                 },
                 stages: vec![],
                 encoding_type: Default::default(),
+                max_download_bytes: None,
             },
         };
         let rt = tokio::runtime::Runtime::new().unwrap();

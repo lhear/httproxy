@@ -113,7 +113,15 @@ pub async fn try_pq_connect(
         .instrument(tracing::Span::current()),
     );
 
-    let download_fut = download_loop(response, write_half, Some(download_cipher), encoding);
+    let download_fut = download_loop(
+        response,
+        write_half,
+        Some(download_cipher),
+        encoding,
+        cookie_val.clone(),
+        Arc::clone(http_client),
+        Arc::clone(state),
+    );
     tokio::pin!(download_fut);
 
     let result: Result<()> = tokio::select! {
@@ -348,7 +356,15 @@ pub async fn full_handshake(
         .instrument(tracing::Span::current()),
     );
 
-    let download_fut = download_loop(response, write_half, Some(download_cipher), encoding);
+    let download_fut = download_loop(
+        response,
+        write_half,
+        Some(download_cipher),
+        encoding,
+        cookie_val.clone(),
+        Arc::clone(http_client),
+        Arc::clone(state),
+    );
     tokio::pin!(download_fut);
 
     let result: Result<()> = tokio::select! {

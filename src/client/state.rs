@@ -41,4 +41,5 @@ pub struct SharedState {
     pub proxy_auth: Option<(String, String)>,
     pub initial_master: Mutex<Option<InitialMasterEntry>>,
     pub handshake_lock: OnceCell<tokio::sync::Mutex<()>>,
+    pub max_download_bytes: Option<u64>,
 }

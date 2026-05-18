@@ -83,6 +83,8 @@ pub struct TrafficConfig {
     pub stages: Vec<StageConfig>,
     #[serde(default)]
     pub encoding_type: EncodingType,
+    #[serde(default)]
+    pub max_download_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -549,6 +551,7 @@ mod tests {
                 padding_range: [0, 16],
             },
             stages: vec![],
+            max_download_bytes: None,
         }
     }
 

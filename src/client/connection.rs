@@ -270,7 +270,19 @@ async fn handle_plain_proxy(
         .instrument(tracing::Span::current()),
     );
 
-    let download_fut = tunnel::download_loop(response, write_half, None, encoding);
+    let download_http_client = Arc::clone(&http_client);
+    let download_state = Arc::clone(&state);
+    let cookie_val_for_dl = stream_id.clone();
+
+    let download_fut = tunnel::download_loop(
+        response,
+        write_half,
+        None,
+        encoding,
+        cookie_val_for_dl,
+        download_http_client,
+        download_state,
+    );
     tokio::pin!(download_fut);
 
     let result: Result<()> = tokio::select! {
