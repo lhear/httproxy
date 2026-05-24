@@ -24,9 +24,9 @@ Generate a secure bearer token. **The secret used here must match the `secret` i
 
 ## Keypair Generation
 
-Generate an X25519 keypair for end-to-end encryption. **The public key will be used in the client configuration, while the private key must be kept secure on the server.**
+Generate an X25519 keypair to enable hybrid post-quantum encryption. **The public key will be used in the client configuration, while the private key must be kept secure on the server.**
 
-> **Note**: End-to-end encryption is optional. If the `public_key` is not configured in the client, encryption will be disabled.
+> **Note**: Encryption is optional. If the `public_key` is not configured in the client, encryption will be disabled.
 
 ```bash
 ./server gen-key
