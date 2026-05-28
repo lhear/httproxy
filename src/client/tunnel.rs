@@ -239,10 +239,6 @@ async fn download_single_response(
         );
     }
 
-    if let Some(tx) = pre_fetch_trigger.take() {
-        let _ = tx.send(());
-    }
-
     Ok((bytes_received, expected_seq))
 }
 
@@ -301,7 +297,9 @@ pub async fn download_loop(
             let pre_state = Arc::clone(&state);
             let pre_cookie = cookie_val.clone();
             tokio::spawn(async move {
-                let _ = trigger_rx.await;
+                if trigger_rx.await.is_err() {
+                    return;
+                }
                 let result = send_continue_request(&pre_client, &pre_state, &pre_cookie).await;
                 let _ = result_tx.send(result);
             });
