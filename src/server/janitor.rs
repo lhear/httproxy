@@ -13,7 +13,9 @@ pub async fn stream_janitor(streams: Arc<DashMap<String, Arc<StreamBundle>>>) {
         let mut expired = vec![];
         for entry in streams.iter() {
             let bundle = entry.value();
-            if bundle.upload.is_idle() && bundle.upload.do_shutdown() {
+            if (bundle.upload.is_idle() || bundle.upload.is_rotation_stale())
+                && bundle.upload.do_shutdown()
+            {
                 expired.push(entry.key().clone());
             }
         }
@@ -24,7 +26,7 @@ pub async fn stream_janitor(streams: Arc<DashMap<String, Arc<StreamBundle>>>) {
                 *guard = None;
             }
             let display_id = key.split(':').next().unwrap_or(&key);
-            warn!(stream_id = %display_id, reason = "idle timeout", "shutting down idle stream");
+            warn!(stream_id = %display_id, reason = "idle or rotation timeout", "shutting down stream");
         }
     }
 }

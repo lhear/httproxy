@@ -13,7 +13,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::crypto::AesFrameCipher;
-use crate::server::constants::{STREAM_IDLE_TIMEOUT_SECS, now_secs};
+use crate::server::constants::{ROTATION_TIMEOUT_SECS, STREAM_IDLE_TIMEOUT_SECS, now_secs};
 use crate::shaper::{EncodingType, FrameCipher};
 
 pub enum FrameOrEos {
@@ -33,6 +33,7 @@ pub struct UploadStream {
     pub upload_cipher: Option<Arc<AesFrameCipher>>,
     pub shutdown: Arc<Notify>,
     shutdown_flag: AtomicBool,
+    pub rotation_at: AtomicU64,
 }
 
 impl UploadStream {
@@ -44,6 +45,7 @@ impl UploadStream {
             upload_cipher,
             shutdown: Arc::new(Notify::new()),
             shutdown_flag: AtomicBool::new(false),
+            rotation_at: AtomicU64::new(0),
         }
     }
     #[inline(always)]
@@ -63,6 +65,19 @@ impl UploadStream {
             self.shutdown.notify_one();
             true
         }
+    }
+    #[inline(always)]
+    pub fn mark_rotation(&self) {
+        self.rotation_at.store(now_secs(), Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn clear_rotation(&self) {
+        self.rotation_at.store(0, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    pub fn is_rotation_stale(&self) -> bool {
+        let at = self.rotation_at.load(Ordering::Relaxed);
+        at != 0 && now_secs().saturating_sub(at) > ROTATION_TIMEOUT_SECS
     }
 }
 
@@ -133,12 +148,14 @@ impl Stream for DownloadStream {
 
         let threshold = this.bundle.max_download_bytes;
 
-        let mut guard = this
+        let mut shaper_opt = this
             .bundle
             .upstream_reader
             .lock()
-            .expect("upstream_reader mutex poisoned");
-        let shaper = match guard.as_mut() {
+            .expect("upstream_reader mutex poisoned")
+            .take();
+
+        let shaper = match shaper_opt.as_mut() {
             Some(s) => s,
             None => {
                 info!(stream_id = %this.log_key, reason = "upstream reader already taken", "download stream ended");
@@ -159,7 +176,12 @@ impl Stream for DownloadStream {
                 {
                     this.done = true;
                     this.rotated = true;
-                    drop(guard);
+                    this.bundle.upload.mark_rotation();
+                    *this
+                        .bundle
+                        .upstream_reader
+                        .lock()
+                        .expect("upstream_reader mutex poisoned") = shaper_opt;
                     this.release_upstream();
                     debug!(
                         stream_id = %this.log_key,
@@ -168,6 +190,11 @@ impl Stream for DownloadStream {
                     );
                     return Poll::Ready(Some(Ok(data)));
                 }
+                *this
+                    .bundle
+                    .upstream_reader
+                    .lock()
+                    .expect("upstream_reader mutex poisoned") = shaper_opt;
                 Poll::Ready(Some(Ok(data)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -182,7 +209,14 @@ impl Stream for DownloadStream {
                 this.release_upstream();
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                *this
+                    .bundle
+                    .upstream_reader
+                    .lock()
+                    .expect("upstream_reader mutex poisoned") = shaper_opt;
+                Poll::Pending
+            }
         }
     }
 }
