@@ -13,7 +13,10 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{self, AesFrameCipher, AesKey};
 use crate::error::ServerError;
-use crate::server::constants::{CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_UPLOAD_BODY_SIZE};
+use crate::server::constants::{
+    CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_UPLOAD_BODY_SIZE, UPLOAD_CHANNEL_CAPACITY,
+    UPLOAD_DONE_TIMEOUT,
+};
 use crate::server::{
     connection::{self, connect_upstream},
     state::{DownloadStream, FrameOrEos, StreamBundle, UploadStream},
@@ -159,7 +162,7 @@ async fn handle_plaintext_download(
     let session_id = utils::extract_cookie_value(&headers, "session")
         .map(|s| s.to_owned())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(1);
+    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(UPLOAD_CHANNEL_CAPACITY);
 
     let upload = Arc::new(UploadStream::new(frame_tx, None));
 
@@ -474,7 +477,7 @@ async fn handle_pq_download(
     };
 
     let (upstream_read, upstream_write) = upstream.into_split();
-    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(1);
+    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(UPLOAD_CHANNEL_CAPACITY);
 
     let upload = Arc::new(UploadStream::new(frame_tx, Some(upload_cipher)));
 
@@ -551,6 +554,8 @@ async fn handle_download_continuation(
         .get(cookie_val)
         .map(|r| Arc::clone(r.value()))
         .ok_or_else(|| ServerError::not_found("stream not found for continuation"))?;
+
+    bundle.upload.clear_rotation();
 
     let session_id = cookie_val.split(':').next().unwrap_or(cookie_val);
 
@@ -661,8 +666,9 @@ async fn handle_stream_upload(
         .await
         .map_err(|_| ServerError::bad_gateway("upload channel closed"))?;
 
-    done_rx
+    tokio::time::timeout(UPLOAD_DONE_TIMEOUT, done_rx)
         .await
+        .map_err(|_| ServerError::gateway_timeout("upload drain timeout"))?
         .map_err(|_| ServerError::bad_gateway("upload stream closed"))?;
 
     bundle.upload.touch();
