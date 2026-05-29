@@ -16,7 +16,7 @@ pub const JANITOR_INTERVAL: Duration = Duration::from_secs(30);
 pub const NONCE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const UPLOAD_CHANNEL_CAPACITY: usize = 16;
 
