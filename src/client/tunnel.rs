@@ -64,9 +64,7 @@ pub async fn upload_loop(
     start_seq: u64,
 ) -> Result<()> {
     let reader = AsyncReadExt::chain(std::io::Cursor::new(initial_payload), read_half);
-    let traffic_cipher: Option<Arc<dyn FrameCipher>> = cipher
-        .as_ref()
-        .map(|c| Arc::clone(c) as Arc<dyn FrameCipher>);
+    let traffic_cipher: Option<Arc<dyn FrameCipher>> = cipher.map(|c| c as Arc<dyn FrameCipher>);
 
     let mut shaped = Box::pin(shaper::TrafficShaper::with_seq(
         reader,
@@ -212,10 +210,9 @@ async fn download_single_response(
 
         if let Some(at) = pre_fetch_at
             && bytes_received >= at
+            && let Some(tx) = pre_fetch_trigger.take()
         {
-            if let Some(tx) = pre_fetch_trigger.take() {
-                let _ = tx.send(());
-            }
+            let _ = tx.send(());
         }
 
         buffer.extend_from_slice(&chunk);

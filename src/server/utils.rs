@@ -41,7 +41,7 @@ pub fn extract_cookie_value<'a>(headers: &'a axum::http::HeaderMap, key: &str) -
     None
 }
 
-#[inline(always)]
+#[inline]
 pub fn random_padding() -> &'static [u8] {
     let padding_len = rand::rng().random_range(30..=PADDING_POOL.len());
     &PADDING_POOL[..padding_len]

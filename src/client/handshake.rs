@@ -6,7 +6,7 @@ use futures::StreamExt;
 use http_body_util::BodyExt;
 use rand::RngExt;
 use std::sync::Arc;
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, info};
 use zeroize::Zeroizing;
 
 use crate::client::tunnel;
@@ -20,17 +20,22 @@ use crate::client::constants::{
     DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, MIN_PADDING, PADDING_POOL,
 };
 
-#[allow(clippy::too_many_arguments)]
+pub struct PqSessionTicket {
+    pub master: Zeroizing<[u8; 32]>,
+    pub session_id: String,
+}
+
 pub async fn try_pq_connect(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
-    master: &[u8; 32],
-    session_id: &str,
+    ticket: &PqSessionTicket,
     target_host: &str,
     initial_payload: Bytes,
     read_half: &mut Option<tokio::net::tcp::OwnedReadHalf>,
     write_half: &mut Option<tokio::net::tcp::OwnedWriteHalf>,
 ) -> Result<()> {
+    let master = &ticket.master;
+    let session_id = &ticket.session_id;
     info!(session_id = %session_id, target = %target_host, "session resumption: attempting to reuse session");
 
     let conn_nonce: [u8; 16] = rand::rng().random();
@@ -97,7 +102,7 @@ pub async fn try_pq_connect(
     let upload_cipher_clone = Arc::clone(&upload_cipher);
     let session_cookie_val = cookie_val.clone();
 
-    let mut upload_task = tokio::spawn(
+    let upload_task = tokio::spawn(
         async move {
             tunnel::upload_loop(
                 upload_client,
@@ -122,32 +127,8 @@ pub async fn try_pq_connect(
         Arc::clone(http_client),
         Arc::clone(state),
     );
-    tokio::pin!(download_fut);
 
-    let result: Result<()> = tokio::select! {
-        biased;
-        upload_res = &mut upload_task => {
-            let upload_outcome: Result<()> = match upload_res {
-                Ok(r) => r,
-                Err(e) if e.is_cancelled() => Ok(()),
-                Err(e) => Err(anyhow!("upload task panicked: {e}")),
-            };
-            if let Err(ref e) = upload_outcome {
-                warn!(reason = %e, "upload failed; aborting download");
-                return upload_outcome;
-            }
-            download_fut.await
-        }
-        dl_res = &mut download_fut => {
-            upload_task.abort();
-            let _ = upload_task.await;
-            if let Err(ref e) = dl_res {
-                warn!(reason = %e, "download failed; upload task aborted");
-            }
-            dl_res.context("download failed")
-        }
-    };
-    result
+    utils::race_upload_download(upload_task, download_fut, Some("download failed")).await
 }
 
 #[allow(clippy::explicit_auto_deref)]
@@ -184,7 +165,9 @@ pub async fn full_handshake(
         &client_hello,
         0,
         Some(&handshake_cipher),
-        &state.traffic_config,
+        state.traffic_config.global.padding_threshold,
+        state.traffic_config.global.padding_range,
+        state.traffic_config.encoding_type,
     )?;
 
     let eph_pk_a_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eph_pk_a.as_bytes());
@@ -340,7 +323,7 @@ pub async fn full_handshake(
     drop(kem_sk);
     drop(eph_sk_b);
 
-    let mut upload_task = tokio::spawn(
+    let upload_task = tokio::spawn(
         async move {
             tunnel::upload_loop(
                 upload_client,
@@ -365,30 +348,6 @@ pub async fn full_handshake(
         Arc::clone(http_client),
         Arc::clone(state),
     );
-    tokio::pin!(download_fut);
 
-    let result: Result<()> = tokio::select! {
-        biased;
-        upload_res = &mut upload_task => {
-            let upload_outcome: Result<()> = match upload_res {
-                Ok(r) => r,
-                Err(e) if e.is_cancelled() => Ok(()),
-                Err(e) => Err(anyhow!("upload task panicked: {e}")),
-            };
-            if let Err(ref e) = upload_outcome {
-                warn!(reason = %e, "upload failed; aborting download");
-                return upload_outcome;
-            }
-            download_fut.await
-        }
-        dl_res = &mut download_fut => {
-            upload_task.abort();
-            let _ = upload_task.await;
-            if let Err(ref e) = dl_res {
-                warn!(reason = %e, "download failed; upload task aborted");
-            }
-            dl_res.context("tunnel download failed")
-        }
-    };
-    result
+    utils::race_upload_download(upload_task, download_fut, Some("tunnel download failed")).await
 }

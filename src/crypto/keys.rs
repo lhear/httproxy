@@ -27,11 +27,11 @@ fn encode_fixed_32(bytes: &[u8; X25519_KEY_LEN]) -> String {
 }
 
 #[inline]
-fn decode_fixed_32(s: &str, kind: &'static str) -> Result<[u8; X25519_KEY_LEN]> {
+fn decode_fixed_32(s: &str) -> Result<[u8; X25519_KEY_LEN]> {
     let mut out = [0u8; X25519_KEY_LEN];
     let decoded = URL_SAFE_NO_PAD.decode(s.as_bytes())?;
     if decoded.len() != X25519_KEY_LEN {
-        return Err(anyhow!("invalid {kind} length"));
+        return Err(anyhow!("invalid key length"));
     }
     out.copy_from_slice(&decoded);
     Ok(out)
@@ -49,12 +49,12 @@ pub fn private_key_to_b64(sk: &StaticSecret) -> String {
 
 #[inline]
 pub fn b64_to_public_key(s: &str) -> Result<X25519PublicKey> {
-    Ok(X25519PublicKey::from(decode_fixed_32(s, "public key")?))
+    Ok(X25519PublicKey::from(decode_fixed_32(s)?))
 }
 
 #[inline]
 pub fn b64_to_private_key(s: &str) -> Result<StaticSecret> {
-    Ok(StaticSecret::from(decode_fixed_32(s, "private key")?))
+    Ok(StaticSecret::from(decode_fixed_32(s)?))
 }
 
 #[inline]

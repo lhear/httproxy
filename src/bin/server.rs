@@ -1,5 +1,4 @@
 use clap::Parser;
-use serde::{Deserialize, Serialize};
 use std::fs;
 
 #[derive(Parser, Debug)]
@@ -26,12 +25,6 @@ enum Commands {
     GenKey,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: u64,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -41,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
             Commands::GenToken { secret, user, exp } => {
                 let token = jsonwebtoken::encode(
                     &jsonwebtoken::Header::default(),
-                    &Claims { sub: user, exp },
+                    &httproxy::server::Claims { sub: user, exp },
                     &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
                 )?;
                 println!("{token}");

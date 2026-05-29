@@ -2,7 +2,7 @@ use std::{sync::LazyLock, time::Instant};
 
 pub static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-#[inline(always)]
+#[inline]
 pub fn now_secs() -> u64 {
     START.elapsed().as_secs()
 }

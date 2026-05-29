@@ -29,8 +29,6 @@ use zeroize::Zeroizing;
 
 pub type MasterStoreEntry = (String, Zeroizing<[u8; 32]>, u64);
 
-pub static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -49,9 +47,15 @@ pub struct AppState {
     pub private_key: Option<x25519_dalek::StaticSecret>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
     pub used_nonces: Arc<DashMap<String, DashSet<[u8; 16]>>>,
+    pub stream_id_counter: Arc<AtomicU64>,
 }
 
 pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<AppState>> {
+    config
+        .traffic_shaping
+        .validate()
+        .context("invalid traffic_shaping config")?;
+
     let (dns_client, client_subnet) = match config.dns {
         Some(ref mut dc) => {
             let mut dc = dc.clone();
@@ -87,23 +91,25 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         private_key,
         master_store: Arc::new(DashMap::new()),
         used_nonces: Arc::new(DashMap::new()),
+        stream_id_counter: Arc::new(AtomicU64::new(1)),
     }))
 }
 
 pub fn build_router(state: Arc<AppState>, path: &str) -> Router {
     use tracing::field::Empty;
+    let span_state = Arc::clone(&state);
     Router::new()
         .route(path, post(handlers::dispatch))
         .layer(
             ServiceBuilder::new().layer(TraceLayer::new_for_http().make_span_with(
-                |req: &axum::http::Request<Body>| {
-                    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+                move |req: &axum::http::Request<Body>| {
+                    let id = span_state.stream_id_counter.fetch_add(1, Ordering::Relaxed);
                     let client = req
                         .headers()
                         .get("X-Forwarded-For")
                         .and_then(|h| h.to_str().ok())
                         .unwrap_or("-");
-                    tracing::error_span!("session", id, client, user = Empty, target = Empty)
+                    tracing::info_span!("session", id, client, user = Empty, target = Empty)
                 },
             )),
         )

@@ -82,49 +82,7 @@ impl DomainFst {
         }
 
         let bytes = domain.as_bytes();
-        if bytes.len() <= MAX_DOMAIN_LEN {
-            self.matches_stack(bytes)
-        } else {
-            self.matches_heap(bytes)
-        }
-    }
-
-    #[inline]
-    fn matches_stack(&self, bytes: &[u8]) -> bool {
-        let mut buf = [0u8; MAX_DOMAIN_LEN];
-        let mut len = 0usize;
-        let mut end = bytes.len();
-        let mut first = true;
-
-        while end > 0 {
-            let mut start = end;
-            while start > 0 && bytes[start - 1] != b'.' {
-                start -= 1;
-            }
-
-            if !first {
-                buf[len] = b'\x00';
-                len += 1;
-            }
-            first = false;
-
-            for &b in &bytes[start..end] {
-                buf[len] = b.to_ascii_lowercase();
-                len += 1;
-            }
-
-            if self.set.contains(&buf[..len]) {
-                return true;
-            }
-
-            end = if start > 0 { start - 1 } else { 0 };
-        }
-
-        false
-    }
-
-    fn matches_heap(&self, bytes: &[u8]) -> bool {
-        let mut buf = Vec::with_capacity(bytes.len());
+        let mut buf = Vec::with_capacity(bytes.len().min(MAX_DOMAIN_LEN));
         let mut end = bytes.len();
         let mut first = true;
 

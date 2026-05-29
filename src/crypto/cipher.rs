@@ -3,8 +3,6 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::Rng;
 use std::io;
 use zeroize::Zeroizing;
@@ -42,13 +40,9 @@ fn encrypt_with_cipher(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>> 
 }
 
 #[inline]
-fn decrypt_with_cipher(
-    cipher: &Aes256Gcm,
-    data: &[u8],
-    short_err: &'static str,
-) -> Result<Vec<u8>> {
+fn decrypt_with_cipher(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < NONCE_LEN + TAG_LEN {
-        return Err(anyhow!(short_err));
+        return Err(anyhow!("ciphertext too short"));
     }
     let ct_end = data.len() - TAG_LEN;
     let mut plaintext = data[NONCE_LEN..ct_end].to_vec();
@@ -64,39 +58,6 @@ fn decrypt_with_cipher(
     Ok(plaintext)
 }
 
-#[allow(dead_code)]
-#[inline]
-pub fn encrypt_cookie(key: &AesKey, plaintext: &str) -> Result<String> {
-    let cipher = Aes256Gcm::new(key);
-    let encrypted = encrypt_with_cipher(&cipher, plaintext.as_bytes())?;
-    Ok(URL_SAFE_NO_PAD.encode(encrypted))
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn decrypt_cookie(key: &AesKey, ciphertext_b64: &str) -> Result<String> {
-    let mut combined = URL_SAFE_NO_PAD.decode(ciphertext_b64.as_bytes())?;
-    if combined.len() < NONCE_LEN + TAG_LEN {
-        return Err(anyhow!("ciphertext too short"));
-    }
-    let cipher = Aes256Gcm::new(key);
-    let ct_len = combined.len() - NONCE_LEN - TAG_LEN;
-    let (nonce_bytes, rest) = combined.split_at_mut(NONCE_LEN);
-    let (ciphertext, tag_bytes) = rest.split_at_mut(ct_len);
-
-    cipher
-        .decrypt_in_place_detached(
-            Nonce::from_slice(nonce_bytes),
-            EMPTY_AAD,
-            ciphertext,
-            Tag::from_slice(tag_bytes),
-        )
-        .map_err(|e| anyhow!("decryption error: {e}"))?;
-
-    let result = ciphertext.to_vec();
-    String::from_utf8(result).map_err(|e| anyhow!("invalid utf8: {e}"))
-}
-
 #[inline]
 pub fn encrypt_bytes(key: &AesKey, data: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key);
@@ -106,7 +67,7 @@ pub fn encrypt_bytes(key: &AesKey, data: &[u8]) -> Result<Vec<u8>> {
 #[inline]
 pub fn decrypt_bytes(key: &AesKey, data: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key);
-    decrypt_with_cipher(&cipher, data, "encrypted data too short")
+    decrypt_with_cipher(&cipher, data)
 }
 
 pub struct AesFrameCipher {
@@ -142,8 +103,7 @@ impl FrameCipher for AesFrameCipher {
 
     #[inline]
     fn decrypt(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        decrypt_with_cipher(&self.cipher, data, "encrypted frame too short")
-            .map_err(io::Error::other)
+        decrypt_with_cipher(&self.cipher, data).map_err(io::Error::other)
     }
 }
 
@@ -168,15 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn cookie_encrypt_decrypt_roundtrip() {
-        let key = random_key();
-        let msg = "session-1234";
-        let ct = encrypt_cookie(&key, msg).unwrap();
-        let pt = decrypt_cookie(&key, &ct).unwrap();
-        assert_eq!(pt, msg);
-    }
-
-    #[test]
     fn frame_cipher_roundtrip() {
         let key = random_key();
         let cipher = AesFrameCipher::new(key);
@@ -190,13 +141,5 @@ mod tests {
     fn decrypt_garbage_fails() {
         let key = random_key();
         assert!(decrypt_bytes(&key, b"too-short").is_err());
-    }
-
-    #[test]
-    fn decrypt_cookie_invalid_utf8() {
-        let key = random_key();
-        let junk = URL_SAFE_NO_PAD.encode(b"\xff\xfe\xfd");
-        let padded = format!("AAAAQQAAAAAA{}{junk}", "x".repeat(12));
-        assert!(decrypt_cookie(&key, &padded).is_err());
     }
 }
