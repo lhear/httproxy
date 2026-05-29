@@ -76,7 +76,7 @@ pub async fn upload_loop(
     let request_sem = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
     let bytes_sem = Arc::new(Semaphore::new(MAX_IN_FLIGHT_BYTES));
 
-    let mut tasks = JoinSet::new();
+    let mut tasks: JoinSet<Result<(), anyhow::Error>> = JoinSet::new();
     let mut leftover: Option<Bytes> = None;
 
     loop {
@@ -96,19 +96,33 @@ pub async fn upload_loop(
         }
 
         if batch_buf.is_empty() {
-            match shaped.next().await {
-                Some(Ok((_seq, data))) => {
-                    let size = data.len() as u32;
-                    let permit = bytes_sem
-                        .clone()
-                        .acquire_many_owned(size)
-                        .await
-                        .map_err(|_| anyhow!("bytes semaphore closed"))?;
-                    batch_buf.put_slice(&data);
-                    bytes_permits.push(permit);
+            tokio::select! {
+                frame = shaped.next() => {
+                    match frame {
+                        Some(Ok((_seq, data))) => {
+                            let size = data.len() as u32;
+                            let permit = bytes_sem
+                                .clone()
+                                .acquire_many_owned(size)
+                                .await
+                                .map_err(|_| anyhow!("bytes semaphore closed"))?;
+                            batch_buf.put_slice(&data);
+                            bytes_permits.push(permit);
+                        }
+                        Some(Err(e)) => return Err(e.into()),
+                        None => {
+                            stream_ended = true;
+                        }
+                    }
                 }
-                Some(Err(e)) => return Err(e.into()),
-                None => break,
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    match result {
+                        Some(Ok(Ok(()))) => {}
+                        Some(Ok(Err(e))) => return Err(e.context("upload POST failed")),
+                        Some(Err(join_err)) => return Err(anyhow!("upload task panicked: {}", join_err)),
+                        None => {}
+                    }
+                }
             }
         }
 
