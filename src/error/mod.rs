@@ -59,35 +59,35 @@ impl From<std::io::Error> for HttpProxyError {
 pub struct ServerError(pub StatusCode, pub String);
 
 impl ServerError {
-    #[inline(always)]
+    #[inline]
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, msg.into())
     }
-    #[inline(always)]
+    #[inline]
     pub fn bad_gateway(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_GATEWAY, msg.into())
     }
-    #[inline(always)]
+    #[inline]
     pub fn gateway_timeout(msg: impl Into<String>) -> Self {
         Self(StatusCode::GATEWAY_TIMEOUT, msg.into())
     }
-    #[inline(always)]
+    #[inline]
     pub fn unauthorized(msg: impl Into<String>) -> Self {
         Self(StatusCode::UNAUTHORIZED, msg.into())
     }
-    #[inline(always)]
+    #[inline]
     pub fn not_found(msg: impl Into<String>) -> Self {
-        Self(StatusCode::GONE, msg.into())
+        Self(StatusCode::NOT_FOUND, msg.into())
     }
-    #[inline(always)]
+    #[inline]
     pub fn internal(msg: impl Into<String>) -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
     }
-    #[inline(always)]
+    #[inline]
     pub fn payload_too_large(msg: impl Into<String>) -> Self {
         Self(StatusCode::PAYLOAD_TOO_LARGE, msg.into())
     }
-    #[inline(always)]
+    #[inline]
     pub fn precondition_required(msg: impl Into<String>) -> Self {
         Self(StatusCode::PRECONDITION_REQUIRED, msg.into())
     }
@@ -99,8 +99,8 @@ impl IntoResponse for ServerError {
     }
 }
 
-impl<E: std::error::Error> From<E> for ServerError {
-    fn from(err: E) -> Self {
+impl From<std::io::Error> for ServerError {
+    fn from(err: std::io::Error) -> Self {
         Self::internal(err.to_string())
     }
 }
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn error_display_and_source() {
-        let io_err = HttpProxyError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let io_err = HttpProxyError::Io(std::io::Error::other("boom"));
         assert!(io_err.to_string().contains("boom"));
         assert!(std::error::Error::source(&io_err).is_some());
 
@@ -135,7 +135,7 @@ mod tests {
             StatusCode::GATEWAY_TIMEOUT
         );
         assert_eq!(ServerError::unauthorized("x").0, StatusCode::UNAUTHORIZED);
-        assert_eq!(ServerError::not_found("x").0, StatusCode::GONE);
+        assert_eq!(ServerError::not_found("x").0, StatusCode::NOT_FOUND);
         assert_eq!(
             ServerError::internal("x").0,
             StatusCode::INTERNAL_SERVER_ERROR
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn app_error_from_std_error() {
-        let io = std::io::Error::new(std::io::ErrorKind::Other, "oops");
+        let io = std::io::Error::other("oops");
         let app: ServerError = io.into();
         assert_eq!(app.0, StatusCode::INTERNAL_SERVER_ERROR);
     }

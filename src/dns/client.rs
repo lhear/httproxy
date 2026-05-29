@@ -34,6 +34,11 @@ use super::transport::{DotTransport, UdpTransport, init_dot_transport};
 type CacheKey = (String, u16, Option<IpAddr>);
 type SharedDnsResult = Result<(Vec<IpAddr>, Duration), Arc<anyhow::Error>>;
 
+enum Transport {
+    Udp(UdpTransport),
+    Dot(DotTransport),
+}
+
 #[derive(Clone)]
 struct CacheEntry {
     ips: Vec<IpAddr>,
@@ -47,15 +52,14 @@ pub struct DnsClient {
     cache: Cache<CacheKey, CacheEntry>,
     single_flight: SingleFlight<CacheKey, SharedDnsResult>,
     semaphore: Arc<Semaphore>,
-    udp_transport: Option<UdpTransport>,
-    dot_transport: Option<DotTransport>,
+    transport: Transport,
 }
 
 impl DnsClient {
     pub async fn new(config: &DnsConfig) -> Result<Self> {
-        let (udp, dot) = match config.options.protocol {
-            Protocol::Udp => (Some(UdpTransport::new(config.upstream).await?), None),
-            Protocol::Dot => (None, Some(init_dot_transport(config)?)),
+        let transport = match config.options.protocol {
+            Protocol::Udp => Transport::Udp(UdpTransport::new(config.upstream).await?),
+            Protocol::Dot => Transport::Dot(init_dot_transport(config)?),
         };
         Ok(Self {
             config: config.clone(),
@@ -67,8 +71,7 @@ impl DnsClient {
                 .build(),
             single_flight: SingleFlight::new(),
             semaphore: Arc::new(Semaphore::new(config.options.max_concurrent_queries)),
-            udp_transport: udp,
-            dot_transport: dot,
+            transport,
         })
     }
 
@@ -156,10 +159,9 @@ impl DnsClient {
 
         let mut query = self.build_query(domain, rtype, ecs, 0)?;
 
-        let (resp, id) = match (&self.udp_transport, &self.dot_transport) {
-            (Some(udp), _) => udp.send(&mut query).await?,
-            (_, Some(dot)) => dot.send(&mut query).await?,
-            _ => return Err(anyhow!("no transport configured")),
+        let (resp, id) = match &self.transport {
+            Transport::Udp(udp) => udp.send(&mut query).await?,
+            Transport::Dot(dot) => dot.send(&mut query).await?,
         };
 
         self.parse_response(&resp, id, rtype)
@@ -378,11 +380,7 @@ impl DnsClient {
         ))
     }
 
-    async fn connect_single(
-        ip: IpAddr,
-        port: u16,
-        proxy: Option<String>,
-    ) -> Result<TcpStream, Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect_single(ip: IpAddr, port: u16, proxy: Option<String>) -> Result<TcpStream> {
         let addr = SocketAddr::new(ip, port);
         let t = Duration::from_secs(10);
         let stream = match proxy {
@@ -392,12 +390,17 @@ impl DnsClient {
                     .or_else(|| url.strip_prefix("socks5h://"))
                     .unwrap_or(&url);
                 timeout(t, Socks5Stream::connect(proxy_addr, addr))
-                    .await??
+                    .await
+                    .context("connect timeout")?
+                    .map_err(|e| anyhow!("socks5 connect: {e}"))?
                     .into_inner()
             }
-            None => timeout(t, TcpStream::connect(addr)).await??,
+            None => timeout(t, TcpStream::connect(addr))
+                .await
+                .context("connect timeout")?
+                .map_err(|e| anyhow!("tcp connect: {e}"))?,
         };
-        stream.set_nodelay(true)?;
+        stream.set_nodelay(true).context("set_nodelay")?;
         Ok(stream)
     }
 }

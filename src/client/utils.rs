@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use rand::RngExt;
+use std::future::Future;
+use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::client::constants::{MIN_PADDING, PADDING_POOL};
 use crate::shaper::{self, FrameCipher};
@@ -39,14 +42,56 @@ pub fn encode_initial_payload(
     while offset < data_to_send.len() {
         let chunk_end = (offset + raw_payload_limit).min(data_to_send.len());
         let chunk = &data_to_send[offset..chunk_end];
-        let frame = shaper::encode_frame(chunk, seq, cipher, config)
-            .context("encode_frame failed on initial payload")?;
+        let frame = shaper::encode_frame(
+            chunk,
+            seq,
+            cipher,
+            config.global.padding_threshold,
+            config.global.padding_range,
+            config.encoding_type,
+        )
+        .context("encode_frame failed on initial payload")?;
         body.extend_from_slice(&frame);
         offset = chunk_end;
         seq += 1;
     }
 
     Ok((body, remaining, seq))
+}
+
+pub async fn race_upload_download<F: Future<Output = Result<()>>>(
+    mut upload_task: JoinHandle<Result<()>>,
+    download_fut: F,
+    download_label: Option<&'static str>,
+) -> Result<()> {
+    tokio::pin!(download_fut);
+    tokio::select! {
+        biased;
+        upload_res = &mut upload_task => {
+            let upload_outcome: Result<()> = match upload_res {
+                Ok(r) => r,
+                Err(e) if e.is_cancelled() => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("upload task panicked: {e}")),
+            };
+            if let Err(ref e) = upload_outcome {
+                warn!(reason = %e, "upload failed; aborting download");
+                return upload_outcome;
+            }
+            download_fut.await
+        }
+        dl_res = &mut download_fut => {
+            upload_task.abort();
+            let _ = upload_task.await;
+            if let Err(ref e) = dl_res {
+                warn!(reason = %e, "download failed; upload task aborted");
+            }
+            if let Some(label) = download_label {
+                dl_res.context(label)
+            } else {
+                dl_res
+            }
+        }
+    }
 }
 
 #[inline]
@@ -103,7 +148,7 @@ mod tests {
 
     #[test]
     fn is_not_silent_other() {
-        let e = std::io::Error::new(std::io::ErrorKind::Other, "other");
+        let e = std::io::Error::other("other");
         assert!(!is_silent_error(&e));
     }
 }

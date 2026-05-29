@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{Instrument, info, warn};
+use zeroize::Zeroizing;
 
 use crate::client::{
     constants::{
@@ -119,13 +120,15 @@ async fn handle_pq_proxy(
         let mut master_guard = state.initial_master.lock().await;
         if let Some((session_id, master, created)) = master_guard.as_ref() {
             if crate::now_secs().saturating_sub(*created) < MASTER_RESUME_WINDOW_SECS {
-                let (session_id, master) = (session_id.clone(), **master);
+                let ticket = handshake::PqSessionTicket {
+                    master: Zeroizing::new(**master),
+                    session_id: session_id.clone(),
+                };
                 drop(master_guard);
                 match try_pq_connect(
                     &http_client,
                     &state,
-                    &master,
-                    &session_id,
+                    &ticket,
                     target_host,
                     initial_payload.clone(),
                     &mut read_half,
@@ -159,13 +162,15 @@ async fn handle_pq_proxy(
             if let Some((session_id, master, created)) = master_guard.as_ref()
                 && crate::now_secs().saturating_sub(*created) < MASTER_RESUME_WINDOW_SECS
             {
-                let (session_id, master) = (session_id.clone(), **master);
+                let ticket = handshake::PqSessionTicket {
+                    master: Zeroizing::new(**master),
+                    session_id: session_id.clone(),
+                };
                 drop(master_guard);
                 match try_pq_connect(
                     &http_client,
                     &state,
-                    &master,
-                    &session_id,
+                    &ticket,
                     target_host,
                     initial_payload.clone(),
                     &mut read_half,
@@ -183,7 +188,7 @@ async fn handle_pq_proxy(
                         }
                         let mut mg = state.initial_master.lock().await;
                         if let Some((ref cur_sid, _, _)) = *mg
-                            && cur_sid == &session_id
+                            && cur_sid == &ticket.session_id
                         {
                             *mg = None;
                         }
@@ -254,7 +259,7 @@ async fn handle_plain_proxy(
     let upload_state = Arc::clone(&state);
     let stream_id_clone = stream_id.clone();
 
-    let mut upload_task = tokio::spawn(
+    let upload_task = tokio::spawn(
         async move {
             tunnel::upload_loop(
                 upload_client,
@@ -283,32 +288,8 @@ async fn handle_plain_proxy(
         download_http_client,
         download_state,
     );
-    tokio::pin!(download_fut);
 
-    let result: Result<()> = tokio::select! {
-        biased;
-        upload_res = &mut upload_task => {
-            let upload_outcome: Result<()> = match upload_res {
-                Ok(r) => r,
-                Err(e) if e.is_cancelled() => Ok(()),
-                Err(e) => Err(anyhow!("upload task panicked: {e}")),
-            };
-            if let Err(ref e) = upload_outcome {
-                warn!(reason = %e, "upload failed; aborting download");
-                return upload_outcome;
-            }
-            download_fut.await
-        }
-        dl_res = &mut download_fut => {
-            upload_task.abort();
-            let _ = upload_task.await;
-            if let Err(ref e) = dl_res {
-                warn!(reason = %e, "download failed; upload task aborted");
-            }
-            dl_res
-        }
-    };
-    result
+    utils::race_upload_download(upload_task, download_fut, None).await
 }
 
 async fn handle_bypass(
@@ -321,6 +302,8 @@ async fn handle_bypass(
         .await
         .with_context(|| format!("bypass connect to {target} failed"))?;
     remote.set_nodelay(true)?;
+
+    info!(target = %target, initial_bytes = %initial_payload.len(), "bypass connected");
 
     if !initial_payload.is_empty() {
         remote.write_all(&initial_payload).await?;
@@ -341,5 +324,6 @@ async fn handle_bypass(
     let (up_res, down_res) = tokio::join!(up, down);
     up_res.context("bypass client->remote")?;
     down_res.context("bypass remote->client")?;
+    info!(target = %target, "bypass connection closed");
     Ok(())
 }

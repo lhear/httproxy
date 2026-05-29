@@ -26,14 +26,83 @@ use crate::shaper::{self, FrameCipher};
 
 use super::AppState;
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_stream_response(
+    state: &Arc<AppState>,
+    upstream_read: tokio::net::tcp::OwnedReadHalf,
+    upstream_write: tokio::net::tcp::OwnedWriteHalf,
+    upload_cipher: Option<Arc<AesFrameCipher>>,
+    download_cipher: Option<Arc<dyn FrameCipher>>,
+    map_key: String,
+    log_key: String,
+    initial_seq: u64,
+) -> Result<Response, ServerError> {
+    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(UPLOAD_CHANNEL_CAPACITY);
+    let upload = Arc::new(UploadStream::new(frame_tx, upload_cipher));
+
+    let shaper_cipher = download_cipher.clone();
+    let shaper = crate::shaper::TrafficShaper::with_seq(
+        upstream_read,
+        (*state.traffic_config).clone(),
+        shaper_cipher,
+        0,
+    );
+
+    let bundle = Arc::new(StreamBundle {
+        upload: Arc::clone(&upload),
+        upstream_reader: Mutex::new(Some(Box::pin(shaper))),
+        download_cipher,
+        encoding: state.traffic_config.encoding_type,
+        max_download_bytes: state.traffic_config.max_download_bytes,
+        handoff_tx: Mutex::new(None),
+    });
+
+    match state.streams.entry(map_key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return Err(ServerError::bad_request("stream already exists"));
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(Arc::clone(&bundle));
+        }
+    }
+
+    tokio::spawn(
+        connection::ordered_frame_writer(
+            frame_rx,
+            upstream_write,
+            log_key.clone(),
+            upload,
+            initial_seq,
+        )
+        .instrument(tracing::Span::current()),
+    );
+
+    let shutdown_fut = {
+        let notify = Arc::clone(&bundle.upload.shutdown);
+        Box::pin(async move { notify.notified().await })
+    };
+
+    let download = DownloadStream {
+        bundle: Arc::clone(&bundle),
+        streams: Arc::clone(&state.streams),
+        map_key,
+        log_key: log_key.clone(),
+        shutdown_fut: Some(shutdown_fut),
+        done: false,
+        rotated: false,
+        bytes_sent: 0,
+        handoff_rx: None,
+    };
+
+    build_download_response(download)
+}
+
 pub async fn dispatch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ServerError> {
     let span = tracing::Span::current();
-
-    let has_x_target = headers.get("X-Target").is_some();
     let session_cookie = utils::extract_cookie_value(&headers, "session");
 
     if let Some(cookie_val) = session_cookie
@@ -49,19 +118,17 @@ pub async fn dispatch(
         return handle_stream_upload(state, cookie_val.to_owned(), body, span).await;
     }
 
-    if has_x_target {
+    if headers.get("X-Target").is_some() {
         return handle_plaintext_download(state, headers, body, span).await;
     }
 
-    if session_cookie.is_none() {
+    let Some(cookie_val) = session_cookie else {
         return handle_fresh_handshake(state, headers, body, span).await;
-    }
+    };
 
-    let cookie_val = session_cookie.unwrap();
     let session_id = cookie_val.split(':').next().unwrap_or(cookie_val);
-    let is_pq = state.master_store.get(session_id).is_some();
 
-    if !is_pq {
+    if state.master_store.get(session_id).is_none() {
         return Err(ServerError::precondition_required("session not found"));
     }
 
@@ -81,10 +148,7 @@ fn is_body_empty(headers: &HeaderMap, body: &Body) -> bool {
 }
 
 #[inline]
-fn build_download_response(
-    download: DownloadStream,
-    _log_key: &str,
-) -> Result<Response, ServerError> {
+fn build_download_response(download: DownloadStream) -> Result<Response, ServerError> {
     let padding = utils::random_padding();
     Response::builder()
         .header("Cache-Control", "no-store")
@@ -99,7 +163,7 @@ async fn handle_plaintext_download(
     body: Body,
     span: tracing::Span,
 ) -> Result<Response, ServerError> {
-    let user = validate_jwt_if_needed(&headers, false, &state.decoding_key, &state.jwt_validation)?;
+    let user = validate_jwt_if_needed(&headers, &state.decoding_key, &state.jwt_validation)?;
     span.record("user", &user);
 
     let early_data = axum::body::to_bytes(body, MAX_UPLOAD_BODY_SIZE)
@@ -133,7 +197,7 @@ async fn handle_plaintext_download(
     )
     .await
     .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
-    .map_err(ServerError::bad_gateway)?;
+    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
 
     upstream.set_nodelay(true)?;
 
@@ -162,71 +226,20 @@ async fn handle_plaintext_download(
     let session_id = utils::extract_cookie_value(&headers, "session")
         .map(|s| s.to_owned())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(UPLOAD_CHANNEL_CAPACITY);
-
-    let upload = Arc::new(UploadStream::new(frame_tx, None));
-
-    let encoding = state.traffic_config.encoding_type;
-    let max_bytes = state.traffic_config.max_download_bytes;
-
-    let shaper = crate::shaper::TrafficShaper::with_seq(
-        upstream_read,
-        (*state.traffic_config).clone(),
-        None,
-        0,
-    );
-
-    let bundle = Arc::new(StreamBundle {
-        upload: Arc::clone(&upload),
-        upstream_reader: std::sync::Mutex::new(Some(Box::pin(shaper))),
-        download_cipher: None,
-        encoding,
-        max_download_bytes: max_bytes,
-        handoff_tx: Mutex::new(None),
-    });
-
-    match state.streams.entry(session_id.clone()) {
-        dashmap::mapref::entry::Entry::Occupied(_) => {
-            return Err(ServerError::bad_request("stream already exists"));
-        }
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(Arc::clone(&bundle));
-        }
-    }
 
     info!(stream_id = %session_id, user = %user, target = %target,
           initial_frames = %frames_written, "stream established");
 
-    tokio::spawn(
-        connection::ordered_frame_writer(
-            frame_rx,
-            upstream_write,
-            session_id.clone(),
-            upload,
-            frames_written,
-        )
-        .instrument(tracing::Span::current()),
-    );
-
-    let shutdown_fut = {
-        let notify = Arc::clone(&bundle.upload.shutdown);
-        Box::pin(async move { notify.notified().await })
-    };
-
-    let download = DownloadStream {
-        bundle: Arc::clone(&bundle),
-        streams: Arc::clone(&state.streams),
-        map_key: session_id.clone(),
-        log_key: session_id.clone(),
-        shutdown_fut: Some(shutdown_fut),
-        done: false,
-        rotated: false,
-        bytes_sent: 0,
-        handoff_rx: None,
-    };
-
-    #[allow(clippy::needless_borrow)]
-    build_download_response(download, &session_id)
+    spawn_stream_response(
+        &state,
+        upstream_read,
+        upstream_write,
+        None,
+        None,
+        session_id.clone(),
+        session_id,
+        frames_written,
+    )
 }
 
 #[allow(clippy::explicit_auto_deref)]
@@ -236,7 +249,7 @@ async fn handle_fresh_handshake(
     body: Body,
     span: tracing::Span,
 ) -> Result<Response, ServerError> {
-    let user = validate_jwt_if_needed(&headers, false, &state.decoding_key, &state.jwt_validation)?;
+    let user = validate_jwt_if_needed(&headers, &state.decoding_key, &state.jwt_validation)?;
     span.record("user", &user);
 
     info!(user = %user, "handshake: received ClientHello");
@@ -337,7 +350,9 @@ async fn handle_fresh_handshake(
         &server_hello,
         0,
         Some(&handshake_cipher as &dyn FrameCipher),
-        &state.traffic_config,
+        state.traffic_config.global.padding_threshold,
+        state.traffic_config.global.padding_range,
+        state.traffic_config.encoding_type,
     )
     .map_err(|e| ServerError::internal(format!("encode ServerHello: {e}")))?;
 
@@ -448,7 +463,7 @@ async fn handle_pq_download(
     )
     .await
     .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
-    .map_err(ServerError::bad_gateway)?;
+    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
 
     upstream.set_nodelay(true)?;
 
@@ -477,71 +492,17 @@ async fn handle_pq_download(
     };
 
     let (upstream_read, upstream_write) = upstream.into_split();
-    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(UPLOAD_CHANNEL_CAPACITY);
 
-    let upload = Arc::new(UploadStream::new(frame_tx, Some(upload_cipher)));
-
-    let encoding = state.traffic_config.encoding_type;
-    let max_bytes = state.traffic_config.max_download_bytes;
-
-    let download_cipher_clone: Arc<dyn FrameCipher> = Arc::clone(&download_cipher);
-    let shaper = crate::shaper::TrafficShaper::with_seq(
+    spawn_stream_response(
+        &state,
         upstream_read,
-        (*state.traffic_config).clone(),
-        Some(download_cipher_clone),
-        0,
-    );
-
-    let bundle = Arc::new(StreamBundle {
-        upload: Arc::clone(&upload),
-        upstream_reader: std::sync::Mutex::new(Some(Box::pin(shaper))),
-        download_cipher: Some(download_cipher),
-        encoding,
-        max_download_bytes: max_bytes,
-        handoff_tx: Mutex::new(None),
-    });
-
-    match state.streams.entry(cookie_val.to_owned()) {
-        dashmap::mapref::entry::Entry::Occupied(_) => {
-            return Err(ServerError::bad_request("stream already exists"));
-        }
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(Arc::clone(&bundle));
-        }
-    }
-
-    let display_key = session_id.to_owned();
-
-    tokio::spawn(
-        connection::ordered_frame_writer(
-            frame_rx,
-            upstream_write,
-            display_key,
-            upload,
-            frames_written,
-        )
-        .instrument(tracing::Span::current()),
-    );
-
-    let shutdown_fut = {
-        let notify = Arc::clone(&bundle.upload.shutdown);
-        Box::pin(async move { notify.notified().await })
-    };
-
-    let download = DownloadStream {
-        bundle: Arc::clone(&bundle),
-        streams: Arc::clone(&state.streams),
-        map_key: cookie_val.to_owned(),
-        log_key: session_id.to_owned(),
-        shutdown_fut: Some(shutdown_fut),
-        done: false,
-        rotated: false,
-        bytes_sent: 0,
-        handoff_rx: None,
-    };
-
-    #[allow(clippy::needless_borrow)]
-    build_download_response(download, &session_id)
+        upstream_write,
+        Some(upload_cipher),
+        Some(download_cipher),
+        cookie_val.to_owned(),
+        session_id.to_owned(),
+        frames_written,
+    )
 }
 
 async fn handle_download_continuation(
@@ -568,7 +529,10 @@ async fn handle_download_continuation(
 
     let (handoff_tx, handoff_rx) = oneshot::channel();
     {
-        let mut tx_guard = bundle.handoff_tx.lock().expect("handoff_tx poisoned");
+        let mut tx_guard = bundle
+            .handoff_tx
+            .lock()
+            .map_err(|_| ServerError::internal("handoff mutex poisoned"))?;
         *tx_guard = Some(handoff_tx);
     }
 
@@ -589,7 +553,7 @@ async fn handle_download_continuation(
         handoff_rx: Some(Box::pin(handoff_rx)),
     };
 
-    build_download_response(download, session_id)
+    build_download_response(download)
 }
 
 async fn handle_stream_upload(
@@ -619,14 +583,14 @@ async fn handle_stream_upload(
 
     let mut body = body.into_data_stream();
     let mut buf = BytesMut::with_capacity(8192);
-    let mut total_read = 0usize;
+    let mut total_body_bytes = 0usize;
     let mut max_seq = 0u64;
 
     while let Some(chunk) = body.next().await {
         let chunk =
             chunk.map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
-        total_read += chunk.len();
-        if total_read > MAX_UPLOAD_BODY_SIZE {
+        total_body_bytes += chunk.len();
+        if total_body_bytes > MAX_UPLOAD_BODY_SIZE {
             return Err(ServerError::payload_too_large(
                 "body exceeds max upload size",
             ));
@@ -687,14 +651,9 @@ async fn handle_stream_upload(
 #[inline]
 pub fn validate_jwt_if_needed(
     headers: &HeaderMap,
-    has_valid_session: bool,
     key: &DecodingKey,
     validation: &Validation,
 ) -> Result<String, ServerError> {
-    if has_valid_session {
-        return Ok("session-resumed".into());
-    }
-
     let auth_header = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())

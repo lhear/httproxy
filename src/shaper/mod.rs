@@ -28,21 +28,22 @@ const HEADER_LEN: usize = 10;
 
 static JITTER_TABLE: OnceLock<Box<[u64; TABLE_SIZE]>> = OnceLock::new();
 
+fn generate_jitter_table(mut rng: impl Rng) -> Box<[u64; TABLE_SIZE]> {
+    let sigma = 0.5;
+    let avg = AVG_LATENCY_MICROS;
+    let mu = avg.ln() - (sigma * sigma) * 0.5;
+    let log_normal = LogNormal::new(mu, sigma).expect("Invalid parameters");
+    let mut table = Box::new([0u64; TABLE_SIZE]);
+    for slot in table.iter_mut() {
+        *slot = log_normal.sample(&mut rng).round() as u64;
+    }
+    table.shuffle(&mut rng);
+    table
+}
+
 #[inline]
 fn jitter_table() -> &'static [u64; TABLE_SIZE] {
-    JITTER_TABLE.get_or_init(|| {
-        let sigma = 0.5;
-        let avg = AVG_LATENCY_MICROS;
-        let mu = avg.ln() - (sigma * sigma) * 0.5;
-        let log_normal = LogNormal::new(mu, sigma).expect("Invalid parameters");
-        let mut rng = rand::rng();
-        let mut table = Box::new([0u64; TABLE_SIZE]);
-        for slot in table.iter_mut() {
-            *slot = log_normal.sample(&mut rng).round() as u64;
-        }
-        table.shuffle(&mut rng);
-        table
-    })
+    JITTER_TABLE.get_or_init(|| generate_jitter_table(rand::rng()))
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -87,6 +88,30 @@ pub struct TrafficConfig {
     pub max_download_bytes: Option<u64>,
 }
 
+impl TrafficConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use anyhow::anyhow;
+        if self.global.padding_range[0] > self.global.padding_range[1] {
+            return Err(anyhow!(
+                "traffic_shaping.global.padding_range low ({}) > high ({})",
+                self.global.padding_range[0],
+                self.global.padding_range[1]
+            ));
+        }
+        for (i, stage) in self.stages.iter().enumerate() {
+            if stage.padding_range[0] > stage.padding_range[1] {
+                return Err(anyhow!(
+                    "traffic_shaping.stages[{}].padding_range low ({}) > high ({})",
+                    i,
+                    stage.padding_range[0],
+                    stage.padding_range[1]
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResolvedStage {
     end_count: usize,
@@ -101,19 +126,15 @@ pub trait FrameCipher: Send + Sync {
 
 #[inline]
 fn read_u64_be(data: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&data[..8]);
-    u64::from_be_bytes(buf)
+    u64::from_be_bytes(data[..8].try_into().unwrap())
 }
 
 #[inline]
 fn read_u16_be(data: &[u8]) -> u16 {
-    let mut buf = [0u8; 2];
-    buf.copy_from_slice(&data[..2]);
-    u16::from_be_bytes(buf)
+    u16::from_be_bytes(data[..2].try_into().unwrap())
 }
 
-#[inline(always)]
+#[inline]
 fn extract_frame(payload: &[u8]) -> Result<(u64, Bytes), Error> {
     if payload.len() < HEADER_LEN {
         return Err(Error::new(ErrorKind::InvalidData, "payload too short"));
@@ -155,8 +176,9 @@ fn parse_json_payload(json: &[u8]) -> Result<Vec<u8>, Error> {
     let err = |msg: &str| Error::new(ErrorKind::InvalidData, msg);
 
     const PREFIX: &[u8] = b"\"data\":\"";
+    static DATA_FINDER: OnceLock<memchr::memmem::Finder<'static>> = OnceLock::new();
 
-    let finder = memchr::memmem::Finder::new(PREFIX);
+    let finder = DATA_FINDER.get_or_init(|| memchr::memmem::Finder::new(PREFIX));
     let start = finder
         .find(json)
         .ok_or_else(|| err("missing 'data' field"))?;
@@ -173,19 +195,35 @@ fn parse_json_payload(json: &[u8]) -> Result<Vec<u8>, Error> {
     base122_fast::decode(enc_str).map_err(err)
 }
 
+#[inline]
+fn write_encoded_frame(buf: &mut BytesMut, data: &[u8], encoding: EncodingType) {
+    match encoding {
+        EncodingType::Binary => {
+            buf.put_u16(data.len() as u16);
+            buf.put_slice(data);
+        }
+        EncodingType::Json => {
+            let enc_str = base122_fast::encode(data);
+            buf.put_slice(b"{\"data\":\"");
+            buf.put_slice(enc_str.as_bytes());
+            buf.put_slice(b"\"}\n");
+        }
+    }
+}
+
 pub fn encode_frame(
     data: &[u8],
     seq: u64,
     cipher: Option<&dyn FrameCipher>,
-    config: &TrafficConfig,
+    padding_threshold: usize,
+    padding_range: [usize; 2],
+    encoding: EncodingType,
 ) -> std::io::Result<Vec<u8>> {
     let raw_len = data.len();
-    let encoding = config.encoding_type;
 
-    let padding_len = if raw_len < config.global.padding_threshold {
+    let padding_len = if raw_len < padding_threshold {
         let max_pad = MAX_RAW_PAYLOAD - raw_len;
-        let wanted = rand::rng()
-            .random_range(config.global.padding_range[0]..=config.global.padding_range[1]);
+        let wanted = rand::rng().random_range(padding_range[0]..=padding_range[1]);
         wanted.min(max_pad)
     } else {
         0
@@ -204,20 +242,9 @@ pub fn encode_frame(
         payload = cipher.encrypt(&payload)?;
     }
 
-    let mut frame = Vec::new();
-    match encoding {
-        EncodingType::Binary => {
-            frame.put_u16(payload.len() as u16);
-            frame.extend_from_slice(&payload);
-        }
-        EncodingType::Json => {
-            let enc_str = base122_fast::encode(&payload);
-            frame.extend_from_slice(b"{\"data\":\"");
-            frame.extend_from_slice(enc_str.as_bytes());
-            frame.extend_from_slice(b"\"}\n");
-        }
-    }
-    Ok(frame)
+    let mut frame = BytesMut::new();
+    write_encoded_frame(&mut frame, &payload, encoding);
+    Ok(frame.to_vec())
 }
 
 pub fn decode_from_buffer(
@@ -415,23 +442,7 @@ impl<R> TrafficShaper<R> {
 
             let encrypted = cipher.encrypt(&this.out_buf[..payload_len])?;
             this.out_buf.clear();
-
-            match *this.encoding {
-                EncodingType::Binary => {
-                    this.out_buf.reserve(2 + encrypted.len());
-                    this.out_buf.put_u16(encrypted.len() as u16);
-                    this.out_buf.put_slice(&encrypted);
-                }
-                EncodingType::Json => {
-                    let enc_str = base122_fast::encode(&encrypted);
-                    let enc_bytes = enc_str.as_bytes();
-
-                    this.out_buf.reserve(9 + enc_bytes.len() + 2 + 1);
-                    this.out_buf.put_slice(b"{\"data\":\"");
-                    this.out_buf.put_slice(enc_bytes);
-                    this.out_buf.put_slice(b"\"}\n");
-                }
-            }
+            write_encoded_frame(this.out_buf, &encrypted, *this.encoding);
         } else {
             this.out_buf.clear();
 
@@ -447,21 +458,14 @@ impl<R> TrafficShaper<R> {
                     }
                 }
                 EncodingType::Json => {
-                    this.out_buf.reserve(payload_len);
                     this.out_buf.put_u64(seq);
                     this.out_buf.put_u16(raw_len as u16);
                     this.out_buf.put_slice(&this.raw_buf[..raw_len]);
                     if padding_len > 0 {
                         this.out_buf.put_bytes(0u8, padding_len);
                     }
-                    let enc_str = base122_fast::encode(&this.out_buf[..payload_len]);
-                    let enc_bytes = enc_str.as_bytes();
-
-                    this.out_buf.clear();
-                    this.out_buf.reserve(9 + enc_bytes.len() + 2 + 1);
-                    this.out_buf.put_slice(b"{\"data\":\"");
-                    this.out_buf.put_slice(enc_bytes);
-                    this.out_buf.put_slice(b"\"}\n");
+                    let payload = this.out_buf.split();
+                    write_encoded_frame(this.out_buf, &payload[..payload_len], EncodingType::Json);
                 }
             }
         }
@@ -559,7 +563,15 @@ mod tests {
     fn encode_decode_roundtrip_binary_no_cipher() {
         let data = b"hello proxy frame";
         let config = test_config();
-        let frame = encode_frame(data, 7, None, &config).unwrap();
+        let frame = encode_frame(
+            data,
+            7,
+            None,
+            config.global.padding_threshold,
+            config.global.padding_range,
+            config.encoding_type,
+        )
+        .unwrap();
         let mut buf = BytesMut::from(&frame[..]);
         let (seq, decoded) = decode_from_buffer(&mut buf, None, EncodingType::Binary)
             .unwrap()
@@ -617,5 +629,15 @@ mod tests {
     fn parse_json_payload_missing_field() {
         let result = parse_json_payload(b"{\"other\":\"x\"}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn jitter_table_deterministic_with_seed() {
+        let table1 = generate_jitter_table(SmallRng::seed_from_u64(42));
+        let table2 = generate_jitter_table(SmallRng::seed_from_u64(42));
+        assert_eq!(&table1[..], &table2[..]);
+
+        let mean = table1.iter().map(|&v| v as f64).sum::<f64>() / table1.len() as f64;
+        assert!((mean - AVG_LATENCY_MICROS).abs() < AVG_LATENCY_MICROS * 0.5);
     }
 }

@@ -21,7 +21,7 @@ pub async fn connect_upstream(
     socks5_proxy: Option<&Arc<str>>,
     host: &str,
     port: u16,
-) -> Result<TcpStream, String> {
+) -> anyhow::Result<TcpStream> {
     if let Some(client) = dns_client {
         return client
             .connect(
@@ -31,16 +31,16 @@ pub async fn connect_upstream(
                 socks5_proxy.map(|s| s.to_string()),
             )
             .await
-            .map_err(|e| format!("dns error: {e}"));
+            .map_err(|e| anyhow::anyhow!("dns error: {e}"));
     }
     match socks5_proxy {
         Some(p) => Socks5Stream::connect(p.as_ref(), (host, port))
             .await
             .map(Socks5Stream::into_inner)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| anyhow::anyhow!("socks5 connect: {e}")),
         None => TcpStream::connect((host, port))
             .await
-            .map_err(|e| e.to_string()),
+            .map_err(|e| anyhow::anyhow!("tcp connect: {e}")),
     }
 }
 
@@ -127,9 +127,23 @@ pub async fn ordered_frame_writer(
 
     stream.do_shutdown();
 
+    if !pending.is_empty() {
+        warn!(
+            stream_id = %stream_key,
+            dropped_frames = pending.len(),
+            dropped_bytes = pending_bytes,
+            "reorder buffer dropped pending frames"
+        );
+    }
+
     while let Ok(cmd) = rx.try_recv() {
-        if let FrameOrEos::Eos { done, .. } = cmd {
-            let _ = done.send(());
+        match cmd {
+            FrameOrEos::Eos { done, .. } => {
+                let _ = done.send(());
+            }
+            FrameOrEos::Data { seq, data } => {
+                warn!(stream_id = %stream_key, seq, len = data.len(), "data frame dropped during cleanup");
+            }
         }
     }
 
@@ -139,7 +153,9 @@ pub async fn ordered_frame_writer(
         }
     }
 
-    let _ = upstream_write.shutdown().await;
+    if let Err(e) = upstream_write.shutdown().await {
+        warn!(stream_id = %stream_key, reason = %e, "shutdown write half failed");
+    }
     info!(stream_id = %stream_key, "frame writer exited");
 }
 

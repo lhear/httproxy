@@ -28,12 +28,12 @@ pub enum FrameOrEos {
 }
 
 pub struct UploadStream {
-    pub last_activity: AtomicU64,
-    pub tx: mpsc::Sender<FrameOrEos>,
-    pub upload_cipher: Option<Arc<AesFrameCipher>>,
-    pub shutdown: Arc<Notify>,
+    last_activity: AtomicU64,
+    pub(crate) tx: mpsc::Sender<FrameOrEos>,
+    pub(crate) upload_cipher: Option<Arc<AesFrameCipher>>,
+    pub(crate) shutdown: Arc<Notify>,
     shutdown_flag: AtomicBool,
-    pub rotation_at: AtomicU64,
+    rotation_at: AtomicU64,
 }
 
 impl UploadStream {
@@ -48,16 +48,16 @@ impl UploadStream {
             rotation_at: AtomicU64::new(0),
         }
     }
-    #[inline(always)]
+    #[inline]
     pub fn touch(&self) {
         self.last_activity.store(now_secs(), Ordering::Relaxed);
     }
-    #[inline(always)]
+    #[inline]
     pub fn is_idle(&self) -> bool {
         now_secs().saturating_sub(self.last_activity.load(Ordering::Relaxed))
             > STREAM_IDLE_TIMEOUT_SECS
     }
-    #[inline(always)]
+    #[inline]
     pub fn do_shutdown(&self) -> bool {
         if self.shutdown_flag.swap(true, Ordering::AcqRel) {
             false
@@ -66,15 +66,15 @@ impl UploadStream {
             true
         }
     }
-    #[inline(always)]
+    #[inline]
     pub fn mark_rotation(&self) {
         self.rotation_at.store(now_secs(), Ordering::Relaxed);
     }
-    #[inline(always)]
+    #[inline]
     pub fn clear_rotation(&self) {
         self.rotation_at.store(0, Ordering::Relaxed);
     }
-    #[inline(always)]
+    #[inline]
     pub fn is_rotation_stale(&self) -> bool {
         let at = self.rotation_at.load(Ordering::Relaxed);
         at != 0 && now_secs().saturating_sub(at) > ROTATION_TIMEOUT_SECS
@@ -85,11 +85,25 @@ pub type ShaperStream = Pin<Box<dyn Stream<Item = std::io::Result<(u64, Bytes)>>
 
 pub struct StreamBundle {
     pub upload: Arc<UploadStream>,
-    pub upstream_reader: Mutex<Option<ShaperStream>>,
+    pub(crate) upstream_reader: Mutex<Option<ShaperStream>>,
     pub download_cipher: Option<Arc<dyn FrameCipher>>,
     pub encoding: EncodingType,
     pub max_download_bytes: Option<u64>,
-    pub handoff_tx: Mutex<Option<oneshot::Sender<()>>>,
+    pub(crate) handoff_tx: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl StreamBundle {
+    fn take_upstream_reader(&self) -> Result<Option<ShaperStream>, ()> {
+        self.upstream_reader
+            .lock()
+            .map(|mut g| g.take())
+            .map_err(|_| ())
+    }
+    fn restore_upstream_reader(&self, reader: Option<ShaperStream>) {
+        if let Ok(mut g) = self.upstream_reader.lock() {
+            *g = reader;
+        }
+    }
 }
 
 pub struct DownloadStream {
@@ -148,12 +162,14 @@ impl Stream for DownloadStream {
 
         let threshold = this.bundle.max_download_bytes;
 
-        let mut shaper_opt = this
-            .bundle
-            .upstream_reader
-            .lock()
-            .expect("upstream_reader mutex poisoned")
-            .take();
+        let mut shaper_opt = match this.bundle.take_upstream_reader() {
+            Ok(opt) => opt,
+            Err(()) => {
+                info!(stream_id = %this.log_key, reason = "upstream reader mutex poisoned", "download stream ended");
+                this.done = true;
+                return Poll::Ready(None);
+            }
+        };
 
         let shaper = match shaper_opt.as_mut() {
             Some(s) => s,
@@ -177,11 +193,7 @@ impl Stream for DownloadStream {
                     this.done = true;
                     this.rotated = true;
                     this.bundle.upload.mark_rotation();
-                    *this
-                        .bundle
-                        .upstream_reader
-                        .lock()
-                        .expect("upstream_reader mutex poisoned") = shaper_opt;
+                    this.bundle.restore_upstream_reader(shaper_opt.take());
                     this.release_upstream();
                     debug!(
                         stream_id = %this.log_key,
@@ -190,11 +202,7 @@ impl Stream for DownloadStream {
                     );
                     return Poll::Ready(Some(Ok(data)));
                 }
-                *this
-                    .bundle
-                    .upstream_reader
-                    .lock()
-                    .expect("upstream_reader mutex poisoned") = shaper_opt;
+                this.bundle.restore_upstream_reader(shaper_opt.take());
                 Poll::Ready(Some(Ok(data)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -210,11 +218,7 @@ impl Stream for DownloadStream {
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                *this
-                    .bundle
-                    .upstream_reader
-                    .lock()
-                    .expect("upstream_reader mutex poisoned") = shaper_opt;
+                this.bundle.restore_upstream_reader(shaper_opt.take());
                 Poll::Pending
             }
         }

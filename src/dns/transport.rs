@@ -20,7 +20,7 @@ use tracing::{debug, error, warn};
 
 use super::config::DnsConfig;
 
-static ROOT_CERT_STORE: OnceLock<RootCertStore> = OnceLock::new();
+static ROOT_CERT_STORE: OnceLock<Arc<RootCertStore>> = OnceLock::new();
 
 type PendingMap = Arc<Mutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>>>>>>;
 
@@ -61,17 +61,22 @@ impl UdpTransport {
         let (rs, rp) = (socket.clone(), pending.clone());
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            let mut consecutive_errors = 0u32;
             loop {
                 match rs.recv(&mut buf).await {
                     Ok(len) if len >= 2 => {
+                        consecutive_errors = 0;
                         let id = u16::from_be_bytes([buf[0], buf[1]]);
                         if let Some(tx) = rp.lock().await.remove(&id) {
                             let _ = tx.send(Ok(buf[..len].to_vec()));
                         }
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        consecutive_errors = 0;
+                    }
                     Err(e) => {
-                        error!("UDP recv error: {}", e);
+                        consecutive_errors += 1;
+                        error!(error = %e, consecutive_errors, "UDP recv error");
                         tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                 }
@@ -244,9 +249,14 @@ pub(super) fn init_dot_transport(config: &DnsConfig) -> Result<DotTransport> {
         .map_err(|_| anyhow!("invalid TLS domain: {domain}"))?
         .to_owned();
     let root_store = ROOT_CERT_STORE
-        .get_or_init(|| RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()));
+        .get_or_init(|| {
+            Arc::new(RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            ))
+        })
+        .clone();
     let cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store.clone())
+        .with_root_certificates(root_store)
         .with_no_client_auth();
     Ok(DotTransport::new(
         config.upstream,

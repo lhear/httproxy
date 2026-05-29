@@ -15,6 +15,10 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 
 pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
+    cfg.traffic_shaping
+        .validate()
+        .context("invalid traffic_shaping config")?;
+
     let bypass = if cfg.bypass.bypass_files.is_empty() {
         None
     } else {
