@@ -90,6 +90,7 @@ pub struct StreamBundle {
     pub encoding: EncodingType,
     pub max_download_bytes: Option<u64>,
     pub(crate) handoff_tx: Mutex<Option<oneshot::Sender<()>>>,
+    pub(crate) handoff_done: AtomicBool,
 }
 
 impl StreamBundle {
@@ -120,6 +121,7 @@ pub struct DownloadStream {
 
 impl DownloadStream {
     fn release_upstream(&self) {
+        self.bundle.handoff_done.store(true, Ordering::Release);
         if let Ok(mut guard) = self.bundle.handoff_tx.lock()
             && let Some(tx) = guard.take()
         {
@@ -140,9 +142,17 @@ impl Stream for DownloadStream {
         if let Some(rx) = &mut this.handoff_rx {
             match rx.as_mut().poll(cx) {
                 Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {
+                    this.bundle.handoff_done.store(false, Ordering::Release);
                     this.handoff_rx = None;
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    if this.bundle.handoff_done.load(Ordering::Acquire) {
+                        this.bundle.handoff_done.store(false, Ordering::Release);
+                        this.handoff_rx = None;
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
             }
         }
 
