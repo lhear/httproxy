@@ -231,8 +231,7 @@ async fn handle_plain_proxy(
         &state.traffic_config,
     )?;
 
-    info!(target = %target_host, initial_bytes = %payload.len(),
-          body_len = %early_data.len(), frames_sent = %frames_sent, "connection initiated");
+    info!(target = %target_host, "connection initiated");
 
     let response = tokio::time::timeout(
         DOWNLOAD_CONNECT_TIMEOUT,
