@@ -241,6 +241,10 @@ impl Drop for DownloadStream {
             info!(stream_id = %self.log_key, reason = "client disconnected", "download stream ended");
         }
 
+        if self.handoff_rx.is_some() {
+            return;
+        }
+
         self.release_upstream();
 
         if self.rotated {

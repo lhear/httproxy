@@ -208,11 +208,9 @@ async fn download_single_response(
     cipher: Option<&dyn FrameCipher>,
     encoding: EncodingType,
     start_seq: u64,
-    max_bytes: Option<u64>,
-    mut pre_fetch_trigger: Option<oneshot::Sender<()>>,
+    prefetch_at: Option<u64>,
+    mut prefetch_trigger: Option<oneshot::Sender<()>>,
 ) -> Result<(u64, u64)> {
-    let pre_fetch_at = max_bytes.map(|m| m.saturating_sub(PREFETCH_LEAD_BYTES));
-
     let mut buffer = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
     let mut data_stream = response.into_data_stream();
     let mut expected_seq: u64 = start_seq;
@@ -222,9 +220,9 @@ async fn download_single_response(
         let chunk = chunk.context("response read error")?;
         bytes_received += chunk.len() as u64;
 
-        if let Some(at) = pre_fetch_at
+        if let Some(at) = prefetch_at
             && bytes_received >= at
-            && let Some(tx) = pre_fetch_trigger.take()
+            && let Some(tx) = prefetch_trigger.take()
         {
             let _ = tx.send(());
         }
@@ -282,39 +280,65 @@ async fn send_continue_request(
     Ok(resp)
 }
 
+fn spawn_prefetch_continuation(
+    http_client: &Arc<wreq::Client>,
+    state: &Arc<SharedState>,
+    cookie_val: &str,
+) -> (
+    oneshot::Sender<()>,
+    oneshot::Receiver<Result<wreq::Response>>,
+) {
+    let (trigger_tx, trigger_rx) = oneshot::channel();
+    let (result_tx, result_rx) = oneshot::channel();
+    let pre_client = Arc::clone(http_client);
+    let pre_state = Arc::clone(state);
+    let pre_cookie = cookie_val.to_owned();
+
+    tokio::spawn(async move {
+        if trigger_rx.await.is_err() {
+            return;
+        }
+        match send_continue_request(&pre_client, &pre_state, &pre_cookie).await {
+            Ok(resp) => {
+                let _ = result_tx.send(Ok(resp));
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "prefetch continuation request failed"
+                );
+            }
+        }
+    });
+
+    (trigger_tx, result_rx)
+}
+
 pub async fn download_loop(
     initial_response: wreq::Response,
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     cipher: Option<Arc<AesFrameCipher>>,
-    encoding: EncodingType,
     cookie_val: String,
     http_client: Arc<wreq::Client>,
     state: Arc<SharedState>,
 ) -> Result<()> {
+    let encoding = state.traffic_config.encoding_type;
     let cipher_dyn: Option<Arc<dyn FrameCipher>> = cipher.map(|c| c as Arc<dyn FrameCipher>);
     let cipher_ref: Option<&dyn FrameCipher> = cipher_dyn.as_deref();
 
     let max_bytes = state.max_download_bytes;
     let rotate_enabled = max_bytes.is_some_and(|m| m > 0);
 
+    let prefetch_at = max_bytes.map(|m| m.saturating_sub(PREFETCH_LEAD_BYTES));
+    let use_prefetch = prefetch_at.is_some_and(|at| at > 0);
+
     let mut response = initial_response;
     let mut expected_seq: u64 = 0;
 
     loop {
-        let (pre_fetch_trigger, pre_fetch_rx) = if rotate_enabled {
-            let (trigger_tx, trigger_rx) = oneshot::channel();
-            let (result_tx, result_rx) = oneshot::channel();
-            let pre_client = Arc::clone(&http_client);
-            let pre_state = Arc::clone(&state);
-            let pre_cookie = cookie_val.clone();
-            tokio::spawn(async move {
-                if trigger_rx.await.is_err() {
-                    return;
-                }
-                let result = send_continue_request(&pre_client, &pre_state, &pre_cookie).await;
-                let _ = result_tx.send(result);
-            });
-            (Some(trigger_tx), Some(result_rx))
+        let (prefetch_trigger, prefetch_rx) = if rotate_enabled && use_prefetch {
+            let (tx, rx) = spawn_prefetch_continuation(&http_client, &state, &cookie_val);
+            (Some(tx), Some(rx))
         } else {
             (None, None)
         };
@@ -325,22 +349,39 @@ pub async fn download_loop(
             cipher_ref,
             encoding,
             expected_seq,
-            max_bytes,
-            pre_fetch_trigger,
+            prefetch_at,
+            prefetch_trigger,
         )
         .await?;
 
         expected_seq = next_seq;
 
-        let should_rotate = rotate_enabled && bytes_received >= max_bytes.unwrap();
+        let should_rotate = match max_bytes {
+            Some(max) => bytes_received >= max,
+            None => false,
+        };
         if !should_rotate {
             break;
         }
 
-        response = pre_fetch_rx
-            .expect("pre_fetch_rx must be Some when rotate_enabled")
-            .await
-            .map_err(|_| anyhow!("pre-fetch task panicked"))??;
+        response = if use_prefetch {
+            let prefetch = prefetch_rx
+                .expect("prefetch_rx must be Some when use_prefetch")
+                .await
+                .map_err(|_| anyhow!("prefetch task panicked"))?;
+            match prefetch {
+                Ok(resp) => resp,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "prefetch failed, falling back to synchronous continuation"
+                    );
+                    send_continue_request(&http_client, &state, &cookie_val).await?
+                }
+            }
+        } else {
+            send_continue_request(&http_client, &state, &cookie_val).await?
+        };
     }
 
     let _ = write_half.shutdown().await;

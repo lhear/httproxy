@@ -253,7 +253,6 @@ async fn handle_plain_proxy(
         return Err(anyhow!("upstream rejected download: {status}"));
     }
 
-    let encoding = state.traffic_config.encoding_type;
     let upload_client = Arc::clone(&http_client);
     let upload_state = Arc::clone(&state);
     let stream_id_clone = stream_id.clone();
@@ -282,7 +281,6 @@ async fn handle_plain_proxy(
         response,
         write_half,
         None,
-        encoding,
         cookie_val_for_dl,
         download_http_client,
         download_state,
