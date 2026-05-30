@@ -291,8 +291,7 @@ pub async fn full_handshake(
         &state.traffic_config,
     )?;
 
-    info!(session_id = %session_id, target = %target_host,
-          body_len = %early_data.len(), frames_sent = %frames_sent, "PQ tunnel established");
+    info!(session_id = %session_id, target = %target_host, "PQ tunnel established");
 
     let response = tokio::time::timeout(
         DOWNLOAD_CONNECT_TIMEOUT,

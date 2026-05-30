@@ -176,7 +176,7 @@ async fn handle_plaintext_download(
         .ok_or_else(|| ServerError::bad_request("missing X-Target header"))?;
 
     span.record("target", target);
-    info!(user = %user, target = %target, body_len = %early_data.len(), "connection initiated");
+    info!(user = %user, target = %target, "connection initiated");
 
     let (host, port_str) = target
         .rsplit_once(':')
@@ -382,8 +382,7 @@ async fn handle_pq_download(
         return Err(ServerError::bad_request("invalid session cookie format"));
     }
     let (session_id, enc_target_b64, enc_nonce_b64) = (parts[0], parts[1], parts[2]);
-    info!(session_id = %session_id, body_len = %early_data.len(),
-          "session resumption: download request received");
+    info!(session_id = %session_id, "session resumption: download request received");
 
     let entry = state
         .master_store
