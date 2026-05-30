@@ -7,7 +7,6 @@ use rand::Rng;
 use std::io;
 use zeroize::Zeroizing;
 
-use super::AesKey;
 use crate::shaper::FrameCipher;
 
 const NONCE_LEN: usize = 12;
@@ -59,14 +58,14 @@ fn decrypt_with_cipher(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[inline]
-pub fn encrypt_bytes(key: &AesKey, data: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key);
+pub fn encrypt_bytes(key_z: &Zeroizing<[u8; 32]>, data: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(&**key_z).map_err(|_| anyhow!("invalid key length"))?;
     encrypt_with_cipher(&cipher, data)
 }
 
 #[inline]
-pub fn decrypt_bytes(key: &AesKey, data: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key);
+pub fn decrypt_bytes(key_z: &Zeroizing<[u8; 32]>, data: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(&**key_z).map_err(|_| anyhow!("invalid key length"))?;
     decrypt_with_cipher(&cipher, data)
 }
 
@@ -78,20 +77,16 @@ pub struct AesFrameCipher {
 impl Clone for AesFrameCipher {
     #[inline]
     fn clone(&self) -> Self {
-        Self::new(AesKey::from(*self.key))
+        Self::new(&self.key)
     }
 }
 
 impl AesFrameCipher {
     #[inline]
-    pub fn new(key: AesKey) -> Self {
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(key.as_ref());
-        let cipher = Aes256Gcm::new(&key);
-        Self {
-            key: Zeroizing::new(key_bytes),
-            cipher,
-        }
+    pub fn new(key_z: &Zeroizing<[u8; 32]>) -> Self {
+        let key = Zeroizing::new(**key_z);
+        let cipher = Aes256Gcm::new_from_slice(&**key_z).expect("32 bytes is valid for Aes256Gcm");
+        Self { key, cipher }
     }
 }
 
@@ -112,10 +107,10 @@ mod tests {
     use super::*;
     use rand::Rng;
 
-    fn random_key() -> AesKey {
-        let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
-        AesKey::from(bytes)
+    fn random_key() -> Zeroizing<[u8; 32]> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut *bytes);
+        bytes
     }
 
     #[test]
@@ -130,7 +125,7 @@ mod tests {
     #[test]
     fn frame_cipher_roundtrip() {
         let key = random_key();
-        let cipher = AesFrameCipher::new(key);
+        let cipher = AesFrameCipher::new(&key);
         let data = b"frame data for cipher test";
         let ct = cipher.encrypt(data).unwrap();
         let pt = cipher.decrypt(&ct).unwrap();

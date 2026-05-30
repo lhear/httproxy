@@ -2,8 +2,6 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use super::AesKey;
-
 pub fn derive_handshake_key(shared: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let hkdf = Hkdf::<Sha256>::new(None, shared);
     let mut key = Zeroizing::new([0u8; 32]);
@@ -12,8 +10,8 @@ pub fn derive_handshake_key(shared: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     key
 }
 
-pub fn derive_initial_master(mlkem_ss: &[u8], x25519_ss: &[u8]) -> Zeroizing<[u8; 32]> {
-    let mut ikm = Vec::with_capacity(mlkem_ss.len() + x25519_ss.len());
+pub fn derive_initial_master(mlkem_ss: &[u8], x25519_ss: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(mlkem_ss.len() + x25519_ss.len()));
     ikm.extend_from_slice(mlkem_ss);
     ikm.extend_from_slice(x25519_ss);
     let hkdf = Hkdf::<Sha256>::new(Some(b"initial_master_salt"), &ikm);
@@ -23,33 +21,30 @@ pub fn derive_initial_master(mlkem_ss: &[u8], x25519_ss: &[u8]) -> Zeroizing<[u8
     master
 }
 
-pub fn derive_cookie_nonce_key(master: &[u8; 32]) -> AesKey {
+pub fn derive_cookie_nonce_key(master: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let hkdf = Hkdf::<Sha256>::new(None, master);
-    let mut key = [0u8; 32];
-    hkdf.expand(b"cookie_nonce_key", &mut key)
+    let mut key = Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"cookie_nonce_key", &mut *key)
         .expect("32 bytes is valid for HKDF");
-    key.into()
+    key
 }
 
-pub fn derive_connection_keys(
-    master: &[u8; 32],
-    conn_nonce: &[u8; 16],
-) -> (AesKey, AesKey, AesKey) {
+pub fn derive_connection_keys(master: &[u8; 32], conn_nonce: &[u8; 16]) -> super::ConnectionKeys {
     let hkdf = Hkdf::<Sha256>::new(None, master);
     let mut info = Vec::with_capacity(16 + 15);
     info.extend_from_slice(conn_nonce);
     info.extend_from_slice(b"connection_keys");
-    let mut buf = [0u8; 96];
-    hkdf.expand(&info, &mut buf)
+    let mut buf = Zeroizing::new([0u8; 96]);
+    hkdf.expand(&info, &mut *buf)
         .expect("96 bytes is valid for HKDF");
 
-    let mut upload_key = [0u8; 32];
-    let mut download_key = [0u8; 32];
-    let mut target_key = [0u8; 32];
+    let mut upload_key = Zeroizing::new([0u8; 32]);
+    let mut download_key = Zeroizing::new([0u8; 32]);
+    let mut target_key = Zeroizing::new([0u8; 32]);
     upload_key.copy_from_slice(&buf[..32]);
     download_key.copy_from_slice(&buf[32..64]);
     target_key.copy_from_slice(&buf[64..]);
-    (upload_key.into(), download_key.into(), target_key.into())
+    (upload_key, download_key, target_key)
 }
 
 #[cfg(test)]
