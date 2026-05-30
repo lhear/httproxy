@@ -4,6 +4,7 @@ use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use jsonwebtoken::{DecodingKey, Validation};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
@@ -55,6 +56,7 @@ fn spawn_stream_response(
         encoding: state.traffic_config.encoding_type,
         max_download_bytes: state.traffic_config.max_download_bytes,
         handoff_tx: Mutex::new(None),
+        handoff_done: AtomicBool::new(false),
     });
 
     match state.streams.entry(map_key.clone()) {
