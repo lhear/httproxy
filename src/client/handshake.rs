@@ -41,8 +41,8 @@ pub async fn try_pq_connect(
     let conn_nonce: [u8; 16] = rand::rng().random();
     let (upload_key, download_key, target_key) =
         crypto::derive_connection_keys(master, &conn_nonce);
-    let upload_cipher = Arc::new(AesFrameCipher::new(upload_key));
-    let download_cipher = Arc::new(AesFrameCipher::new(download_key));
+    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
+    let download_cipher = Arc::new(AesFrameCipher::new(&download_key));
 
     let enc_target = crypto::encrypt_bytes(&target_key, target_host.as_bytes())?;
 
@@ -131,7 +131,6 @@ pub async fn try_pq_connect(
     utils::race_upload_download(upload_task, download_fut, Some("download failed")).await
 }
 
-#[allow(clippy::explicit_auto_deref)]
 pub async fn full_handshake(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
@@ -146,8 +145,8 @@ pub async fn full_handshake(
     let (eph_sk_a, eph_pk_a) = crypto::generate_keypair();
     let eph_sk_a = Zeroizing::new(eph_sk_a);
     let x25519_shared_a = crypto::diffie_hellman(&eph_sk_a, server_pk);
-    let handshake_key = crypto::derive_handshake_key(&*x25519_shared_a);
-    let handshake_cipher = AesFrameCipher::new(crypto::AesKey::from(*handshake_key));
+    let handshake_key = crypto::derive_handshake_key(&x25519_shared_a);
+    let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
     let (kem_sk, kem_pk) = crypto::generate_mlkem_keypair();
     let kem_pk_bytes = kem_pk.to_bytes();
@@ -247,7 +246,7 @@ pub async fn full_handshake(
     let master = {
         let ss_mlkem = crypto::mlkem_decapsulate(&kem_sk, &ct);
         let ss_x25519 = crypto::diffie_hellman(&eph_sk_b, &server_eph_pk);
-        crypto::derive_initial_master(&*ss_mlkem, &*ss_x25519)
+        crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
     };
 
     info!(session_id = %session_id, "handshake complete, master key derived");
@@ -263,13 +262,13 @@ pub async fn full_handshake(
 
     let conn_nonce: [u8; 16] = rand::rng().random();
     let (upload_key, download_key, target_key) =
-        crypto::derive_connection_keys(&*master, &conn_nonce);
-    let upload_cipher = Arc::new(AesFrameCipher::new(upload_key));
-    let download_cipher = Arc::new(AesFrameCipher::new(download_key));
+        crypto::derive_connection_keys(&master, &conn_nonce);
+    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
+    let download_cipher = Arc::new(AesFrameCipher::new(&download_key));
 
     let enc_target = crypto::encrypt_bytes(&target_key, target_host.as_bytes())?;
 
-    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&*master);
+    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&master);
     let enc_conn_nonce = crypto::encrypt_bytes(&cookie_nonce_key, &conn_nonce)?;
 
     let cookie_val = format!(

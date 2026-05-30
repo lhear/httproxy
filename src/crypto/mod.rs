@@ -13,3 +13,9 @@ pub use keys::{
 };
 
 pub type AesKey = aes_gcm::Key<aes_gcm::Aes256Gcm>;
+
+pub type ConnectionKeys = (
+    zeroize::Zeroizing<[u8; 32]>,
+    zeroize::Zeroizing<[u8; 32]>,
+    zeroize::Zeroizing<[u8; 32]>,
+);

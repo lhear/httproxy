@@ -29,7 +29,7 @@ fn encode_fixed_32(bytes: &[u8; X25519_KEY_LEN]) -> String {
 #[inline]
 fn decode_fixed_32(s: &str) -> Result<[u8; X25519_KEY_LEN]> {
     let mut out = [0u8; X25519_KEY_LEN];
-    let decoded = URL_SAFE_NO_PAD.decode(s.as_bytes())?;
+    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(s.as_bytes())?);
     if decoded.len() != X25519_KEY_LEN {
         return Err(anyhow!("invalid key length"));
     }

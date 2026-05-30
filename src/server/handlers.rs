@@ -11,7 +11,7 @@ use tracing::{Instrument, debug, info, warn};
 use uuid;
 use zeroize::Zeroizing;
 
-use crate::crypto::{self, AesFrameCipher, AesKey};
+use crate::crypto::{self, AesFrameCipher};
 use crate::error::ServerError;
 use crate::server::constants::{
     CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_UPLOAD_BODY_SIZE, UPLOAD_CHANNEL_CAPACITY,
@@ -242,7 +242,6 @@ async fn handle_plaintext_download(
     )
 }
 
-#[allow(clippy::explicit_auto_deref)]
 async fn handle_fresh_handshake(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -271,8 +270,8 @@ async fn handle_fresh_handshake(
         .ok_or_else(|| ServerError::internal("server private key not configured"))?;
 
     let shared_a = crypto::diffie_hellman(private_key, &eph_pk_a);
-    let handshake_key = crypto::derive_handshake_key(&*shared_a);
-    let handshake_cipher = AesFrameCipher::new(AesKey::from(*handshake_key));
+    let handshake_key = crypto::derive_handshake_key(&shared_a);
+    let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
     let body_bytes = axum::body::to_bytes(body, MAX_UPLOAD_BODY_SIZE)
         .await
@@ -326,7 +325,7 @@ async fn handle_fresh_handshake(
     let master = {
         let server_eph_sk = Zeroizing::new(server_eph_sk);
         let ss_x25519 = crypto::diffie_hellman(&server_eph_sk, &client_eph_pk_b);
-        crypto::derive_initial_master(&*ss_mlkem, &*ss_x25519)
+        crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
     };
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -370,7 +369,6 @@ async fn handle_fresh_handshake(
     Ok(resp)
 }
 
-#[allow(clippy::explicit_auto_deref)]
 async fn handle_pq_download(
     state: Arc<AppState>,
     cookie_val: &str,
@@ -401,7 +399,7 @@ async fn handle_pq_download(
         return Err(ServerError::precondition_required("master key expired"));
     }
 
-    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&*master);
+    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&master);
 
     let enc_target = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(enc_target_b64)
@@ -428,15 +426,15 @@ async fn handle_pq_download(
     drop(entry);
 
     let (upload_key, download_key, target_key) =
-        crypto::derive_connection_keys(&*master, &conn_nonce);
+        crypto::derive_connection_keys(&master, &conn_nonce);
 
     let target_bytes = crypto::decrypt_bytes(&target_key, &enc_target)
         .map_err(|_| ServerError::bad_request("failed to decrypt target"))?;
     let target = String::from_utf8(target_bytes)
         .map_err(|_| ServerError::bad_request("invalid target utf8"))?;
 
-    let upload_cipher = Arc::new(AesFrameCipher::new(upload_key));
-    let download_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(download_key));
+    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
+    let download_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&download_key));
 
     let (host, port_str) = target
         .rsplit_once(':')
