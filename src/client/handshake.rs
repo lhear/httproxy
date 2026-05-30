@@ -95,8 +95,6 @@ pub async fn try_pq_connect(
         .take()
         .ok_or_else(|| anyhow!("write half already consumed"))?;
 
-    let encoding = state.traffic_config.encoding_type;
-
     let upload_client = Arc::clone(http_client);
     let upload_state = Arc::clone(state);
     let upload_cipher_clone = Arc::clone(&upload_cipher);
@@ -122,7 +120,6 @@ pub async fn try_pq_connect(
         response,
         write_half,
         Some(download_cipher),
-        encoding,
         cookie_val.clone(),
         Arc::clone(http_client),
         Arc::clone(state),
@@ -310,7 +307,6 @@ pub async fn full_handshake(
         return Err(anyhow!("post-handshake download rejected: {status}"));
     }
 
-    let encoding = state.traffic_config.encoding_type;
     let upload_client = Arc::clone(http_client);
     let upload_state = Arc::clone(state);
     let upload_cipher_clone = Arc::clone(&upload_cipher);
@@ -341,7 +337,6 @@ pub async fn full_handshake(
         response,
         write_half,
         Some(download_cipher),
-        encoding,
         cookie_val.clone(),
         Arc::clone(http_client),
         Arc::clone(state),
