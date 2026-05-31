@@ -26,37 +26,37 @@ base122-fast = "0.1.3"
 base64 = "0.22.1"
 bytes = "1.11"
 clap = {version = "4.6.1", features = ["derive"]}
-crypto-common = "0.2.1"
-dashmap = "6.1.0"
-domain = "0.12.0"
+crypto-common = "0.2.2"
+dashmap = "6.2.1"
+domain = "0.12.1"
 fst = "0.4.7"
 futures = "0.3"
 h2 = "0.4.14"
 hkdf = "0.13.0"
-http = "1.4"
+http = "1.4.1"
 http-body-util = "0.1"
 httparse = "1.10"
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
-jsonwebtoken = {version = "10.2", features = ["aws_lc_rs"]}
-memchr = "2.8.0"
-ml-kem = {version = "0.3", features = ["zeroize"]}
+jsonwebtoken = {version = "10.4", features = ["aws_lc_rs"]}
+memchr = "2.8.1"
+ml-kem = {version = "0.3.2", features = ["zeroize"]}
 moka = {version = "0.12", features = ["future"]}
 pin-project-lite = "0.2"
 rand = "0.10"
 rand_distr = "0.6"
 rustls = "0.23.40"
 serde = {version = "1.0", features = ["derive"]}
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 sha2 = "0.11.0"
 singleflight-async = "0.2"
 tokio = {version = "1.52.3", features = ["rt-multi-thread"]}
 tokio-rustls = "0.26"
-tokio-socks = "0.5"
+tokio-socks = "0.5.3"
 tokio-stream = {version = "0.1", features = ["net"]}
 toml = "1.1"
 tower = "0.5"
-tower-http = {version = "0.6.10", features = ["trace"]}
+tower-http = {version = "0.6.11", features = ["trace"]}
 tracing = "0.1"
 tracing-appender = "0.2.5"
 tracing-subscriber = {version = "0.3", features = [
@@ -65,7 +65,7 @@ tracing-subscriber = {version = "0.3", features = [
   "json",
 ]}
 url = "2.5"
-uuid = "1.23.1"
+uuid = "1.23.2"
 webpki-roots = "1.0.7"
 wreq = "6.0.0-rc.28"
 wreq-util = "3.0.0-rc.10"
