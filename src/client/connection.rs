@@ -11,7 +11,7 @@ use crate::client::{
         CONNECT_RESPONSE, DOWNLOAD_CONNECT_TIMEOUT, EARLY_READ_WINDOW, MASTER_RESUME_WINDOW_SECS,
         PROXY_AUTH_REQUIRED_RESPONSE, PROXY_REQUEST_PARSE_TIMEOUT,
     },
-    handshake::{self, try_pq_connect},
+    handshake::{self, RehandshakeRequired, try_pq_connect},
     proxy,
     state::SharedState,
     tunnel, utils,
@@ -138,8 +138,15 @@ async fn handle_pq_proxy(
                 {
                     Ok(()) => return Ok(()),
                     Err(e) => {
-                        warn!("session resumption failed, falling back to full handshake: {e}");
-                        if read_half.is_none() {
+                        if e.downcast_ref::<RehandshakeRequired>().is_some() {
+                            warn!(
+                                "session resumption failed (428), falling back to full handshake: {e}"
+                            );
+                            if read_half.is_none() {
+                                return Err(e);
+                            }
+                        } else {
+                            warn!("session resumption failed with transient error, aborting: {e}");
                             return Err(e);
                         }
                     }
@@ -180,17 +187,24 @@ async fn handle_pq_proxy(
                 {
                     Ok(()) => return Ok(()),
                     Err(e) => {
-                        warn!(
-                            "session resumption (post-lock) failed, falling back to full handshake: {e}"
-                        );
-                        if read_half.is_none() {
+                        if e.downcast_ref::<RehandshakeRequired>().is_some() {
+                            warn!(
+                                "session resumption (post-lock) failed (428), falling back to full handshake: {e}"
+                            );
+                            if read_half.is_none() {
+                                return Err(e);
+                            }
+                            let mut mg = state.initial_master.lock().await;
+                            if let Some((ref cur_sid, _, _)) = *mg
+                                && cur_sid == &ticket.session_id
+                            {
+                                *mg = None;
+                            }
+                        } else {
+                            warn!(
+                                "session resumption (post-lock) failed with transient error, aborting: {e}"
+                            );
                             return Err(e);
-                        }
-                        let mut mg = state.initial_master.lock().await;
-                        if let Some((ref cur_sid, _, _)) = *mg
-                            && cur_sid == &ticket.session_id
-                        {
-                            *mg = None;
                         }
                     }
                 }

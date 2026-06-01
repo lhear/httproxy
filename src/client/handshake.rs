@@ -25,6 +25,17 @@ pub struct PqSessionTicket {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RehandshakeRequired(pub String);
+
+impl std::fmt::Display for RehandshakeRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RehandshakeRequired {}
+
 pub async fn try_pq_connect(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
@@ -80,7 +91,9 @@ pub async fn try_pq_connect(
 
     if response.status().as_u16() == 428 {
         let _ = response.bytes().await;
-        return Err(anyhow!("server requests re-handshake (428)"));
+        return Err(anyhow::Error::new(RehandshakeRequired(
+            "server requests re-handshake (428)".into(),
+        )));
     }
     if !response.status().is_success() {
         let status = response.status();

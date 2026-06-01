@@ -379,7 +379,9 @@ async fn handle_pq_download(
 ) -> Result<Response, ServerError> {
     let parts: Vec<&str> = cookie_val.splitn(3, ':').collect();
     if parts.len() != 3 {
-        return Err(ServerError::bad_request("invalid session cookie format"));
+        return Err(ServerError::precondition_required(
+            "invalid session cookie format",
+        ));
     }
     let (session_id, enc_target_b64, enc_nonce_b64) = (parts[0], parts[1], parts[2]);
     info!(session_id = %session_id, "session resumption: download request received");
@@ -405,16 +407,16 @@ async fn handle_pq_download(
 
     let enc_target = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(enc_target_b64)
-        .map_err(|_| ServerError::bad_request("invalid cookie encoding"))?;
+        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
 
     let enc_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(enc_nonce_b64)
-        .map_err(|_| ServerError::bad_request("invalid cookie encoding"))?;
+        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
     let conn_nonce_bytes = crypto::decrypt_bytes(&cookie_nonce_key, &enc_nonce)
-        .map_err(|_| ServerError::bad_request("failed to decrypt conn_nonce"))?;
+        .map_err(|_| ServerError::precondition_required("failed to decrypt conn_nonce"))?;
     let conn_nonce: [u8; 16] = conn_nonce_bytes
         .try_into()
-        .map_err(|_| ServerError::bad_request("invalid conn_nonce length"))?;
+        .map_err(|_| ServerError::precondition_required("invalid conn_nonce length"))?;
 
     {
         let nonce_set = state.used_nonces.entry(session_id.to_string()).or_default();
@@ -431,9 +433,9 @@ async fn handle_pq_download(
         crypto::derive_connection_keys(&master, &conn_nonce);
 
     let target_bytes = crypto::decrypt_bytes(&target_key, &enc_target)
-        .map_err(|_| ServerError::bad_request("failed to decrypt target"))?;
+        .map_err(|_| ServerError::precondition_required("failed to decrypt target"))?;
     let target = String::from_utf8(target_bytes)
-        .map_err(|_| ServerError::bad_request("invalid target utf8"))?;
+        .map_err(|_| ServerError::precondition_required("invalid target utf8"))?;
 
     let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
     let download_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&download_key));
