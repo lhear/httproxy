@@ -201,8 +201,6 @@ async fn handle_plaintext_download(
     .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
     .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
 
-    upstream.set_nodelay(true)?;
-
     let frames_written: u64 = if !early_data.is_empty() {
         let mut buf = BytesMut::from(&early_data[..]);
         let mut count: u64 = 0;
@@ -465,8 +463,6 @@ async fn handle_pq_download(
     .await
     .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
     .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
-
-    upstream.set_nodelay(true)?;
 
     let upload_cipher_ref: &dyn FrameCipher = upload_cipher.as_ref() as &dyn FrameCipher;
     let frames_written: u64 = if !early_data.is_empty() {
