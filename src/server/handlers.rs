@@ -27,45 +27,53 @@ use crate::shaper::{self, FrameCipher};
 
 use super::AppState;
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_stream_response(
+fn pre_register_stream(
     state: &Arc<AppState>,
-    upstream_read: tokio::net::tcp::OwnedReadHalf,
-    upstream_write: tokio::net::tcp::OwnedWriteHalf,
+    map_key: String,
     upload_cipher: Option<Arc<AesFrameCipher>>,
     download_cipher: Option<Arc<dyn FrameCipher>>,
-    map_key: String,
-    log_key: String,
-    initial_seq: u64,
-) -> Result<Response, ServerError> {
+) -> (Arc<StreamBundle>, mpsc::Receiver<FrameOrEos>) {
     let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(UPLOAD_CHANNEL_CAPACITY);
     let upload = Arc::new(UploadStream::new(frame_tx, upload_cipher));
 
-    let shaper_cipher = download_cipher.clone();
-    let shaper = crate::shaper::TrafficShaper::with_seq(
-        upstream_read,
-        (*state.traffic_config).clone(),
-        shaper_cipher,
-        0,
-    );
-
     let bundle = Arc::new(StreamBundle {
-        upload: Arc::clone(&upload),
-        upstream_reader: Mutex::new(Some(Box::pin(shaper))),
+        upload,
+        upstream_reader: Mutex::new(None),
         download_cipher,
-        encoding: state.traffic_config.encoding_type,
         max_download_bytes: state.traffic_config.max_download_bytes,
         handoff_tx: Mutex::new(None),
         handoff_done: AtomicBool::new(false),
     });
 
-    match state.streams.entry(map_key.clone()) {
-        dashmap::mapref::entry::Entry::Occupied(_) => {
-            return Err(ServerError::bad_request("stream already exists"));
-        }
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(Arc::clone(&bundle));
-        }
+    if let Some(_old) = state.streams.insert(map_key, Arc::clone(&bundle)) {
+        warn!("stream key collision on pre-register, replaced old entry");
+    }
+
+    (bundle, frame_rx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_stream_response(
+    state: &Arc<AppState>,
+    bundle: Arc<StreamBundle>,
+    frame_rx: mpsc::Receiver<FrameOrEos>,
+    upstream_read: tokio::net::tcp::OwnedReadHalf,
+    upstream_write: tokio::net::tcp::OwnedWriteHalf,
+    download_cipher: Option<Arc<dyn FrameCipher>>,
+    map_key: String,
+    log_key: String,
+    initial_seq: u64,
+) -> Result<Response, ServerError> {
+    let shaper = crate::shaper::TrafficShaper::with_seq(
+        upstream_read,
+        (*state.traffic_config).clone(),
+        download_cipher,
+        0,
+    );
+    if let Ok(mut guard) = bundle.upstream_reader.lock() {
+        *guard = Some(Box::pin(shaper));
+    } else {
+        return Err(ServerError::internal("upstream_reader mutex poisoned"));
     }
 
     tokio::spawn(
@@ -73,7 +81,7 @@ fn spawn_stream_response(
             frame_rx,
             upstream_write,
             log_key.clone(),
-            upload,
+            Arc::clone(&bundle.upload),
             initial_seq,
         )
         .instrument(tracing::Span::current()),
@@ -85,10 +93,10 @@ fn spawn_stream_response(
     };
 
     let download = DownloadStream {
-        bundle: Arc::clone(&bundle),
+        bundle,
         streams: Arc::clone(&state.streams),
         map_key,
-        log_key: log_key.clone(),
+        log_key,
         shutdown_fut: Some(shutdown_fut),
         done: false,
         rotated: false,
@@ -98,7 +106,6 @@ fn spawn_stream_response(
 
     build_download_response(download)
 }
-
 pub async fn dispatch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -187,6 +194,12 @@ async fn handle_plaintext_download(
         .parse()
         .map_err(|_| ServerError::bad_request("invalid port"))?;
 
+    let session_id = utils::extract_cookie_value(&headers, "session")
+        .map(|s| s.to_owned())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let (bundle, frame_rx) = pre_register_stream(&state, session_id.clone(), None, None);
+
     let mut upstream = tokio::time::timeout(
         CONNECT_TIMEOUT,
         connect_upstream(
@@ -198,21 +211,43 @@ async fn handle_plaintext_download(
         ),
     )
     .await
-    .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
-    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
+    .map_err(|_| {
+        state.streams.remove(session_id.as_str());
+        ServerError::gateway_timeout("connect timeout")
+    })?
+    .map_err(|e| {
+        state.streams.remove(session_id.as_str());
+        ServerError::bad_gateway(e.to_string())
+    })?;
 
     let frames_written: u64 = if !early_data.is_empty() {
         let mut buf = BytesMut::from(&early_data[..]);
         let mut count: u64 = 0;
-        while let Some((_seq, data)) =
-            shaper::decode_from_buffer(&mut buf, None, state.traffic_config.encoding_type)?
-        {
-            upstream.write_all(&data).await.map_err(|e| {
-                ServerError::bad_gateway(format!("initial upload write error: {e}"))
-            })?;
-            count += 1;
+        loop {
+            let decoded = match shaper::decode_from_buffer(
+                &mut buf,
+                None,
+                state.traffic_config.encoding_type,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    state.streams.remove(session_id.as_str());
+                    return Err(ServerError::internal(e.to_string()));
+                }
+            };
+            match decoded {
+                Some((_seq, data)) => {
+                    upstream.write_all(&data).await.map_err(|e| {
+                        state.streams.remove(session_id.as_str());
+                        ServerError::bad_gateway(format!("initial upload write error: {e}"))
+                    })?;
+                    count += 1;
+                }
+                None => break,
+            }
         }
         if !buf.is_empty() {
+            state.streams.remove(session_id.as_str());
             return Err(ServerError::bad_request(
                 "trailing data in initial upload body",
             ));
@@ -223,18 +258,16 @@ async fn handle_plaintext_download(
     };
 
     let (upstream_read, upstream_write) = upstream.into_split();
-    let session_id = utils::extract_cookie_value(&headers, "session")
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     info!(stream_id = %session_id, user = %user, target = %target,
           initial_frames = %frames_written, "stream established");
 
-    spawn_stream_response(
+    finalize_stream_response(
         &state,
+        bundle,
+        frame_rx,
         upstream_read,
         upstream_write,
-        None,
         None,
         session_id.clone(),
         session_id,
@@ -416,15 +449,6 @@ async fn handle_pq_download(
         .try_into()
         .map_err(|_| ServerError::precondition_required("invalid conn_nonce length"))?;
 
-    {
-        let nonce_set = state.used_nonces.entry(session_id.to_string()).or_default();
-        if !nonce_set.insert(conn_nonce) {
-            return Err(ServerError::precondition_required(
-                "nonce already used (replay detected)",
-            ));
-        }
-    }
-
     drop(entry);
 
     let (upload_key, download_key, target_key) =
@@ -448,6 +472,23 @@ async fn handle_pq_download(
     span.record("user", &username);
     span.record("target", &target);
 
+    let (bundle, frame_rx) = pre_register_stream(
+        &state,
+        cookie_val.to_owned(),
+        Some(upload_cipher.clone()),
+        Some(download_cipher.clone()),
+    );
+
+    {
+        let nonce_set = state.used_nonces.entry(session_id.to_string()).or_default();
+        if !nonce_set.insert(conn_nonce) {
+            state.streams.remove(cookie_val);
+            return Err(ServerError::precondition_required(
+                "nonce already used (replay detected)",
+            ));
+        }
+    }
+
     info!(session_id = %session_id, user = %username, "session resumption: connecting to {}", target);
 
     let mut upstream = tokio::time::timeout(
@@ -461,24 +502,44 @@ async fn handle_pq_download(
         ),
     )
     .await
-    .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
-    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
+    .map_err(|_| {
+        state.streams.remove(cookie_val);
+        ServerError::gateway_timeout("connect timeout")
+    })?
+    .map_err(|e| {
+        state.streams.remove(cookie_val);
+        ServerError::bad_gateway(e.to_string())
+    })?;
 
     let upload_cipher_ref: &dyn FrameCipher = upload_cipher.as_ref() as &dyn FrameCipher;
     let frames_written: u64 = if !early_data.is_empty() {
         let mut buf = BytesMut::from(&early_data[..]);
         let mut count: u64 = 0;
-        while let Some((_seq, data)) = shaper::decode_from_buffer(
-            &mut buf,
-            Some(upload_cipher_ref),
-            state.traffic_config.encoding_type,
-        )? {
-            upstream.write_all(&data).await.map_err(|e| {
-                ServerError::bad_gateway(format!("initial upload write error: {e}"))
-            })?;
-            count += 1;
+        loop {
+            let decoded = match shaper::decode_from_buffer(
+                &mut buf,
+                Some(upload_cipher_ref),
+                state.traffic_config.encoding_type,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    state.streams.remove(cookie_val);
+                    return Err(ServerError::internal(e.to_string()));
+                }
+            };
+            match decoded {
+                Some((_seq, data)) => {
+                    upstream.write_all(&data).await.map_err(|e| {
+                        state.streams.remove(cookie_val);
+                        ServerError::bad_gateway(format!("initial upload write error: {e}"))
+                    })?;
+                    count += 1;
+                }
+                None => break,
+            }
         }
         if !buf.is_empty() {
+            state.streams.remove(cookie_val);
             return Err(ServerError::bad_request(
                 "trailing data in initial upload body",
             ));
@@ -490,11 +551,12 @@ async fn handle_pq_download(
 
     let (upstream_read, upstream_write) = upstream.into_split();
 
-    spawn_stream_response(
+    finalize_stream_response(
         &state,
+        bundle,
+        frame_rx,
         upstream_read,
         upstream_write,
-        Some(upload_cipher),
         Some(download_cipher),
         cookie_val.to_owned(),
         session_id.to_owned(),

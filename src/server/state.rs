@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::crypto::AesFrameCipher;
 use crate::server::constants::{ROTATION_TIMEOUT_SECS, STREAM_IDLE_TIMEOUT_SECS, now_secs};
-use crate::shaper::{EncodingType, FrameCipher};
+use crate::shaper::FrameCipher;
 
 pub enum FrameOrEos {
     Data {
@@ -87,7 +87,6 @@ pub struct StreamBundle {
     pub upload: Arc<UploadStream>,
     pub(crate) upstream_reader: Mutex<Option<ShaperStream>>,
     pub download_cipher: Option<Arc<dyn FrameCipher>>,
-    pub encoding: EncodingType,
     pub max_download_bytes: Option<u64>,
     pub(crate) handoff_tx: Mutex<Option<oneshot::Sender<()>>>,
     pub(crate) handoff_done: AtomicBool,
