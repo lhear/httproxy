@@ -22,8 +22,8 @@ pub async fn connect_upstream(
     host: &str,
     port: u16,
 ) -> anyhow::Result<TcpStream> {
-    if let Some(client) = dns_client {
-        return client
+    let upstream = if let Some(client) = dns_client {
+        client
             .connect(
                 host,
                 port,
@@ -31,17 +31,20 @@ pub async fn connect_upstream(
                 socks5_proxy.map(|s| s.to_string()),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("dns error: {e}"));
-    }
-    match socks5_proxy {
-        Some(p) => Socks5Stream::connect(p.as_ref(), (host, port))
-            .await
-            .map(Socks5Stream::into_inner)
-            .map_err(|e| anyhow::anyhow!("socks5 connect: {e}")),
-        None => TcpStream::connect((host, port))
-            .await
-            .map_err(|e| anyhow::anyhow!("tcp connect: {e}")),
-    }
+            .map_err(|e| anyhow::anyhow!("dns error: {e}"))?
+    } else {
+        match socks5_proxy {
+            Some(p) => Socks5Stream::connect(p.as_ref(), (host, port))
+                .await
+                .map(Socks5Stream::into_inner)
+                .map_err(|e| anyhow::anyhow!("socks5 connect: {e}"))?,
+            None => TcpStream::connect((host, port))
+                .await
+                .map_err(|e| anyhow::anyhow!("tcp connect: {e}"))?,
+        }
+    };
+    upstream.set_nodelay(true)?;
+    Ok(upstream)
 }
 
 pub async fn ordered_frame_writer(

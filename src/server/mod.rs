@@ -11,6 +11,7 @@ use crate::dns::{self, DnsClient};
 use crate::shaper::TrafficConfig;
 
 use anyhow::Context;
+use axum::serve::ListenerExt;
 use axum::{Router, body::Body, routing::post};
 use dashmap::{DashMap, DashSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -131,7 +132,11 @@ pub async fn run_server(app: Router, listen: &str) -> anyhow::Result<()> {
     }
     let addr: SocketAddr = listen.parse().context("invalid bind address")?;
     info!("listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await?
+        .tap_io(|tcp_stream| {
+            let _ = tcp_stream.set_nodelay(true);
+        });
     axum::serve(listener, app).await?;
     Ok(())
 }
