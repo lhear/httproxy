@@ -10,9 +10,12 @@ pub const PROXY_REQUEST_PARSE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
+pub const BATCH_BUF_INITIAL_CAPACITY: usize = 8192;
 pub const MAX_IN_FLIGHT_BYTES: usize = 2 * 1024 * 1024;
 pub const UPLOAD_CONCURRENCY: usize = 128;
 pub const PREFETCH_LEAD_BYTES: u64 = 20 * 1024 * 1024;
+
+pub const PREFETCH_ROTATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const DECODE_BUF_CAPACITY: usize = 16 * 1024 + 2396;
 

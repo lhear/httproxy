@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use rand::RngExt;
 use std::future::Future;
@@ -108,6 +108,18 @@ pub fn is_silent_error(root: &(dyn std::error::Error + 'static)) -> bool {
     }
     root.to_string()
         .contains("connection closed during header parsing")
+}
+
+pub(crate) async fn check_response_status(
+    response: wreq::Response,
+    context: &str,
+) -> Result<wreq::Response> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let _ = response.bytes().await;
+        return Err(anyhow!("{context}: {status}"));
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

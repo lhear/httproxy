@@ -1,9 +1,9 @@
+pub mod actor;
 pub mod connection;
 pub mod constants;
 pub mod handshake;
 pub mod proxy;
 pub mod state;
-pub mod tunnel;
 pub mod utils;
 
 use crate::config::ClientTopConfig;
@@ -12,7 +12,7 @@ use crate::crypto;
 use anyhow::{Context, Result};
 use base64::Engine;
 use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 
 pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
     cfg.traffic_shaping
@@ -58,7 +58,7 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         server_public_key,
         proxy_auth,
         initial_master: Mutex::new(None),
-        handshake_lock: OnceCell::new(),
+        handshake_lock: Mutex::new(()),
         max_download_bytes: cfg.traffic_shaping.max_download_bytes,
     }))
 }

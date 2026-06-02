@@ -100,6 +100,49 @@ impl FrameCipher for AesFrameCipher {
     fn decrypt(&self, data: &[u8]) -> io::Result<Vec<u8>> {
         decrypt_with_cipher(&self.cipher, data).map_err(io::Error::other)
     }
+
+    #[inline]
+    fn encrypt_into(&self, data: &[u8], out: &mut bytes::BytesMut) -> io::Result<()> {
+        let nonce_bytes = random_nonce();
+        out.reserve(NONCE_LEN + data.len() + TAG_LEN);
+        out.extend_from_slice(&nonce_bytes);
+        let ct_start = out.len();
+        out.extend_from_slice(data);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                EMPTY_AAD,
+                &mut out[ct_start..],
+            )
+            .map_err(|e| io::Error::other(anyhow!("encryption error: {e}")))?;
+        out.extend_from_slice(tag.as_ref());
+        Ok(())
+    }
+
+    #[inline]
+    fn decrypt_into(&self, data: &[u8], out: &mut bytes::BytesMut) -> io::Result<()> {
+        if data.len() < NONCE_LEN + TAG_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ciphertext too short",
+            ));
+        }
+        let ct_end = data.len() - TAG_LEN;
+        let ct_len = ct_end - NONCE_LEN;
+        out.reserve(ct_len);
+        let pt_start = out.len();
+        out.extend_from_slice(&data[NONCE_LEN..ct_end]);
+        self.cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&data[..NONCE_LEN]),
+                EMPTY_AAD,
+                &mut out[pt_start..],
+                Tag::from_slice(&data[ct_end..]),
+            )
+            .map_err(|e| io::Error::other(anyhow!("decryption error: {e}")))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -62,13 +62,9 @@ async fn main() -> anyhow::Result<()> {
 
     let state = httproxy::server::build_state(&mut config).await?;
 
-    let (_stream_jh, _master_jh) = httproxy::server::spawn_janitors(&state);
+    let (_master_jh, _stream_jh) = httproxy::server::spawn_janitors(&state);
 
     let router = httproxy::server::build_router(state, &config.server.path);
     httproxy::server::run_server(router, &config.server.listen).await?;
-
-    drop(_stream_jh);
-    drop(_master_jh);
-
     Ok(())
 }
