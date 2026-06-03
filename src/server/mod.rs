@@ -1,20 +1,23 @@
+pub mod actor;
 pub mod connection;
 pub mod constants;
 pub mod handlers;
 pub mod janitor;
-pub mod state;
+pub mod nonce_registry;
+pub mod stream;
 pub mod utils;
 
 use crate::config::ServerTopConfig;
 use crate::crypto;
 use crate::dns::{self, DnsClient};
-use crate::shaper::TrafficConfig;
+use crate::shaper::{EncodingType, FrameCipher, TrafficConfig};
 
 use anyhow::Context;
 use axum::serve::ListenerExt;
 use axum::{Router, body::Body, routing::post};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use nonce_registry::NonceRegistry;
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -23,10 +26,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use zeroize::Zeroizing;
+
+use crate::server::actor::tunnel::TunnelCmd;
 
 pub type MasterStoreEntry = (String, Zeroizing<[u8; 32]>, u64);
 
@@ -37,6 +43,13 @@ pub struct Claims {
 }
 
 #[derive(Clone)]
+pub struct SessionHandle {
+    pub cmd_tx: mpsc::Sender<TunnelCmd>,
+    pub upload_cipher: Option<Arc<dyn FrameCipher>>,
+    pub encoding: EncodingType,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub decoding_key: DecodingKey,
     pub jwt_validation: Validation,
@@ -44,10 +57,10 @@ pub struct AppState {
     pub dns_client: Option<Arc<DnsClient>>,
     pub client_subnet: Option<IpAddr>,
     pub traffic_config: Arc<TrafficConfig>,
-    pub streams: Arc<DashMap<String, Arc<state::StreamBundle>>>,
     pub private_key: Option<x25519_dalek::StaticSecret>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
-    pub used_nonces: Arc<DashMap<String, DashSet<[u8; 16]>>>,
+    pub nonce_registry: Arc<NonceRegistry>,
+    pub actors: Arc<DashMap<String, SessionHandle>>,
     pub stream_id_counter: Arc<AtomicU64>,
 }
 
@@ -88,10 +101,10 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         dns_client,
         client_subnet,
         traffic_config: Arc::new(config.traffic_shaping.clone()),
-        streams: Arc::new(DashMap::new()),
         private_key,
         master_store: Arc::new(DashMap::new()),
-        used_nonces: Arc::new(DashMap::new()),
+        nonce_registry: Arc::new(NonceRegistry::new()),
+        actors: Arc::new(DashMap::new()),
         stream_id_counter: Arc::new(AtomicU64::new(1)),
     }))
 }
@@ -144,12 +157,12 @@ pub async fn run_server(app: Router, listen: &str) -> anyhow::Result<()> {
 pub fn spawn_janitors(
     state: &Arc<AppState>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let stream_handle = tokio::spawn(janitor::stream_janitor(Arc::clone(&state.streams)));
-    let master_handle = tokio::spawn(janitor::master_and_nonce_janitor(
+    let master_jh = tokio::spawn(janitor::master_and_nonce_janitor(
         Arc::clone(&state.master_store),
-        Arc::clone(&state.used_nonces),
+        Arc::clone(&state.nonce_registry),
     ));
-    (stream_handle, master_handle)
+    let stream_jh = tokio::spawn(janitor::stream_janitor(Arc::clone(&state.actors)));
+    (master_jh, stream_jh)
 }
 
 #[cfg(test)]

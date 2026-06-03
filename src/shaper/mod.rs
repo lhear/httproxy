@@ -122,6 +122,18 @@ struct ResolvedStage {
 pub trait FrameCipher: Send + Sync {
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error>;
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error>;
+
+    fn encrypt_into(&self, data: &[u8], out: &mut BytesMut) -> Result<(), Error> {
+        let encrypted = self.encrypt(data)?;
+        out.extend_from_slice(&encrypted);
+        Ok(())
+    }
+
+    fn decrypt_into(&self, data: &[u8], out: &mut BytesMut) -> Result<(), Error> {
+        let decrypted = self.decrypt(data)?;
+        out.extend_from_slice(&decrypted);
+        Ok(())
+    }
 }
 
 #[inline]
@@ -149,6 +161,23 @@ fn extract_frame(payload: &[u8]) -> Result<(u64, Bytes), Error> {
         ));
     }
     Ok((seq, Bytes::copy_from_slice(&payload[HEADER_LEN..total])))
+}
+
+#[inline]
+fn extract_frame_range(payload: &[u8]) -> Result<(u64, usize, usize), Error> {
+    if payload.len() < HEADER_LEN {
+        return Err(Error::new(ErrorKind::InvalidData, "payload too short"));
+    }
+    let seq = read_u64_be(&payload[..8]);
+    let orig_len = read_u16_be(&payload[8..10]) as usize;
+    let total = HEADER_LEN + orig_len;
+    if payload.len() < total {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "payload shorter than declared original length",
+        ));
+    }
+    Ok((seq, HEADER_LEN, total))
 }
 
 #[inline]
@@ -247,78 +276,120 @@ pub fn encode_frame(
     Ok(frame.to_vec())
 }
 
+macro_rules! decode_skeleton {
+    (
+        $src:expr, $cipher:expr, $encoding:expr,
+        cipher => |$cipher_var:ident| $cipher_expr:expr,
+        binary_plain => |$bin_plain_var:ident| $bin_plain_expr:expr,
+        json_plain => |$json_plain_var:ident| $json_plain_expr:expr $(,)?
+    ) => {
+        match $encoding {
+            EncodingType::Binary => {
+                if $src.len() < 2 {
+                    return Ok(None);
+                }
+                let frame_len = read_u16_be(&$src[..2]) as usize;
+
+                if frame_len > MAX_BINARY_FRAME_LEN {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "binary frame length exceeds limit",
+                    ));
+                }
+                if $src.len() < 2 + frame_len {
+                    return Ok(None);
+                }
+                $src.advance(2);
+                let $bin_plain_var = $src.split_to(frame_len);
+
+                if let Some(c) = $cipher {
+                    let mut $cipher_var = BytesMut::new();
+                    c.decrypt_into(&$bin_plain_var, &mut $cipher_var)?;
+                    $cipher_expr
+                } else {
+                    $bin_plain_expr
+                }
+            }
+
+            EncodingType::Json => {
+                let newline_pos = memchr::memchr(DELIMITER, $src);
+
+                match newline_pos {
+                    Some(pos) => {
+                        if pos > MAX_JSON_LINE_LEN {
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "JSON line exceeds maximum allowed length",
+                            ));
+                        }
+
+                        let line = $src.split_to(pos);
+                        $src.advance(1);
+
+                        if line.is_empty() {
+                            return Err(Error::new(ErrorKind::InvalidData, "empty frame line"));
+                        }
+
+                        let $json_plain_var = parse_json_payload(&line)?;
+
+                        if let Some(c) = $cipher {
+                            let mut $cipher_var = BytesMut::new();
+                            c.decrypt_into(&$json_plain_var, &mut $cipher_var)?;
+                            $cipher_expr
+                        } else {
+                            $json_plain_expr
+                        }
+                    }
+                    None => {
+                        if $src.len() > MAX_JSON_LINE_LEN {
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "incomplete JSON line is too long",
+                            ));
+                        }
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    };
+}
+
 pub fn decode_from_buffer(
     src: &mut BytesMut,
     cipher: Option<&dyn FrameCipher>,
     encoding: EncodingType,
 ) -> Result<Option<(u64, Bytes)>, Error> {
-    match encoding {
-        EncodingType::Binary => {
-            if src.len() < 2 {
-                return Ok(None);
-            }
-            let frame_len = read_u16_be(&src[..2]) as usize;
+    decode_skeleton!(
+        src, cipher, encoding,
+        cipher => |decrypted| Ok(Some(extract_frame(&decrypted)?)),
+        binary_plain => |frame_data| Ok(Some(extract_frame(&frame_data)?)),
+        json_plain => |encoded_payload| Ok(Some(extract_frame(&encoded_payload)?)),
+    )
+}
 
-            if frame_len > MAX_BINARY_FRAME_LEN {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "binary frame length exceeds limit",
-                ));
-            }
-            if src.len() < 2 + frame_len {
-                return Ok(None);
-            }
-            src.advance(2);
-            let frame_data = src.split_to(frame_len);
-
-            if let Some(c) = cipher {
-                let decrypted = c.decrypt(&frame_data)?;
-                Ok(Some(extract_frame(&decrypted)?))
-            } else {
-                Ok(Some(extract_frame(&frame_data)?))
-            }
-        }
-
-        EncodingType::Json => {
-            let newline_pos = memchr::memchr(DELIMITER, src);
-
-            match newline_pos {
-                Some(pos) => {
-                    if pos > MAX_JSON_LINE_LEN {
-                        return Err(Error::new(
-                            ErrorKind::InvalidData,
-                            "JSON line exceeds maximum allowed length",
-                        ));
-                    }
-
-                    let line = src.split_to(pos);
-                    src.advance(1);
-
-                    if line.is_empty() {
-                        return Err(Error::new(ErrorKind::InvalidData, "empty frame line"));
-                    }
-
-                    let encoded_payload = parse_json_payload(&line)?;
-
-                    if let Some(c) = cipher {
-                        let decrypted = c.decrypt(&encoded_payload)?;
-                        Ok(Some(extract_frame(&decrypted)?))
-                    } else {
-                        Ok(Some(extract_frame(&encoded_payload)?))
-                    }
-                }
-                None => {
-                    if src.len() > MAX_JSON_LINE_LEN {
-                        return Err(Error::new(
-                            ErrorKind::InvalidData,
-                            "incomplete JSON line is too long",
-                        ));
-                    }
-                    Ok(None)
-                }
-            }
-        }
-    }
+pub fn decode_frame_owned(
+    src: &mut BytesMut,
+    cipher: Option<&dyn FrameCipher>,
+    encoding: EncodingType,
+) -> Result<Option<(u64, BytesMut, usize, usize)>, Error> {
+    decode_skeleton!(
+        src, cipher, encoding,
+        cipher => |decrypted| {
+            let (seq, start, end) = extract_frame_range(&decrypted)?;
+            Ok(Some((seq, decrypted, start, end)))
+        },
+        binary_plain => |frame_data| {
+            let (seq, start, end) = extract_frame_range(&frame_data)?;
+            Ok(Some((seq, frame_data, start, end)))
+        },
+        json_plain => |encoded_payload| {
+            let mut frame_data = BytesMut::with_capacity(encoded_payload.len());
+            frame_data.extend_from_slice(&encoded_payload);
+            let (seq, start, end) = extract_frame_range(&frame_data)?;
+            Ok(Some((seq, frame_data, start, end)))
+        },
+    )
 }
 
 pin_project! {
@@ -329,6 +400,7 @@ pin_project! {
 
         raw_buf: BytesMut,
         out_buf: BytesMut,
+        enc_buf: BytesMut,
 
         #[pin]
         flush_timer: Sleep,
@@ -379,6 +451,7 @@ impl<R> TrafficShaper<R> {
             reader,
             raw_buf: BytesMut::with_capacity(MAX_RAW_PAYLOAD),
             out_buf: BytesMut::with_capacity(out_capacity),
+            enc_buf: BytesMut::new(),
             flush_timer: tokio::time::sleep_until(Instant::now()),
             timer_armed: false,
             stages,
@@ -440,9 +513,10 @@ impl<R> TrafficShaper<R> {
                 this.out_buf.put_bytes(0u8, padding_len);
             }
 
-            let encrypted = cipher.encrypt(&this.out_buf[..payload_len])?;
+            this.enc_buf.clear();
+            cipher.encrypt_into(&this.out_buf[..payload_len], this.enc_buf)?;
             this.out_buf.clear();
-            write_encoded_frame(this.out_buf, &encrypted, *this.encoding);
+            write_encoded_frame(this.out_buf, this.enc_buf, *this.encoding);
         } else {
             this.out_buf.clear();
 
@@ -483,21 +557,11 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
         let mut this = self.project();
 
         loop {
-            let raw_len = this.raw_buf.len();
-            let remaining = MAX_RAW_PAYLOAD - raw_len;
-
-            if remaining == 0 {
+            if this.raw_buf.len() >= MAX_RAW_PAYLOAD {
                 return Poll::Ready(Some(Self::seal_and_emit(&mut this)));
             }
 
-            if *this.timer_armed && raw_len > 0 {
-                if this.flush_timer.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(Some(Self::seal_and_emit(&mut this)));
-                } else {
-                    return Poll::Pending;
-                }
-            }
-
+            let remaining = MAX_RAW_PAYLOAD - this.raw_buf.len();
             this.raw_buf.reserve(remaining);
             let spare = this.raw_buf.spare_capacity_mut();
             let read_limit = spare.len().min(remaining);
@@ -507,16 +571,24 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
                     if n == 0 {
-                        return if raw_len == 0 {
+                        return if this.raw_buf.is_empty() {
                             Poll::Ready(None)
                         } else {
                             Poll::Ready(Some(Self::seal_and_emit(&mut this)))
                         };
                     }
 
-                    unsafe { this.raw_buf.advance_mut(n) }
+                    unsafe {
+                        this.raw_buf.advance_mut(n);
+                    }
+                }
+                Poll::Pending => {
+                    let raw_len = this.raw_buf.len();
+                    if raw_len == 0 {
+                        return Poll::Pending;
+                    }
 
-                    if raw_len == 0 && this.raw_buf.len() < MAX_RAW_PAYLOAD {
+                    if !*this.timer_armed {
                         let idx = *this.cursor;
                         let delay_us = jitter_table()[idx];
                         *this.cursor = (idx + 1) & TABLE_MASK;
@@ -524,15 +596,9 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
                             .as_mut()
                             .reset(Instant::now() + Duration::from_micros(delay_us));
                         *this.timer_armed = true;
-
-                        let _ = this.flush_timer.as_mut().poll(cx);
                     }
-                }
-                Poll::Pending => {
-                    if *this.timer_armed
-                        && raw_len > 0
-                        && this.flush_timer.as_mut().poll(cx).is_ready()
-                    {
+
+                    if this.flush_timer.as_mut().poll(cx).is_ready() {
                         return Poll::Ready(Some(Self::seal_and_emit(&mut this)));
                     }
                     return Poll::Pending;

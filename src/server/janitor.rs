@@ -1,51 +1,60 @@
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::warn;
 
+use crate::server::SessionHandle;
 use crate::server::constants::{JANITOR_INTERVAL, MASTER_EXPIRY, NONCE_CLEANUP_INTERVAL, now_secs};
-use crate::server::state::StreamBundle;
-
-pub async fn stream_janitor(streams: Arc<DashMap<String, Arc<StreamBundle>>>) {
-    let mut interval = tokio::time::interval(JANITOR_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        let mut expired = vec![];
-        for entry in streams.iter() {
-            let bundle = entry.value();
-            if (bundle.upload.is_idle() || bundle.upload.is_rotation_stale())
-                && bundle.upload.do_shutdown()
-            {
-                expired.push(entry.key().clone());
-            }
-        }
-        for key in expired {
-            if let Some(bundle) = streams.remove(&key)
-                && let Ok(mut guard) = bundle.1.upstream_reader.lock()
-            {
-                *guard = None;
-            }
-            let display_id = key.split(':').next().unwrap_or(&key);
-            warn!(stream_id = %display_id, reason = "idle or rotation timeout", "shutting down stream");
-        }
-    }
-}
+use crate::server::nonce_registry::NonceRegistry;
 
 pub async fn master_and_nonce_janitor(
     master_store: Arc<DashMap<String, super::MasterStoreEntry>>,
-    used_nonces: Arc<DashMap<String, DashSet<[u8; 16]>>>,
+    nonce_registry: Arc<NonceRegistry>,
 ) {
     let mut interval = tokio::time::interval(NONCE_CLEANUP_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         interval.tick().await;
-        master_store.retain(|session_id, (_, _master, created)| {
-            if now_secs().saturating_sub(*created) >= MASTER_EXPIRY.as_secs() {
-                used_nonces.remove(session_id);
+
+        let mut has_deleted = false;
+        let now = now_secs();
+        let expiry_limit = MASTER_EXPIRY.as_secs();
+
+        master_store.retain(|session_id, (_, _, created)| {
+            if now.saturating_sub(*created) >= expiry_limit {
+                nonce_registry.remove_session(session_id);
+                has_deleted = true;
                 false
             } else {
                 true
             }
         });
+
+        if has_deleted {
+            master_store.shrink_to_fit();
+            nonce_registry.shrink_to_fit();
+        }
+    }
+}
+
+pub async fn stream_janitor(actors: Arc<DashMap<String, SessionHandle>>) {
+    let mut interval = tokio::time::interval(JANITOR_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        let mut has_deleted = false;
+
+        actors.retain(|_, handle| {
+            if handle.cmd_tx.is_closed() {
+                has_deleted = true;
+                false
+            } else {
+                true
+            }
+        });
+
+        if has_deleted {
+            actors.shrink_to_fit();
+        }
     }
 }

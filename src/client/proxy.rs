@@ -56,6 +56,51 @@ pub fn resolve_target_host(method: &str, url_str: &str) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
+pub fn rewrite_absolute_url(buf: &mut BytesMut, method: &str, url_str: &str) -> Result<()> {
+    let parsed = match Url::parse(url_str) {
+        Ok(u) => u,
+        Err(_) => return Ok(()),
+    };
+
+    let origin_path = {
+        let mut s = String::new();
+        s.push_str(parsed.path());
+        if let Some(q) = parsed.query() {
+            s.push('?');
+            s.push_str(q);
+        }
+        if let Some(f) = parsed.fragment() {
+            s.push('#');
+            s.push_str(f);
+        }
+        s
+    };
+
+    let line_end = buf
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| anyhow!("request line has no newline"))?;
+    let old_line_len = line_end + 1;
+
+    let first_line = std::str::from_utf8(&buf[..line_end])
+        .map_err(|_| anyhow!("request line is not valid UTF-8"))?;
+    let first_line_trimmed = first_line.trim_end_matches('\r');
+    let version = first_line_trimmed
+        .rsplit_once(' ')
+        .map(|(_, v)| v)
+        .ok_or_else(|| anyhow!("malformed request line: {first_line_trimmed}"))?;
+
+    let new_first_line = format!("{method} {origin_path} {version}\r\n");
+    let new_line_bytes = new_first_line.as_bytes();
+
+    let rest = buf.split_off(old_line_len);
+    buf.clear();
+    buf.extend_from_slice(new_line_bytes);
+    buf.unsplit(rest);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +126,102 @@ mod tests {
     #[test]
     fn resolve_connect_no_port_fails() {
         assert!(resolve_target_host("CONNECT", "example.com").is_err());
+    }
+
+    #[test]
+    fn rewrite_absolute_to_origin() {
+        let mut buf = BytesMut::from(
+            &b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+        );
+        rewrite_absolute_url(&mut buf, "GET", "http://example.com/path").unwrap();
+        let result = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            result.starts_with("GET /path HTTP/1.1\r\n"),
+            "got: {result}"
+        );
+        assert!(result.contains("Host: example.com"));
+    }
+
+    #[test]
+    fn rewrite_with_query_string() {
+        let mut buf = BytesMut::from(
+            &b"GET http://example.com/search?q=rust&lang=en HTTP/1.1\r\nHost: example.com\r\n\r\n"
+                [..],
+        );
+        rewrite_absolute_url(&mut buf, "GET", "http://example.com/search?q=rust&lang=en").unwrap();
+        let result = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            result.starts_with("GET /search?q=rust&lang=en HTTP/1.1\r\n"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn rewrite_root_path() {
+        let mut buf =
+            BytesMut::from(&b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n"[..]);
+        rewrite_absolute_url(&mut buf, "GET", "http://example.com/").unwrap();
+        let result = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(result.starts_with("GET / HTTP/1.1\r\n"), "got: {result}");
+    }
+
+    #[test]
+    fn rewrite_strips_port() {
+        let mut buf = BytesMut::from(
+            &b"GET http://example.com:8080/path HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"[..],
+        );
+        rewrite_absolute_url(&mut buf, "GET", "http://example.com:8080/path").unwrap();
+        let result = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            result.starts_with("GET /path HTTP/1.1\r\n"),
+            "got: {result}"
+        );
+        assert!(result.contains("Host: example.com:8080"));
+    }
+
+    #[test]
+    fn rewrite_already_origin_form_noop() {
+        let original = b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut buf = BytesMut::from(&original[..]);
+        rewrite_absolute_url(&mut buf, "GET", "/path").unwrap();
+        assert_eq!(&buf[..], &original[..]);
+    }
+
+    #[test]
+    fn rewrite_post_body_intact() {
+        let body = b"{\"key\":\"value\"}";
+        let mut request = Vec::new();
+        request.extend_from_slice(b"POST http://example.com/api HTTP/1.1\r\n");
+        request.extend_from_slice(b"Host: example.com\r\n");
+        request.extend_from_slice(b"Content-Type: application/json\r\n");
+        request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(body);
+
+        let mut buf = BytesMut::from(&request[..]);
+        rewrite_absolute_url(&mut buf, "POST", "http://example.com/api").unwrap();
+        let result = buf.to_vec();
+
+        let result_str = String::from_utf8(result.clone()).unwrap();
+        assert!(
+            result_str.starts_with("POST /api HTTP/1.1\r\n"),
+            "got: {result_str}"
+        );
+        assert!(result.ends_with(body), "POST body was modified");
+        assert!(result_str.contains(&format!("Content-Length: {}", body.len())));
+    }
+
+    #[test]
+    fn rewrite_https_url_scheme() {
+        let mut buf = BytesMut::from(
+            &b"GET https://secure.example.com/private HTTP/1.1\r\nHost: secure.example.com\r\n\r\n"
+                [..],
+        );
+        rewrite_absolute_url(&mut buf, "GET", "https://secure.example.com/private").unwrap();
+        let result = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            result.starts_with("GET /private HTTP/1.1\r\n"),
+            "got: {result}"
+        );
     }
 }

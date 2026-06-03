@@ -9,13 +9,13 @@ use std::sync::Arc;
 use tracing::{Instrument, info};
 use zeroize::Zeroizing;
 
-use crate::client::tunnel;
+use crate::client::actor::download_loop::DownloadLoopActor;
+use crate::client::actor::upload_loop::UploadLoopActor;
 use crate::client::utils;
 use crate::crypto::{self, AesFrameCipher};
 use crate::shaper::{self, FrameCipher, MAX_RAW_PAYLOAD};
 
 use super::state::SharedState;
-use super::tunnel::download_loop;
 use crate::client::constants::{
     DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, MIN_PADDING, PADDING_POOL,
 };
@@ -95,11 +95,8 @@ pub async fn try_pq_connect(
             "server requests re-handshake (428)".into(),
         )));
     }
-    if !response.status().is_success() {
-        let status = response.status();
-        let _ = response.bytes().await;
-        return Err(anyhow!("server rejected session resumption: {status}"));
-    }
+    let response =
+        utils::check_response_status(response, "server rejected session resumption").await?;
 
     let read_half = read_half
         .take()
@@ -113,23 +110,19 @@ pub async fn try_pq_connect(
     let upload_cipher_clone = Arc::clone(&upload_cipher);
     let session_cookie_val = cookie_val.clone();
 
-    let upload_task = tokio::spawn(
-        async move {
-            tunnel::upload_loop(
-                upload_client,
-                upload_state,
-                remaining_payload,
-                read_half,
-                Some(upload_cipher_clone),
-                session_cookie_val,
-                frames_sent,
-            )
-            .await
-        }
-        .instrument(tracing::Span::current()),
+    let upload_actor = UploadLoopActor::new(
+        upload_client.clone(),
+        upload_state.clone(),
+        remaining_payload,
+        read_half,
+        Some(upload_cipher_clone),
+        session_cookie_val,
+        frames_sent,
     );
+    let upload_task =
+        tokio::spawn(async move { upload_actor.run().await }.instrument(tracing::Span::current()));
 
-    let download_fut = download_loop(
+    let download_actor = DownloadLoopActor::new(
         response,
         write_half,
         Some(download_cipher),
@@ -138,19 +131,15 @@ pub async fn try_pq_connect(
         Arc::clone(state),
     );
 
-    utils::race_upload_download(upload_task, download_fut, Some("download failed")).await
+    utils::race_upload_download(upload_task, download_actor.run(), Some("download failed")).await
 }
 
-pub async fn full_handshake(
-    http_client: &Arc<wreq::Client>,
-    state: &Arc<SharedState>,
+pub async fn perform_pq_handshake(
+    http_client: &wreq::Client,
+    state: &SharedState,
     server_pk: &x25519_dalek::PublicKey,
-    target_host: &str,
-    initial_payload: Bytes,
-    read_half: tokio::net::tcp::OwnedReadHalf,
-    write_half: tokio::net::tcp::OwnedWriteHalf,
-) -> Result<()> {
-    info!(target = %target_host, "PQ handshake initiated");
+) -> Result<PqSessionTicket> {
+    info!("PQ handshake initiated");
 
     let (eph_sk_a, eph_pk_a) = crypto::generate_keypair();
     let eph_sk_a = Zeroizing::new(eph_sk_a);
@@ -205,11 +194,7 @@ pub async fn full_handshake(
     .context("handshake download connect timed out")?
     .context("handshake POST failed")?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let _ = response.bytes().await;
-        return Err(anyhow!("server rejected handshake: {status}"));
-    }
+    let response = utils::check_response_status(response, "server rejected handshake").await?;
 
     let handshake_cipher_ref: &dyn FrameCipher = &handshake_cipher;
     let mut body_buf = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
@@ -270,90 +255,30 @@ pub async fn full_handshake(
         ));
     }
 
-    let conn_nonce: [u8; 16] = rand::rng().random();
-    let (upload_key, download_key, target_key) =
-        crypto::derive_connection_keys(&master, &conn_nonce);
-    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
-    let download_cipher = Arc::new(AesFrameCipher::new(&download_key));
+    Ok(PqSessionTicket { master, session_id })
+}
 
-    let enc_target = crypto::encrypt_bytes(&target_key, target_host.as_bytes())?;
+pub async fn full_handshake(
+    http_client: &Arc<wreq::Client>,
+    state: &Arc<SharedState>,
+    server_pk: &x25519_dalek::PublicKey,
+    target_host: &str,
+    initial_payload: Bytes,
+    read_half: tokio::net::tcp::OwnedReadHalf,
+    write_half: tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    let ticket = perform_pq_handshake(http_client, state, server_pk).await?;
 
-    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&master);
-    let enc_conn_nonce = crypto::encrypt_bytes(&cookie_nonce_key, &conn_nonce)?;
-
-    let cookie_val = format!(
-        "{}:{}:{}",
-        session_id,
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&enc_target),
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&enc_conn_nonce)
-    );
-
-    let mut session_cookie = String::new();
-    utils::build_tunnel_cookie(&mut session_cookie, &cookie_val);
-
-    drop(stream);
-
-    let (early_data, remaining_payload, frames_sent) = utils::encode_initial_payload(
-        &initial_payload,
-        MAX_RAW_PAYLOAD,
-        Some(upload_cipher.as_ref() as &dyn FrameCipher),
-        &state.traffic_config,
-    )?;
-
-    info!(session_id = %session_id, target = %target_host, "PQ tunnel established");
-
-    let response = tokio::time::timeout(
-        DOWNLOAD_CONNECT_TIMEOUT,
-        http_client
-            .post(state.remote_str.as_str())
-            .header("Cookie", &session_cookie)
-            .body(wreq::Body::from(early_data))
-            .send(),
+    let mut rh = Some(read_half);
+    let mut wh = Some(write_half);
+    try_pq_connect(
+        http_client,
+        state,
+        &ticket,
+        target_host,
+        initial_payload,
+        &mut rh,
+        &mut wh,
     )
     .await
-    .context("post-handshake download connect timed out")?
-    .context("post-handshake POST failed")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let _ = response.bytes().await;
-        return Err(anyhow!("post-handshake download rejected: {status}"));
-    }
-
-    let upload_client = Arc::clone(http_client);
-    let upload_state = Arc::clone(state);
-    let upload_cipher_clone = Arc::clone(&upload_cipher);
-    let session_cookie_val = cookie_val.clone();
-
-    drop(eph_sk_a);
-    drop(handshake_key);
-    drop(kem_sk);
-    drop(eph_sk_b);
-
-    let upload_task = tokio::spawn(
-        async move {
-            tunnel::upload_loop(
-                upload_client,
-                upload_state,
-                remaining_payload,
-                read_half,
-                Some(upload_cipher_clone),
-                session_cookie_val,
-                frames_sent,
-            )
-            .await
-        }
-        .instrument(tracing::Span::current()),
-    );
-
-    let download_fut = download_loop(
-        response,
-        write_half,
-        Some(download_cipher),
-        cookie_val.clone(),
-        Arc::clone(http_client),
-        Arc::clone(state),
-    );
-
-    utils::race_upload_download(upload_task, download_fut, Some("tunnel download failed")).await
 }

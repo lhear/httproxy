@@ -1,111 +1,355 @@
-use axum::body::HttpBody;
 use axum::{body::Body, extract::State, http::HeaderMap, response::Response};
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use jsonwebtoken::{DecodingKey, Validation};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{Instrument, debug, info, warn};
+use std::io;
+use std::sync::Arc;
+use tracing::{Instrument, info, warn};
 use uuid;
 use zeroize::Zeroizing;
 
 use crate::crypto::{self, AesFrameCipher};
 use crate::error::ServerError;
+use crate::server::actor::tunnel::TunnelCmd;
+use crate::server::connection::connect_upstream;
 use crate::server::constants::{
-    CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_UPLOAD_BODY_SIZE, UPLOAD_CHANNEL_CAPACITY,
-    UPLOAD_DONE_TIMEOUT,
+    CONNECT_TIMEOUT, DOWNLOAD_CHANNEL_CAPACITY, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE,
+    TUNNEL_CMD_CHANNEL_CAPACITY,
 };
-use crate::server::{
-    connection::{self, connect_upstream},
-    state::{DownloadStream, FrameOrEos, StreamBundle, UploadStream},
-    utils,
-};
+use crate::server::stream::FrameDecoder;
+use crate::server::{SessionHandle, utils};
 use crate::shaper::{self, FrameCipher};
+use tokio::sync::oneshot;
 
 use super::AppState;
 
-fn pre_register_stream(
-    state: &Arc<AppState>,
-    map_key: String,
-    upload_cipher: Option<Arc<AesFrameCipher>>,
-    download_cipher: Option<Arc<dyn FrameCipher>>,
-) -> (Arc<StreamBundle>, mpsc::Receiver<FrameOrEos>) {
-    let (frame_tx, frame_rx) = mpsc::channel::<FrameOrEos>(UPLOAD_CHANNEL_CAPACITY);
-    let upload = Arc::new(UploadStream::new(frame_tx, upload_cipher));
-
-    let bundle = Arc::new(StreamBundle {
-        upload,
-        upstream_reader: Mutex::new(None),
-        download_cipher,
-        max_download_bytes: state.traffic_config.max_download_bytes,
-        handoff_tx: Mutex::new(None),
-        handoff_done: AtomicBool::new(false),
-    });
-
-    if let Some(_old) = state.streams.insert(map_key, Arc::clone(&bundle)) {
-        warn!("stream key collision on pre-register, replaced old entry");
+struct ActorGuard {
+    actors: Arc<dashmap::DashMap<String, SessionHandle>>,
+    key: String,
+    armed: bool,
+}
+impl Drop for ActorGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.actors.remove(&self.key);
+        }
     }
+}
+impl ActorGuard {
+    fn new(actors: Arc<dashmap::DashMap<String, SessionHandle>>, key: String) -> Self {
+        Self {
+            actors,
+            key,
+            armed: true,
+        }
+    }
+}
 
-    (bundle, frame_rx)
+struct TunnelGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+impl TunnelGuard {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finalize_stream_response(
+async fn setup_tunnel_response(
     state: &Arc<AppState>,
-    bundle: Arc<StreamBundle>,
-    frame_rx: mpsc::Receiver<FrameOrEos>,
-    upstream_read: tokio::net::tcp::OwnedReadHalf,
-    upstream_write: tokio::net::tcp::OwnedWriteHalf,
+    body: Body,
+    host: &str,
+    port: u16,
+    session_id: &str,
+    conn_nonce: Option<[u8; 16]>,
+    upload_cipher: Option<Arc<dyn FrameCipher>>,
     download_cipher: Option<Arc<dyn FrameCipher>>,
-    map_key: String,
-    log_key: String,
-    initial_seq: u64,
+    actor_key: &str,
 ) -> Result<Response, ServerError> {
-    let shaper = crate::shaper::TrafficShaper::with_seq(
+    let encoding = state.traffic_config.encoding_type;
+
+    let (download_tx, download_rx) =
+        tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(DOWNLOAD_CHANNEL_CAPACITY);
+    let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
+
+    let upstream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_upstream(
+            state.dns_client.as_ref(),
+            state.client_subnet,
+            state.socks5_proxy.as_ref(),
+            host,
+            port,
+        ),
+    )
+    .await
+    .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
+    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
+
+    let (upstream_read, upstream_write) = upstream.into_split();
+
+    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<
+        crate::server::actor::upload::UploadCmd,
+    >(crate::server::constants::UPLOAD_CMD_CHANNEL_CAPACITY);
+    let upload_actor = crate::server::actor::upload::UploadActor::new(upload_rx, upstream_write, 0);
+    let upload_handle =
+        tokio::spawn(async move { upload_actor.run().await }.instrument(tracing::Span::current()));
+
+    let byte_stream = body.into_data_stream().map(|r| r.map_err(io::Error::other));
+    let mut decoder = FrameDecoder::new(
+        byte_stream,
+        upload_cipher.clone(),
+        encoding,
+        MAX_FRAME_BUF_SIZE,
+    );
+
+    while let Some(result) = decoder.next().await {
+        let (seq, data) =
+            result.map_err(|e| ServerError::bad_request(format!("decode error: {e}")))?;
+        upload_tx
+            .send(crate::server::actor::upload::UploadCmd::Frame { seq, data })
+            .await
+            .map_err(|_| ServerError::bad_gateway("upload actor closed during initial stream"))?;
+    }
+
+    let upload_tx_for_actor = upload_tx.clone();
+
+    let mut actor = crate::server::actor::tunnel::TunnelActor::new(
+        actor_rx,
+        download_tx,
+        session_id.to_owned(),
+        conn_nonce,
+        Arc::clone(&state.nonce_registry),
+        state.traffic_config.max_download_bytes,
+    );
+    actor.set_upload_channel(upload_tx_for_actor, upload_handle);
+    actor.on_upstream_connected(
         upstream_read,
+        None,
         (*state.traffic_config).clone(),
         download_cipher,
         0,
     );
-    if let Ok(mut guard) = bundle.upstream_reader.lock() {
-        *guard = Some(Box::pin(shaper));
-    } else {
-        return Err(ServerError::internal("upstream_reader mutex poisoned"));
-    }
 
-    tokio::spawn(
-        connection::ordered_frame_writer(
-            frame_rx,
-            upstream_write,
-            log_key.clone(),
-            Arc::clone(&bundle.upload),
-            initial_seq,
-        )
+    let handle = SessionHandle {
+        cmd_tx: actor_tx.clone(),
+        upload_cipher,
+        encoding,
+    };
+    state.actors.insert(actor_key.to_owned(), handle);
+    let mut early_guard = ActorGuard::new(Arc::clone(&state.actors), actor_key.to_owned());
+
+    let key = actor_key.to_owned();
+    let actors_ref2 = Arc::clone(&state.actors);
+    let actor_handle = tokio::spawn(
+        async move {
+            let _guard = ActorGuard::new(actors_ref2, key);
+            actor.run().await;
+        }
         .instrument(tracing::Span::current()),
     );
 
-    let shutdown_fut = {
-        let notify = Arc::clone(&bundle.upload.shutdown);
-        Box::pin(async move { notify.notified().await })
-    };
+    let mut tunnel_guard = TunnelGuard::new(actor_handle);
 
-    let download = DownloadStream {
-        bundle,
-        streams: Arc::clone(&state.streams),
-        map_key,
-        log_key,
-        shutdown_fut: Some(shutdown_fut),
-        done: false,
-        rotated: false,
-        bytes_sent: 0,
-        handoff_rx: None,
-    };
+    early_guard.armed = false;
 
-    build_download_response(download)
+    let padding = utils::random_padding();
+    let response = Response::builder()
+        .header("Cache-Control", "no-store")
+        .header("Set-Cookie", padding)
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(download_rx),
+        ))
+        .map_err(|e| ServerError::internal(e.to_string()))?;
+
+    tunnel_guard.disarm();
+    Ok(response)
 }
+
+async fn spawn_tunnel_actor(
+    state: Arc<AppState>,
+    cookie_val: &str,
+    body: Body,
+    span: tracing::Span,
+) -> Result<Response, ServerError> {
+    let parts: Vec<&str> = cookie_val.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(ServerError::precondition_required(
+            "invalid session cookie format",
+        ));
+    }
+    let (session_id, enc_target_b64, enc_nonce_b64) = (parts[0], parts[1], parts[2]);
+
+    let entry = state
+        .master_store
+        .get(session_id)
+        .ok_or_else(|| ServerError::precondition_required("session not found"))?;
+    let value_ref = entry.value();
+    let mut master = Zeroizing::new([0u8; 32]);
+    let (username, master_z, created) = value_ref;
+    master.copy_from_slice(&**master_z);
+    let username = username.clone();
+    let created = *created;
+    if crate::now_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
+        drop(entry);
+        state.master_store.remove(session_id);
+        return Err(ServerError::precondition_required("master key expired"));
+    }
+    span.record("user", &username);
+    drop(entry);
+
+    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&master);
+    let enc_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(enc_nonce_b64)
+        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
+    let conn_nonce_bytes = crypto::decrypt_bytes(&cookie_nonce_key, &enc_nonce)
+        .map_err(|_| ServerError::precondition_required("failed to decrypt conn_nonce"))?;
+    let conn_nonce: [u8; 16] = conn_nonce_bytes
+        .try_into()
+        .map_err(|_| ServerError::precondition_required("invalid conn_nonce length"))?;
+
+    match state.nonce_registry.try_claim(session_id, &conn_nonce) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(ServerError::precondition_required("nonce already claimed"));
+        }
+        Err(_) => {
+            return Err(ServerError::precondition_required("nonce already consumed"));
+        }
+    }
+
+    let (upload_key, download_key, target_key) =
+        crypto::derive_connection_keys(&master, &conn_nonce);
+    let enc_target = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(enc_target_b64)
+        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
+    let target_bytes = crypto::decrypt_bytes(&target_key, &enc_target)
+        .map_err(|_| ServerError::precondition_required("failed to decrypt target"))?;
+    let target = String::from_utf8(target_bytes)
+        .map_err(|_| ServerError::precondition_required("invalid target utf8"))?;
+    let (host, port_str) = target
+        .rsplit_once(':')
+        .ok_or_else(|| ServerError::bad_request("target must be host:port"))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| ServerError::bad_request("invalid port"))?;
+    span.record("target", &target);
+
+    let download_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&download_key));
+    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
+
+    let log_target = target.clone();
+    let response = setup_tunnel_response(
+        &state,
+        body,
+        host,
+        port,
+        session_id,
+        Some(conn_nonce),
+        Some(upload_cipher as Arc<dyn FrameCipher>),
+        Some(download_cipher),
+        cookie_val,
+    )
+    .await?;
+
+    info!(session_id = %session_id, user = %username, target = %log_target, "tunnel actor spawned");
+    Ok(response)
+}
+
+async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response, ServerError> {
+    let byte_stream = body.into_data_stream().map(|r| r.map_err(io::Error::other));
+    let mut decoder = FrameDecoder::new(
+        byte_stream,
+        handle.upload_cipher.clone(),
+        handle.encoding,
+        MAX_FRAME_BUF_SIZE,
+    );
+
+    let mut max_seq: u64 = 0;
+    let mut frame_count = 0;
+
+    while let Some(result) = decoder.next().await {
+        let (seq, data) =
+            result.map_err(|e| ServerError::bad_request(format!("frame decode error: {e}")))?;
+        max_seq = max_seq.max(seq);
+        handle
+            .cmd_tx
+            .send(TunnelCmd::UploadFrame { seq, data })
+            .await
+            .map_err(|_| ServerError::bad_gateway("actor closed"))?;
+        frame_count += 1;
+    }
+
+    if frame_count == 0 {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(TunnelCmd::Continue { reply: reply_tx })
+            .await
+            .map_err(|_| ServerError::bad_gateway("actor closed"))?;
+
+        match reply_rx.await {
+            Ok(Some(new_download_rx)) => {
+                let padding = utils::random_padding();
+                return Response::builder()
+                    .header("Cache-Control", "no-store")
+                    .header("Set-Cookie", padding)
+                    .body(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(new_download_rx),
+                    ))
+                    .map_err(|e| ServerError::internal(e.to_string()));
+            }
+            _ => {
+                let padding = utils::random_padding();
+                return Response::builder()
+                    .header("Cache-Control", "no-store")
+                    .header("Set-Cookie", padding)
+                    .status(axum::http::StatusCode::NO_CONTENT)
+                    .body(Body::empty())
+                    .map_err(|e| ServerError::internal(e.to_string()));
+            }
+        }
+    }
+
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(TunnelCmd::UploadEos {
+            max_seq,
+            ack: ack_tx,
+        })
+        .await
+        .map_err(|_| ServerError::bad_gateway("actor closed"))?;
+
+    match tokio::time::timeout(crate::server::constants::UPLOAD_DONE_TIMEOUT, ack_rx).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => return Err(e),
+        Ok(Err(_)) => return Err(ServerError::bad_gateway("actor closed before upload ack")),
+        Err(_) => return Err(ServerError::gateway_timeout("upload drain timeout")),
+    }
+
+    let padding = utils::random_padding();
+    Response::builder()
+        .header("Cache-Control", "no-store")
+        .header("Set-Cookie", padding)
+        .status(axum::http::StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .map_err(|e| ServerError::internal(e.to_string()))
+}
+
 pub async fn dispatch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -114,56 +358,24 @@ pub async fn dispatch(
     let span = tracing::Span::current();
     let session_cookie = utils::extract_cookie_value(&headers, "session");
 
-    if let Some(cookie_val) = session_cookie
-        && state.streams.contains_key(cookie_val)
-    {
-        if is_body_empty(&headers, &body) {
-            return handle_download_continuation(state, cookie_val, span).await;
-        }
-        let session_id = cookie_val.split(':').next().unwrap_or(cookie_val);
-        if let Some(entry) = state.master_store.get(session_id) {
-            span.record("user", &entry.value().0);
-        }
-        return handle_stream_upload(state, cookie_val.to_owned(), body, span).await;
-    }
-
-    if headers.get("X-Target").is_some() {
+    let has_encrypted_cookie = session_cookie.is_some_and(|c| c.contains(':'));
+    if headers.get("X-Target").is_some() && !has_encrypted_cookie {
         return handle_plaintext_download(state, headers, body, span).await;
     }
 
-    let Some(cookie_val) = session_cookie else {
-        return handle_fresh_handshake(state, headers, body, span).await;
-    };
+    if let Some(cookie_val) = session_cookie {
+        if let Some(handle) = state.actors.get(cookie_val).map(|r| r.value().clone()) {
+            return dispatch_to_actor(handle, body).await;
+        }
 
-    let session_id = cookie_val.split(':').next().unwrap_or(cookie_val);
-
-    if state.master_store.get(session_id).is_none() {
+        let session_id = cookie_val.split(':').next().unwrap_or(cookie_val);
+        if state.master_store.get(session_id).is_some() {
+            return spawn_tunnel_actor(state, cookie_val, body, span).await;
+        }
         return Err(ServerError::precondition_required("session not found"));
     }
 
-    let body_bytes = axum::body::to_bytes(body, MAX_UPLOAD_BODY_SIZE)
-        .await
-        .map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
-
-    handle_pq_download(state, cookie_val, body_bytes, span).await
-}
-
-#[inline]
-fn is_body_empty(headers: &HeaderMap, body: &Body) -> bool {
-    if let Some(cl) = headers.get("content-length").and_then(|v| v.to_str().ok()) {
-        return cl == "0";
-    }
-    body.is_end_stream()
-}
-
-#[inline]
-fn build_download_response(download: DownloadStream) -> Result<Response, ServerError> {
-    let padding = utils::random_padding();
-    Response::builder()
-        .header("Cache-Control", "no-store")
-        .header("Set-Cookie", padding)
-        .body(Body::from_stream(download))
-        .map_err(|e| ServerError::internal(e.to_string()))
+    handle_fresh_handshake(state, headers, body, span).await
 }
 
 async fn handle_plaintext_download(
@@ -175,15 +387,10 @@ async fn handle_plaintext_download(
     let user = validate_jwt_if_needed(&headers, &state.decoding_key, &state.jwt_validation)?;
     span.record("user", &user);
 
-    let early_data = axum::body::to_bytes(body, MAX_UPLOAD_BODY_SIZE)
-        .await
-        .map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
-
     let target = headers
         .get("X-Target")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::bad_request("missing X-Target header"))?;
-
     span.record("target", target);
     info!(user = %user, target = %target, "connection initiated");
 
@@ -198,81 +405,21 @@ async fn handle_plaintext_download(
         .map(|s| s.to_owned())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let (bundle, frame_rx) = pre_register_stream(&state, session_id.clone(), None, None);
-
-    let mut upstream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        connect_upstream(
-            state.dns_client.as_ref(),
-            state.client_subnet,
-            state.socks5_proxy.as_ref(),
-            host,
-            port,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        state.streams.remove(session_id.as_str());
-        ServerError::gateway_timeout("connect timeout")
-    })?
-    .map_err(|e| {
-        state.streams.remove(session_id.as_str());
-        ServerError::bad_gateway(e.to_string())
-    })?;
-
-    let frames_written: u64 = if !early_data.is_empty() {
-        let mut buf = BytesMut::from(&early_data[..]);
-        let mut count: u64 = 0;
-        loop {
-            let decoded = match shaper::decode_from_buffer(
-                &mut buf,
-                None,
-                state.traffic_config.encoding_type,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    state.streams.remove(session_id.as_str());
-                    return Err(ServerError::internal(e.to_string()));
-                }
-            };
-            match decoded {
-                Some((_seq, data)) => {
-                    upstream.write_all(&data).await.map_err(|e| {
-                        state.streams.remove(session_id.as_str());
-                        ServerError::bad_gateway(format!("initial upload write error: {e}"))
-                    })?;
-                    count += 1;
-                }
-                None => break,
-            }
-        }
-        if !buf.is_empty() {
-            state.streams.remove(session_id.as_str());
-            return Err(ServerError::bad_request(
-                "trailing data in initial upload body",
-            ));
-        }
-        count
-    } else {
-        0
-    };
-
-    let (upstream_read, upstream_write) = upstream.into_split();
-
-    info!(stream_id = %session_id, user = %user, target = %target,
-          initial_frames = %frames_written, "stream established");
-
-    finalize_stream_response(
+    let response = setup_tunnel_response(
         &state,
-        bundle,
-        frame_rx,
-        upstream_read,
-        upstream_write,
+        body,
+        host,
+        port,
+        &session_id,
         None,
-        session_id.clone(),
-        session_id,
-        frames_written,
+        None,
+        None,
+        &session_id,
     )
+    .await?;
+
+    info!(stream_id = %session_id, user = %user, target = %target, "stream established");
+    Ok(response)
 }
 
 async fn handle_fresh_handshake(
@@ -306,9 +453,9 @@ async fn handle_fresh_handshake(
     let handshake_key = crypto::derive_handshake_key(&shared_a);
     let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
-    let body_bytes = axum::body::to_bytes(body, MAX_UPLOAD_BODY_SIZE)
+    let body_bytes = axum::body::to_bytes(body, MAX_FRAME_BUF_SIZE)
         .await
-        .map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
+        .map_err(|e| ServerError::payload_too_large(format!("request body error: {e}")))?;
 
     let mut buf = BytesMut::from(&body_bytes[..]);
     let Some((_seq, client_hello_data)) = shaper::decode_from_buffer(
@@ -402,312 +549,6 @@ async fn handle_fresh_handshake(
     Ok(resp)
 }
 
-async fn handle_pq_download(
-    state: Arc<AppState>,
-    cookie_val: &str,
-    early_data: Bytes,
-    span: tracing::Span,
-) -> Result<Response, ServerError> {
-    let parts: Vec<&str> = cookie_val.splitn(3, ':').collect();
-    if parts.len() != 3 {
-        return Err(ServerError::precondition_required(
-            "invalid session cookie format",
-        ));
-    }
-    let (session_id, enc_target_b64, enc_nonce_b64) = (parts[0], parts[1], parts[2]);
-    info!(session_id = %session_id, "session resumption: download request received");
-
-    let entry = state
-        .master_store
-        .get(session_id)
-        .ok_or_else(|| ServerError::precondition_required("session not found"))?;
-
-    let value_ref = entry.value();
-    let mut master = Zeroizing::new([0u8; 32]);
-    let (username, master_z, created) = value_ref;
-    master.copy_from_slice(&**master_z);
-    let username = username.clone();
-    let created = *created;
-    if crate::now_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
-        drop(entry);
-        state.master_store.remove(session_id);
-        return Err(ServerError::precondition_required("master key expired"));
-    }
-
-    let cookie_nonce_key = crypto::derive_cookie_nonce_key(&master);
-
-    let enc_target = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(enc_target_b64)
-        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
-
-    let enc_nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(enc_nonce_b64)
-        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
-    let conn_nonce_bytes = crypto::decrypt_bytes(&cookie_nonce_key, &enc_nonce)
-        .map_err(|_| ServerError::precondition_required("failed to decrypt conn_nonce"))?;
-    let conn_nonce: [u8; 16] = conn_nonce_bytes
-        .try_into()
-        .map_err(|_| ServerError::precondition_required("invalid conn_nonce length"))?;
-
-    drop(entry);
-
-    let (upload_key, download_key, target_key) =
-        crypto::derive_connection_keys(&master, &conn_nonce);
-
-    let target_bytes = crypto::decrypt_bytes(&target_key, &enc_target)
-        .map_err(|_| ServerError::precondition_required("failed to decrypt target"))?;
-    let target = String::from_utf8(target_bytes)
-        .map_err(|_| ServerError::precondition_required("invalid target utf8"))?;
-
-    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
-    let download_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&download_key));
-
-    let (host, port_str) = target
-        .rsplit_once(':')
-        .ok_or_else(|| ServerError::bad_request("target must be host:port"))?;
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| ServerError::bad_request("invalid port"))?;
-
-    span.record("user", &username);
-    span.record("target", &target);
-
-    let (bundle, frame_rx) = pre_register_stream(
-        &state,
-        cookie_val.to_owned(),
-        Some(upload_cipher.clone()),
-        Some(download_cipher.clone()),
-    );
-
-    {
-        let nonce_set = state.used_nonces.entry(session_id.to_string()).or_default();
-        if !nonce_set.insert(conn_nonce) {
-            state.streams.remove(cookie_val);
-            return Err(ServerError::precondition_required(
-                "nonce already used (replay detected)",
-            ));
-        }
-    }
-
-    info!(session_id = %session_id, user = %username, "session resumption: connecting to {}", target);
-
-    let mut upstream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        connect_upstream(
-            state.dns_client.as_ref(),
-            state.client_subnet,
-            state.socks5_proxy.as_ref(),
-            host,
-            port,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        state.streams.remove(cookie_val);
-        ServerError::gateway_timeout("connect timeout")
-    })?
-    .map_err(|e| {
-        state.streams.remove(cookie_val);
-        ServerError::bad_gateway(e.to_string())
-    })?;
-
-    let upload_cipher_ref: &dyn FrameCipher = upload_cipher.as_ref() as &dyn FrameCipher;
-    let frames_written: u64 = if !early_data.is_empty() {
-        let mut buf = BytesMut::from(&early_data[..]);
-        let mut count: u64 = 0;
-        loop {
-            let decoded = match shaper::decode_from_buffer(
-                &mut buf,
-                Some(upload_cipher_ref),
-                state.traffic_config.encoding_type,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    state.streams.remove(cookie_val);
-                    return Err(ServerError::internal(e.to_string()));
-                }
-            };
-            match decoded {
-                Some((_seq, data)) => {
-                    upstream.write_all(&data).await.map_err(|e| {
-                        state.streams.remove(cookie_val);
-                        ServerError::bad_gateway(format!("initial upload write error: {e}"))
-                    })?;
-                    count += 1;
-                }
-                None => break,
-            }
-        }
-        if !buf.is_empty() {
-            state.streams.remove(cookie_val);
-            return Err(ServerError::bad_request(
-                "trailing data in initial upload body",
-            ));
-        }
-        count
-    } else {
-        0
-    };
-
-    let (upstream_read, upstream_write) = upstream.into_split();
-
-    finalize_stream_response(
-        &state,
-        bundle,
-        frame_rx,
-        upstream_read,
-        upstream_write,
-        Some(download_cipher),
-        cookie_val.to_owned(),
-        session_id.to_owned(),
-        frames_written,
-    )
-}
-
-async fn handle_download_continuation(
-    state: Arc<AppState>,
-    cookie_val: &str,
-    _span: tracing::Span,
-) -> Result<Response, ServerError> {
-    let bundle = state
-        .streams
-        .get(cookie_val)
-        .map(|r| Arc::clone(r.value()))
-        .ok_or_else(|| ServerError::not_found("stream not found for continuation"))?;
-
-    bundle.upload.clear_rotation();
-
-    let session_id = cookie_val.split(':').next().unwrap_or(cookie_val);
-
-    if let Some(entry) = state.master_store.get(session_id) {
-        let user = &entry.value().0;
-        tracing::Span::current().record("user", user);
-    }
-
-    debug!(stream_id = %session_id, "download continuation requested");
-
-    let (handoff_tx, handoff_rx) = oneshot::channel();
-    {
-        let mut tx_guard = bundle
-            .handoff_tx
-            .lock()
-            .map_err(|_| ServerError::internal("handoff mutex poisoned"))?;
-        *tx_guard = Some(handoff_tx);
-    }
-
-    let shutdown_fut = {
-        let notify = Arc::clone(&bundle.upload.shutdown);
-        Box::pin(async move { notify.notified().await })
-    };
-
-    let download = DownloadStream {
-        bundle: Arc::clone(&bundle),
-        streams: Arc::clone(&state.streams),
-        map_key: cookie_val.to_owned(),
-        log_key: session_id.to_owned(),
-        shutdown_fut: Some(shutdown_fut),
-        done: false,
-        rotated: false,
-        bytes_sent: 0,
-        handoff_rx: Some(Box::pin(handoff_rx)),
-    };
-
-    build_download_response(download)
-}
-
-async fn handle_stream_upload(
-    state: Arc<AppState>,
-    cookie_val: String,
-    body: Body,
-    _span: tracing::Span,
-) -> Result<Response, ServerError> {
-    let bundle = state
-        .streams
-        .get(&cookie_val)
-        .map(|r| Arc::clone(r.value()))
-        .ok_or_else(|| ServerError::not_found("unknown upload stream"))?;
-
-    let session_id = cookie_val.split(':').next().unwrap_or(&cookie_val);
-    if let Some(entry) = state.master_store.get(session_id) {
-        let user = &entry.value().0;
-        tracing::Span::current().record("user", user);
-    }
-
-    let cipher_ref: Option<&dyn FrameCipher> = bundle
-        .upload
-        .upload_cipher
-        .as_deref()
-        .map(|c| c as &dyn FrameCipher);
-    let encoding_type = state.traffic_config.encoding_type;
-
-    let mut body = body.into_data_stream();
-    let mut buf = BytesMut::with_capacity(8192);
-    let mut total_body_bytes = 0usize;
-    let mut max_seq = 0u64;
-
-    while let Some(chunk) = body.next().await {
-        let chunk =
-            chunk.map_err(|e| ServerError::bad_request(format!("failed to read body: {e}")))?;
-        total_body_bytes += chunk.len();
-        if total_body_bytes > MAX_UPLOAD_BODY_SIZE {
-            return Err(ServerError::payload_too_large(
-                "body exceeds max upload size",
-            ));
-        }
-        buf.extend_from_slice(&chunk);
-
-        loop {
-            let Some((seq, data)) =
-                shaper::decode_from_buffer(&mut buf, cipher_ref, encoding_type)?
-            else {
-                break;
-            };
-            if seq > max_seq {
-                max_seq = seq;
-            }
-            bundle
-                .upload
-                .tx
-                .send(FrameOrEos::Data { seq, data })
-                .await
-                .map_err(|_| ServerError::bad_gateway("upload channel closed"))?;
-        }
-    }
-
-    if !buf.is_empty() {
-        return Err(ServerError::bad_request("incomplete frame in batch body"));
-    }
-
-    let (done_tx, done_rx) = oneshot::channel();
-    bundle
-        .upload
-        .tx
-        .send(FrameOrEos::Eos {
-            max_seq,
-            done: done_tx,
-        })
-        .await
-        .map_err(|_| ServerError::bad_gateway("upload channel closed"))?;
-
-    tokio::time::timeout(UPLOAD_DONE_TIMEOUT, done_rx)
-        .await
-        .map_err(|_| ServerError::gateway_timeout("upload drain timeout"))?
-        .map_err(|_| ServerError::bad_gateway("upload stream closed"))?;
-
-    bundle.upload.touch();
-
-    let padding = utils::random_padding();
-    let resp = Response::builder()
-        .header("Cache-Control", "no-store")
-        .header("Set-Cookie", padding)
-        .status(axum::http::StatusCode::NO_CONTENT)
-        .body(Body::empty())
-        .map_err(|e| ServerError::internal(e.to_string()))?;
-
-    Ok(resp)
-}
-
-#[inline]
 pub fn validate_jwt_if_needed(
     headers: &HeaderMap,
     key: &DecodingKey,

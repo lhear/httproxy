@@ -70,9 +70,12 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::spawn(
             async move {
-                if let Err(e) =
-                    httproxy::client::connection::handle_connection(socket, http_client, state)
-                        .await
+                if let Err(e) = httproxy::client::connection::handle_connection_actor(
+                    socket,
+                    http_client,
+                    state,
+                )
+                .await
                     && !httproxy::client::utils::is_silent_error(e.root_cause())
                 {
                     warn!(reason = %e, "connection aborted");
