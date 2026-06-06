@@ -19,7 +19,7 @@ pub const NONCE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub const DOWNLOAD_CHANNEL_CAPACITY: usize = 8;
+pub const DOWNLOAD_CHANNEL_CAPACITY: usize = 1;
 pub const TUNNEL_CMD_CHANNEL_CAPACITY: usize = 32;
 pub const UPLOAD_CMD_CHANNEL_CAPACITY: usize = 8;
 
