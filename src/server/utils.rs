@@ -1,5 +1,7 @@
 use rand::RngExt;
+use uuid::Uuid;
 
+use crate::error::ServerError;
 use crate::server::constants::PADDING_POOL;
 
 #[inline]
@@ -39,6 +41,11 @@ pub fn extract_cookie_value<'a>(headers: &'a axum::http::HeaderMap, key: &str) -
         }
     }
     None
+}
+
+#[inline]
+pub fn validate_uuid(s: &str) -> Result<Uuid, ServerError> {
+    Uuid::parse_str(s).map_err(|_| ServerError::bad_request("invalid UUID format"))
 }
 
 #[inline]

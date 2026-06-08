@@ -3,8 +3,8 @@ pub mod connection;
 pub mod constants;
 pub mod handlers;
 pub mod janitor;
-pub mod nonce_registry;
 pub mod stream;
+pub mod stream_registry;
 pub mod utils;
 
 use crate::config::ServerTopConfig;
@@ -17,7 +17,6 @@ use axum::serve::ListenerExt;
 use axum::{Router, body::Body, routing::post};
 use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use nonce_registry::NonceRegistry;
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -26,6 +25,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use stream_registry::StreamRegistry;
 use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -59,7 +59,7 @@ pub struct AppState {
     pub traffic_config: Arc<TrafficConfig>,
     pub private_key: Option<x25519_dalek::StaticSecret>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
-    pub nonce_registry: Arc<NonceRegistry>,
+    pub stream_registry: Arc<StreamRegistry>,
     pub actors: Arc<DashMap<String, SessionHandle>>,
     pub stream_id_counter: Arc<AtomicU64>,
 }
@@ -103,7 +103,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         traffic_config: Arc::new(config.traffic_shaping.clone()),
         private_key,
         master_store: Arc::new(DashMap::new()),
-        nonce_registry: Arc::new(NonceRegistry::new()),
+        stream_registry: Arc::new(StreamRegistry::new()),
         actors: Arc::new(DashMap::new()),
         stream_id_counter: Arc::new(AtomicU64::new(1)),
     }))
@@ -157,9 +157,9 @@ pub async fn run_server(app: Router, listen: &str) -> anyhow::Result<()> {
 pub fn spawn_janitors(
     state: &Arc<AppState>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let master_jh = tokio::spawn(janitor::master_and_nonce_janitor(
+    let master_jh = tokio::spawn(janitor::master_and_stream_janitor(
         Arc::clone(&state.master_store),
-        Arc::clone(&state.nonce_registry),
+        Arc::clone(&state.stream_registry),
     ));
     let stream_jh = tokio::spawn(janitor::stream_janitor(Arc::clone(&state.actors)));
     (master_jh, stream_jh)

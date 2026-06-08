@@ -9,15 +9,26 @@ use crate::client::constants::{MIN_PADDING, PADDING_POOL};
 use crate::shaper::{self, FrameCipher};
 
 #[inline]
-pub fn build_tunnel_cookie(buf: &mut String, session_val: &str) {
+fn build_cookie_into(buf: &mut String, name: &str, value: &str) {
     buf.clear();
-    let cap = 8 + session_val.len() + MIN_PADDING + PADDING_POOL.len();
+    let cap = name.len() + 1 + value.len() + 2 + MIN_PADDING + PADDING_POOL.len();
     buf.reserve(cap);
-    buf.push_str("session=");
-    buf.push_str(session_val);
+    buf.push_str(name);
+    buf.push('=');
+    buf.push_str(value);
     buf.push_str("; ");
     let padding_len = rand::rng().random_range(MIN_PADDING..PADDING_POOL.len());
     buf.push_str(std::str::from_utf8(&PADDING_POOL[..padding_len]).expect("Invalid UTF-8"))
+}
+
+#[inline]
+pub fn build_tunnel_cookie(buf: &mut String, session_val: &str) {
+    build_cookie_into(buf, "session", session_val)
+}
+
+#[inline]
+pub fn build_stream_cookie(buf: &mut String, stream_id: &str) {
+    build_cookie_into(buf, "stream", stream_id)
 }
 
 pub fn encode_initial_payload(

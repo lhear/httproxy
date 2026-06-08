@@ -21,7 +21,7 @@ pub(crate) async fn handle_plain_proxy(
 ) -> Result<()> {
     let stream_id = uuid::Uuid::new_v4().to_string();
     let mut cookie = String::new();
-    utils::build_tunnel_cookie(&mut cookie, &stream_id);
+    utils::build_stream_cookie(&mut cookie, &stream_id);
 
     let (early_data, remaining_payload, frames_sent) = utils::encode_initial_payload(
         &payload,
@@ -30,7 +30,7 @@ pub(crate) async fn handle_plain_proxy(
         &state.traffic_config,
     )?;
 
-    info!(target = %target_host, "connection initiated");
+    info!(stream_id = %stream_id, target = %target_host, "connection initiated");
 
     let response = tokio::time::timeout(
         DOWNLOAD_CONNECT_TIMEOUT,
@@ -64,7 +64,7 @@ pub(crate) async fn handle_plain_proxy(
         response,
         write_half,
         None,
-        stream_id.to_owned(),
+        stream_id,
         Arc::clone(&http_client),
         Arc::clone(&state),
     );

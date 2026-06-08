@@ -34,7 +34,7 @@ pub struct DownloadLoopActor {
     write_half: tokio::net::tcp::OwnedWriteHalf,
     cipher: Option<Arc<dyn FrameCipher>>,
     encoding: EncodingType,
-    cookie_val: String,
+    stream_id: String,
     http_client: Arc<wreq::Client>,
     state: Arc<SharedState>,
     max_bytes: Option<u64>,
@@ -46,7 +46,7 @@ impl DownloadLoopActor {
         initial_response: wreq::Response,
         write_half: tokio::net::tcp::OwnedWriteHalf,
         cipher: Option<Arc<AesFrameCipher>>,
-        cookie_val: String,
+        stream_id: String,
         http_client: Arc<wreq::Client>,
         state: Arc<SharedState>,
     ) -> Self {
@@ -58,7 +58,7 @@ impl DownloadLoopActor {
         let use_prefetch = prefetch_at.is_some_and(|at| at > 0);
 
         let (prefetch_trigger, prefetch_rx) = if rotate_enabled && use_prefetch {
-            let (tx, rx) = spawn_prefetch_continuation(&http_client, &state, &cookie_val);
+            let (tx, rx) = spawn_prefetch_continuation(&http_client, &state, &stream_id);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -68,7 +68,7 @@ impl DownloadLoopActor {
             write_half,
             cipher: cipher_dyn,
             encoding,
-            cookie_val,
+            stream_id,
             http_client,
             state,
             max_bytes,
@@ -151,15 +151,15 @@ impl DownloadLoopActor {
             match tokio::time::timeout(PREFETCH_ROTATE_TIMEOUT, rx).await {
                 Ok(Ok(Ok(resp))) => resp,
                 Ok(Ok(Err(_))) | Ok(Err(_)) => {
-                    send_continue_request(&self.http_client, &self.state, &self.cookie_val).await?
+                    send_continue_request(&self.http_client, &self.state, &self.stream_id).await?
                 }
                 Err(_elapsed) => {
                     warn!("prefetch timed out, falling back to synchronous continue");
-                    send_continue_request(&self.http_client, &self.state, &self.cookie_val).await?
+                    send_continue_request(&self.http_client, &self.state, &self.stream_id).await?
                 }
             }
         } else {
-            send_continue_request(&self.http_client, &self.state, &self.cookie_val).await?
+            send_continue_request(&self.http_client, &self.state, &self.stream_id).await?
         };
 
         let use_prefetch = self
@@ -168,7 +168,7 @@ impl DownloadLoopActor {
             .is_some_and(|at| at > 0);
         let (prefetch_trigger, prefetch_rx) = if use_prefetch {
             let (tx, rx) =
-                spawn_prefetch_continuation(&self.http_client, &self.state, &self.cookie_val);
+                spawn_prefetch_continuation(&self.http_client, &self.state, &self.stream_id);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -238,10 +238,10 @@ async fn download_single_response(
 async fn send_continue_request(
     http_client: &wreq::Client,
     state: &SharedState,
-    cookie_val: &str,
+    stream_id: &str,
 ) -> Result<wreq::Response> {
     let mut cookie = String::new();
-    utils::build_tunnel_cookie(&mut cookie, cookie_val);
+    utils::build_stream_cookie(&mut cookie, stream_id);
     let mut req = http_client
         .post(state.remote_str.as_str())
         .header("Cookie", cookie);
@@ -259,7 +259,7 @@ async fn send_continue_request(
 fn spawn_prefetch_continuation(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
-    cookie_val: &str,
+    stream_id: &str,
 ) -> (
     oneshot::Sender<()>,
     oneshot::Receiver<Result<wreq::Response>>,
@@ -268,13 +268,13 @@ fn spawn_prefetch_continuation(
     let (result_tx, result_rx) = oneshot::channel();
     let pre_client = Arc::clone(http_client);
     let pre_state = Arc::clone(state);
-    let pre_cookie = cookie_val.to_owned();
+    let pre_stream_id = stream_id.to_owned();
     tokio::spawn(
         async move {
             if trigger_rx.await.is_err() {
                 return;
             }
-            match send_continue_request(&pre_client, &pre_state, &pre_cookie).await {
+            match send_continue_request(&pre_client, &pre_state, &pre_stream_id).await {
                 Ok(resp) => {
                     let _ = result_tx.send(Ok(resp));
                 }
