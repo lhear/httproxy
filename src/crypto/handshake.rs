@@ -21,18 +21,18 @@ pub fn derive_initial_master(mlkem_ss: &[u8], x25519_ss: &[u8; 32]) -> Zeroizing
     master
 }
 
-pub fn derive_cookie_nonce_key(master: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+pub fn derive_cookie_stream_key(master: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let hkdf = Hkdf::<Sha256>::new(None, master);
     let mut key = Zeroizing::new([0u8; 32]);
-    hkdf.expand(b"cookie_nonce_key", &mut *key)
+    hkdf.expand(b"cookie_stream_key", &mut *key)
         .expect("32 bytes is valid for HKDF");
     key
 }
 
-pub fn derive_connection_keys(master: &[u8; 32], conn_nonce: &[u8; 16]) -> super::ConnectionKeys {
+pub fn derive_connection_keys(master: &[u8; 32], stream_id: &[u8; 16]) -> super::ConnectionKeys {
     let hkdf = Hkdf::<Sha256>::new(None, master);
     let mut info = Vec::with_capacity(16 + 15);
-    info.extend_from_slice(conn_nonce);
+    info.extend_from_slice(stream_id);
     info.extend_from_slice(b"connection_keys");
     let mut buf = Zeroizing::new([0u8; 96]);
     hkdf.expand(&info, &mut *buf)

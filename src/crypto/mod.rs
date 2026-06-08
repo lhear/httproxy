@@ -4,7 +4,7 @@ mod keys;
 
 pub use cipher::{AesFrameCipher, decrypt_bytes, encrypt_bytes};
 pub use handshake::{
-    derive_connection_keys, derive_cookie_nonce_key, derive_handshake_key, derive_initial_master,
+    derive_connection_keys, derive_cookie_stream_key, derive_handshake_key, derive_initial_master,
 };
 pub use keys::{
     b64_to_private_key, b64_to_public_key, bytes_to_encapsulation_key, diffie_hellman,

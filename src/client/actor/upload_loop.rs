@@ -35,7 +35,7 @@ enum Phase {
 pub struct UploadLoopActor {
     http_client: Arc<wreq::Client>,
     state: Arc<SharedState>,
-    session_cookie: String,
+    stream_id: String,
     shaped: ShaperStream,
     request_sem: Arc<Semaphore>,
     bytes_sem: Arc<Semaphore>,
@@ -50,7 +50,7 @@ impl UploadLoopActor {
         initial_payload: Bytes,
         read_half: tokio::net::tcp::OwnedReadHalf,
         cipher: Option<Arc<AesFrameCipher>>,
-        session_cookie: String,
+        stream_id: String,
         start_seq: u64,
     ) -> Self {
         let reader = AsyncReadExt::chain(std::io::Cursor::new(initial_payload), read_half);
@@ -65,7 +65,7 @@ impl UploadLoopActor {
         Self {
             http_client,
             state,
-            session_cookie,
+            stream_id,
             shaped,
             request_sem: Arc::new(Semaphore::new(UPLOAD_CONCURRENCY)),
             bytes_sem: Arc::new(Semaphore::new(MAX_IN_FLIGHT_BYTES)),
@@ -181,12 +181,12 @@ impl UploadLoopActor {
         let body = batch_buf.freeze();
         let http_client = Arc::clone(&self.http_client);
         let state_ref = Arc::clone(&self.state);
-        let session_val = self.session_cookie.clone();
+        let stream_id = self.stream_id.clone();
         self.tasks.spawn(
             async move {
                 let _req_guard = req_permit;
                 let _bytes = bytes_permits;
-                send_upload_post(&http_client, &state_ref, body, &session_val).await
+                send_upload_post(&http_client, &state_ref, body, &stream_id).await
             }
             .instrument(tracing::Span::current()),
         );
@@ -230,11 +230,11 @@ async fn send_upload_post(
     http_client: &wreq::Client,
     state: &SharedState,
     body: Bytes,
-    session_cookie_val: &str,
+    stream_id: &str,
 ) -> Result<()> {
     debug_assert!(!body.is_empty(), "empty upload body");
     let mut cookie = String::new();
-    utils::build_tunnel_cookie(&mut cookie, session_cookie_val);
+    utils::build_stream_cookie(&mut cookie, stream_id);
     let mut req = http_client
         .post(state.remote_str.as_str())
         .header("Accept-Encoding", "identity")

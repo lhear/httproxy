@@ -49,22 +49,23 @@ pub async fn try_pq_connect(
     let session_id = &ticket.session_id;
     info!(session_id = %session_id, target = %target_host, "session resumption: attempting to reuse session");
 
-    let conn_nonce: [u8; 16] = rand::rng().random();
+    let stream_id = uuid::Uuid::new_v4();
+    let stream_id_bytes: [u8; 16] = *stream_id.as_bytes();
     let (upload_key, download_key, target_key) =
-        crypto::derive_connection_keys(master, &conn_nonce);
+        crypto::derive_connection_keys(master, &stream_id_bytes);
     let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
     let download_cipher = Arc::new(AesFrameCipher::new(&download_key));
 
     let enc_target = crypto::encrypt_bytes(&target_key, target_host.as_bytes())?;
 
-    let cookie_nonce_key = crypto::derive_cookie_nonce_key(master);
-    let enc_conn_nonce = crypto::encrypt_bytes(&cookie_nonce_key, &conn_nonce)?;
+    let cookie_stream_key = crypto::derive_cookie_stream_key(master);
+    let enc_stream_id = crypto::encrypt_bytes(&cookie_stream_key, &stream_id_bytes)?;
 
     let cookie_val = format!(
         "{}:{}:{}",
         session_id,
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&enc_target),
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&enc_conn_nonce)
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&enc_stream_id)
     );
 
     let (early_data, remaining_payload, frames_sent) = utils::encode_initial_payload(
@@ -108,7 +109,7 @@ pub async fn try_pq_connect(
     let upload_client = Arc::clone(http_client);
     let upload_state = Arc::clone(state);
     let upload_cipher_clone = Arc::clone(&upload_cipher);
-    let session_cookie_val = cookie_val.clone();
+    let stream_id_str = stream_id.to_string();
 
     let upload_actor = UploadLoopActor::new(
         upload_client.clone(),
@@ -116,7 +117,7 @@ pub async fn try_pq_connect(
         remaining_payload,
         read_half,
         Some(upload_cipher_clone),
-        session_cookie_val,
+        stream_id_str.clone(),
         frames_sent,
     );
     let upload_task =
@@ -126,7 +127,7 @@ pub async fn try_pq_connect(
         response,
         write_half,
         Some(download_cipher),
-        cookie_val.clone(),
+        stream_id_str,
         Arc::clone(http_client),
         Arc::clone(state),
     );

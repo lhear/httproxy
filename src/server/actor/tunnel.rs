@@ -15,7 +15,7 @@ use crate::server::constants::{
     DOWNLOAD_CHANNEL_CAPACITY, ROTATION_STALENESS, STREAM_IDLE_TIMEOUT_SECS,
     UPLOAD_CMD_CHANNEL_CAPACITY, UPLOAD_DONE_TIMEOUT,
 };
-use crate::server::nonce_registry::NonceRegistry;
+use crate::server::stream_registry::StreamRegistry;
 use crate::shaper::{FrameCipher, TrafficConfig, TrafficShaper};
 
 pub enum TunnelCmd {
@@ -54,9 +54,8 @@ pub struct TunnelActor {
     pending_continue: Vec<oneshot::Sender<Option<mpsc::Receiver<std::io::Result<Bytes>>>>>,
     segment_done_tx: mpsc::Sender<Option<ShaperStream>>,
     segment_done_rx: mpsc::Receiver<Option<ShaperStream>>,
-    session_id: String,
-    conn_nonce: Option<[u8; 16]>,
-    nonce_registry: Arc<NonceRegistry>,
+    stream_id: String,
+    stream_registry: Arc<StreamRegistry>,
     shutdown_signal: Arc<Notify>,
     max_download_bytes: Option<u64>,
     pending_write_half: Option<OwnedWriteHalf>,
@@ -69,9 +68,8 @@ impl TunnelActor {
     pub fn new(
         rx: mpsc::Receiver<TunnelCmd>,
         download_tx: mpsc::Sender<std::io::Result<Bytes>>,
-        session_id: String,
-        conn_nonce: Option<[u8; 16]>,
-        nonce_registry: Arc<NonceRegistry>,
+        stream_id: String,
+        stream_registry: Arc<StreamRegistry>,
         max_download_bytes: Option<u64>,
     ) -> Self {
         let (seg_tx, seg_rx) = mpsc::channel::<Option<ShaperStream>>(2);
@@ -86,9 +84,8 @@ impl TunnelActor {
             pending_continue: Vec::new(),
             segment_done_tx: seg_tx,
             segment_done_rx: seg_rx,
-            session_id,
-            conn_nonce,
-            nonce_registry,
+            stream_id,
+            stream_registry,
             shutdown_signal: Arc::new(Notify::new()),
             max_download_bytes,
             pending_write_half: None,
@@ -237,7 +234,7 @@ impl TunnelActor {
                     }
                 }
                 _ = &mut rotation_timeout, if matches!(self.phase, Phase::Rotating) => {
-                    warn!(session_id = %self.session_id, "rotation staleness timeout");
+                    warn!(stream_id = %self.stream_id, "rotation staleness timeout");
                     break;
                 }
                 _ = self.shutdown_signal.notified() => {
@@ -248,7 +245,7 @@ impl TunnelActor {
                         .saturating_sub(self.last_activity.load(Ordering::Relaxed));
                     if idle_secs >= STREAM_IDLE_TIMEOUT_SECS {
                         warn!(
-                            session_id = %self.session_id,
+                            stream_id = %self.stream_id,
                             "stream idle timeout, closing tunnel"
                         );
                         break;
@@ -332,7 +329,7 @@ impl TunnelActor {
 
     async fn cleanup(&mut self) {
         self.phase = Phase::Closed;
-        self.consume_nonce();
+        self.consume_stream();
         if let Some(handle) = self.download_handle.take() {
             handle.abort();
         }
@@ -342,21 +339,19 @@ impl TunnelActor {
             }
             self.upload_tx = None;
             if let Err(join_err) = handle.await {
-                warn!(session_id = %self.session_id, error = %join_err, "upload actor panicked");
+                warn!(stream_id = %self.stream_id, error = %join_err, "upload actor panicked");
             }
         }
-        info!(session_id = %self.session_id, "tunnel actor closed");
+        info!(stream_id = %self.stream_id, "tunnel actor closed");
     }
 
-    fn consume_nonce(&mut self) {
-        if let Some(nonce) = self.conn_nonce.take() {
-            self.nonce_registry.mark_consumed(&self.session_id, &nonce);
-        }
+    fn consume_stream(&mut self) {
+        self.stream_registry.mark_consumed(&self.stream_id);
     }
 }
 
 impl Drop for TunnelActor {
     fn drop(&mut self) {
-        self.consume_nonce();
+        self.consume_stream();
     }
 }
