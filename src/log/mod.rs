@@ -43,8 +43,10 @@ macro_rules! json_fmt_layer {
 }
 
 pub fn init_tracing(log_cfg: &LogConfig) -> Option<WorkerGuard> {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_cfg.level));
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => EnvFilter::try_new(&log_cfg.level).unwrap_or_else(|_| EnvFilter::new("info")),
+    };
     match &log_cfg.file_path {
         Some(path_str) => {
             let (non_blocking, guard) = build_file_writer(path_str, log_cfg.max_backups);
@@ -77,7 +79,7 @@ fn build_file_writer(
     let file_stem = file_path
         .file_stem()
         .and_then(|s| s.to_str())
-        .expect("invalid log file path: missing file stem");
+        .unwrap_or("httproxy");
     let file_extension = file_path
         .extension()
         .and_then(|s| s.to_str())

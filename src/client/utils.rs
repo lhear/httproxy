@@ -1,21 +1,23 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use rand::RngExt;
+use std::fmt::Write as _;
 use std::future::Future;
 use tokio::task::JoinHandle;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::client::constants::{MIN_PADDING, PADDING_POOL};
 use crate::shaper::{self, FrameCipher};
 
 #[inline]
-fn build_cookie_into(buf: &mut String, name: &str, value: &str) {
+fn build_cookie_into(buf: &mut String, name: &str, value: impl std::fmt::Display) {
     buf.clear();
-    let cap = name.len() + 1 + value.len() + 2 + MIN_PADDING + PADDING_POOL.len();
+    let cap = name.len() + 1 + 36 + 2 + MIN_PADDING + PADDING_POOL.len();
     buf.reserve(cap);
     buf.push_str(name);
     buf.push('=');
-    buf.push_str(value);
+    let _ = write!(buf, "{value}");
     buf.push_str("; ");
     let padding_len = rand::rng().random_range(MIN_PADDING..PADDING_POOL.len());
     buf.push_str(std::str::from_utf8(&PADDING_POOL[..padding_len]).expect("Invalid UTF-8"))
@@ -27,8 +29,8 @@ pub fn build_tunnel_cookie(buf: &mut String, session_val: &str) {
 }
 
 #[inline]
-pub fn build_stream_cookie(buf: &mut String, stream_id: &str) {
-    build_cookie_into(buf, "stream", stream_id)
+pub fn build_stream_cookie(buf: &mut String, stream_id: Uuid) {
+    build_cookie_into(buf, "stream", stream_id.as_hyphenated())
 }
 
 pub fn encode_initial_payload(
@@ -45,7 +47,11 @@ pub fn encode_initial_payload(
         Bytes::new()
     };
 
-    let raw_payload_limit = shaper::MAX_RAW_PAYLOAD;
+    let raw_payload_limit = match (cipher.is_some(), config.encoding_type) {
+        (true, shaper::EncodingType::Json) => shaper::JSON_PAYLOAD_CAP_CIPHER,
+        (false, shaper::EncodingType::Json) => shaper::JSON_PAYLOAD_CAP_PLAIN,
+        _ => shaper::MAX_RAW_PAYLOAD,
+    };
     let mut body = Vec::new();
     let mut offset = 0;
     let mut seq: u64 = 0;

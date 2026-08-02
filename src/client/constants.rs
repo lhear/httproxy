@@ -13,11 +13,17 @@ pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
 pub const BATCH_BUF_INITIAL_CAPACITY: usize = 8192;
 pub const MAX_IN_FLIGHT_BYTES: usize = 2 * 1024 * 1024;
 pub const UPLOAD_CONCURRENCY: usize = 128;
+pub const MIN_IN_FLIGHT_BYTES: usize = 20 * 1024;
+
+pub const MAX_LOCAL_CONNECTIONS: usize = 1024;
 pub const PREFETCH_LEAD_BYTES: u64 = 20 * 1024 * 1024;
 
 pub const PREFETCH_ROTATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const DECODE_BUF_CAPACITY: usize = 16 * 1024 + 2396;
+
+pub const WRITE_BUF_CAPACITY: usize = 64 * 1024;
+pub const WRITE_FLUSH_TIMEOUT: Duration = Duration::from_millis(2);
 
 pub const MASTER_RESUME_WINDOW_SECS: u64 = 1170;
 

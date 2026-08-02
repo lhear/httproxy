@@ -16,7 +16,14 @@ use tokio::{
     time::{Instant, Sleep},
 };
 
+use crate::crypto::{NONCE_LEN, TAG_LEN};
+
 pub const MAX_RAW_PAYLOAD: usize = 16 * 1024;
+
+const READ_HIGH_WATER: usize = 32 * 1024;
+
+pub const JSON_PAYLOAD_CAP_PLAIN: usize = 14320 - HEADER_LEN;
+pub const JSON_PAYLOAD_CAP_CIPHER: usize = 14320 - HEADER_LEN - NONCE_LEN - TAG_LEN;
 
 const TABLE_SIZE: usize = 8192;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
@@ -113,10 +120,42 @@ impl TrafficConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ResolvedStage {
+pub(crate) struct ResolvedStage {
     end_count: usize,
     padding_threshold: usize,
     padding_range: [usize; 2],
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedShaperConfig {
+    pub(crate) stages: Arc<[ResolvedStage]>,
+    pub(crate) global_threshold: usize,
+    pub(crate) global_range: [usize; 2],
+    pub encoding: EncodingType,
+}
+
+impl ResolvedShaperConfig {
+    pub fn resolve(config: &TrafficConfig) -> Self {
+        let mut stages: Vec<ResolvedStage> = config
+            .stages
+            .iter()
+            .map(|s| ResolvedStage {
+                end_count: s
+                    .count
+                    .or_else(|| s.count_range.map(|[_, hi]| hi))
+                    .unwrap_or(0),
+                padding_threshold: s.padding_threshold,
+                padding_range: s.padding_range,
+            })
+            .collect();
+        stages.sort_unstable_by_key(|s| s.end_count);
+        Self {
+            stages: Arc::from(stages),
+            global_threshold: config.global.padding_threshold,
+            global_range: config.global.padding_range,
+            encoding: config.encoding_type,
+        }
+    }
 }
 
 pub trait FrameCipher: Send + Sync {
@@ -134,6 +173,18 @@ pub trait FrameCipher: Send + Sync {
         out.extend_from_slice(&decrypted);
         Ok(())
     }
+
+    fn seal_in_place(
+        &self,
+        out: &mut BytesMut,
+        nonce_start: usize,
+        ct_start: usize,
+    ) -> Result<(), Error> {
+        debug_assert!(ct_start >= nonce_start);
+        let plain = out.split_off(ct_start);
+        out.truncate(nonce_start);
+        self.encrypt_into(&plain, out)
+    }
 }
 
 #[inline]
@@ -144,23 +195,6 @@ fn read_u64_be(data: &[u8]) -> u64 {
 #[inline]
 fn read_u16_be(data: &[u8]) -> u16 {
     u16::from_be_bytes(data[..2].try_into().unwrap())
-}
-
-#[inline]
-fn extract_frame(payload: &[u8]) -> Result<(u64, Bytes), Error> {
-    if payload.len() < HEADER_LEN {
-        return Err(Error::new(ErrorKind::InvalidData, "payload too short"));
-    }
-    let seq = read_u64_be(&payload[..8]);
-    let orig_len = read_u16_be(&payload[8..10]) as usize;
-    let total = HEADER_LEN + orig_len;
-    if payload.len() < total {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "payload shorter than declared original length",
-        ));
-    }
-    Ok((seq, Bytes::copy_from_slice(&payload[HEADER_LEN..total])))
 }
 
 #[inline]
@@ -200,7 +234,7 @@ fn trim_bytes(mut b: &[u8]) -> &[u8] {
 }
 
 #[inline]
-fn parse_json_payload(json: &[u8]) -> Result<Vec<u8>, Error> {
+fn parse_json_payload_into(json: &[u8], out: &mut Vec<u8>) -> Result<usize, Error> {
     let json = trim_bytes(json);
     let err = |msg: &str| Error::new(ErrorKind::InvalidData, msg);
 
@@ -221,7 +255,7 @@ fn parse_json_payload(json: &[u8]) -> Result<Vec<u8>, Error> {
     let enc_str =
         std::str::from_utf8(enc_str_bytes).map_err(|_| err("payload is not valid UTF-8"))?;
 
-    base122_fast::decode(enc_str).map_err(err)
+    base122_fast::decode_into(enc_str, out).map_err(err)
 }
 
 #[inline]
@@ -249,9 +283,20 @@ pub fn encode_frame(
     encoding: EncodingType,
 ) -> std::io::Result<Vec<u8>> {
     let raw_len = data.len();
+    let frame_raw_limit = match (cipher.is_some(), encoding) {
+        (true, EncodingType::Json) => JSON_PAYLOAD_CAP_CIPHER,
+        (false, EncodingType::Json) => JSON_PAYLOAD_CAP_PLAIN,
+        _ => MAX_RAW_PAYLOAD,
+    };
+    if raw_len > frame_raw_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("frame payload too large: {raw_len} > {frame_raw_limit}"),
+        ));
+    }
 
     let padding_len = if raw_len < padding_threshold {
-        let max_pad = MAX_RAW_PAYLOAD - raw_len;
+        let max_pad = frame_raw_limit - raw_len;
         let wanted = rand::rng().random_range(padding_range[0]..=padding_range[1]);
         wanted.min(max_pad)
     } else {
@@ -276,83 +321,97 @@ pub fn encode_frame(
     Ok(frame.to_vec())
 }
 
-macro_rules! decode_skeleton {
-    (
-        $src:expr, $cipher:expr, $encoding:expr,
-        cipher => |$cipher_var:ident| $cipher_expr:expr,
-        binary_plain => |$bin_plain_var:ident| $bin_plain_expr:expr,
-        json_plain => |$json_plain_var:ident| $json_plain_expr:expr $(,)?
-    ) => {
-        match $encoding {
-            EncodingType::Binary => {
-                if $src.len() < 2 {
-                    return Ok(None);
-                }
-                let frame_len = read_u16_be(&$src[..2]) as usize;
+#[derive(Debug)]
+pub enum DecodedFrame {
+    InScratch { seq: u64, start: usize, end: usize },
+    Owned { seq: u64, data: Bytes },
+}
 
-                if frame_len > MAX_BINARY_FRAME_LEN {
-                    return Err(Error::new(
-                        ErrorKind::InvalidData,
-                        "binary frame length exceeds limit",
-                    ));
-                }
-                if $src.len() < 2 + frame_len {
-                    return Ok(None);
-                }
-                $src.advance(2);
-                let $bin_plain_var = $src.split_to(frame_len);
-
-                if let Some(c) = $cipher {
-                    let mut $cipher_var = BytesMut::new();
-                    c.decrypt_into(&$bin_plain_var, &mut $cipher_var)?;
-                    $cipher_expr
-                } else {
-                    $bin_plain_expr
-                }
+pub fn decode_frame(
+    src: &mut BytesMut,
+    scratch: &mut BytesMut,
+    json_scratch: &mut Vec<u8>,
+    cipher: Option<&dyn FrameCipher>,
+    encoding: EncodingType,
+) -> Result<Option<DecodedFrame>, Error> {
+    match encoding {
+        EncodingType::Binary => {
+            if src.len() < 2 {
+                return Ok(None);
             }
+            let frame_len = read_u16_be(&src[..2]) as usize;
 
-            EncodingType::Json => {
-                let newline_pos = memchr::memchr(DELIMITER, $src);
+            if frame_len > MAX_BINARY_FRAME_LEN {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "binary frame length exceeds limit",
+                ));
+            }
+            if src.len() < 2 + frame_len {
+                return Ok(None);
+            }
+            src.advance(2);
+            let view = src.split_to(frame_len);
 
-                match newline_pos {
-                    Some(pos) => {
-                        if pos > MAX_JSON_LINE_LEN {
-                            return Err(Error::new(
-                                ErrorKind::InvalidData,
-                                "JSON line exceeds maximum allowed length",
-                            ));
-                        }
+            if let Some(c) = cipher {
+                scratch.clear();
+                c.decrypt_into(&view, scratch)?;
+                let (seq, start, end) = extract_frame_range(scratch)?;
+                Ok(Some(DecodedFrame::InScratch { seq, start, end }))
+            } else {
+                let (seq, start, end) = extract_frame_range(&view)?;
+                let data = view.freeze().slice(start..end);
+                Ok(Some(DecodedFrame::Owned { seq, data }))
+            }
+        }
 
-                        let line = $src.split_to(pos);
-                        $src.advance(1);
+        EncodingType::Json => {
+            let newline_pos = memchr::memchr(DELIMITER, src);
 
-                        if line.is_empty() {
-                            return Err(Error::new(ErrorKind::InvalidData, "empty frame line"));
-                        }
-
-                        let $json_plain_var = parse_json_payload(&line)?;
-
-                        if let Some(c) = $cipher {
-                            let mut $cipher_var = BytesMut::new();
-                            c.decrypt_into(&$json_plain_var, &mut $cipher_var)?;
-                            $cipher_expr
-                        } else {
-                            $json_plain_expr
-                        }
+            match newline_pos {
+                Some(pos) => {
+                    if pos > MAX_JSON_LINE_LEN {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "JSON line exceeds maximum allowed length",
+                        ));
                     }
-                    None => {
-                        if $src.len() > MAX_JSON_LINE_LEN {
-                            return Err(Error::new(
-                                ErrorKind::InvalidData,
-                                "incomplete JSON line is too long",
-                            ));
-                        }
-                        Ok(None)
+
+                    let line = src.split_to(pos);
+                    src.advance(1);
+
+                    if line.is_empty() {
+                        return Err(Error::new(ErrorKind::InvalidData, "empty frame line"));
                     }
+
+                    parse_json_payload_into(&line, json_scratch)?;
+
+                    if let Some(c) = cipher {
+                        scratch.clear();
+                        c.decrypt_into(json_scratch, scratch)?;
+                        let (seq, start, end) = extract_frame_range(scratch)?;
+                        Ok(Some(DecodedFrame::InScratch { seq, start, end }))
+                    } else {
+                        let data = Bytes::from(std::mem::take(json_scratch));
+                        let (seq, start, end) = extract_frame_range(&data)?;
+                        Ok(Some(DecodedFrame::Owned {
+                            seq,
+                            data: data.slice(start..end),
+                        }))
+                    }
+                }
+                None => {
+                    if src.len() > MAX_JSON_LINE_LEN {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "incomplete JSON line is too long",
+                        ));
+                    }
+                    Ok(None)
                 }
             }
         }
-    };
+    }
 }
 
 pub fn decode_from_buffer(
@@ -360,36 +419,24 @@ pub fn decode_from_buffer(
     cipher: Option<&dyn FrameCipher>,
     encoding: EncodingType,
 ) -> Result<Option<(u64, Bytes)>, Error> {
-    decode_skeleton!(
-        src, cipher, encoding,
-        cipher => |decrypted| Ok(Some(extract_frame(&decrypted)?)),
-        binary_plain => |frame_data| Ok(Some(extract_frame(&frame_data)?)),
-        json_plain => |encoded_payload| Ok(Some(extract_frame(&encoded_payload)?)),
-    )
+    let mut scratch = BytesMut::new();
+    let mut json_scratch = Vec::new();
+    match decode_frame(src, &mut scratch, &mut json_scratch, cipher, encoding)? {
+        Some(DecodedFrame::InScratch { seq, start, end }) => {
+            let plain = scratch.split().freeze();
+            Ok(Some((seq, plain.slice(start..end))))
+        }
+        Some(DecodedFrame::Owned { seq, data }) => Ok(Some((seq, data))),
+        None => Ok(None),
+    }
 }
 
-pub fn decode_frame_owned(
-    src: &mut BytesMut,
-    cipher: Option<&dyn FrameCipher>,
-    encoding: EncodingType,
-) -> Result<Option<(u64, BytesMut, usize, usize)>, Error> {
-    decode_skeleton!(
-        src, cipher, encoding,
-        cipher => |decrypted| {
-            let (seq, start, end) = extract_frame_range(&decrypted)?;
-            Ok(Some((seq, decrypted, start, end)))
-        },
-        binary_plain => |frame_data| {
-            let (seq, start, end) = extract_frame_range(&frame_data)?;
-            Ok(Some((seq, frame_data, start, end)))
-        },
-        json_plain => |encoded_payload| {
-            let mut frame_data = BytesMut::with_capacity(encoded_payload.len());
-            frame_data.extend_from_slice(&encoded_payload);
-            let (seq, start, end) = extract_frame_range(&frame_data)?;
-            Ok(Some((seq, frame_data, start, end)))
-        },
-    )
+pub trait SealInto {
+    fn poll_seal_into(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut BytesMut,
+    ) -> Poll<std::io::Result<Option<u64>>>;
 }
 
 pin_project! {
@@ -401,12 +448,13 @@ pin_project! {
         raw_buf: BytesMut,
         out_buf: BytesMut,
         enc_buf: BytesMut,
+        json_buf: Vec<u8>,
 
         #[pin]
         flush_timer: Sleep,
         timer_armed: bool,
         cursor: usize,
-        stages: Vec<ResolvedStage>,
+        stages: Arc<[ResolvedStage]>,
         global_threshold: usize,
         global_range: [usize; 2],
         packet_count: usize,
@@ -414,6 +462,7 @@ pin_project! {
         rng: SmallRng,
         cipher: Option<Arc<dyn FrameCipher>>,
         encoding: EncodingType,
+        seal_threshold: usize,
         seq: u64,
     }
 }
@@ -421,63 +470,52 @@ pin_project! {
 impl<R> TrafficShaper<R> {
     pub fn with_seq(
         reader: R,
-        config: TrafficConfig,
+        config: &ResolvedShaperConfig,
         cipher: Option<Arc<dyn FrameCipher>>,
         start_seq: u64,
     ) -> Self {
         let mut base_rng = rand::rng();
         let cursor = (base_rng.next_u64() as usize) & TABLE_MASK;
 
-        let mut stages: Vec<ResolvedStage> = config
-            .stages
-            .iter()
-            .map(|s| ResolvedStage {
-                end_count: s
-                    .count
-                    .or_else(|| s.count_range.map(|[_, hi]| hi))
-                    .unwrap_or(0),
-                padding_threshold: s.padding_threshold,
-                padding_range: s.padding_range,
-            })
-            .collect();
-        stages.sort_unstable_by_key(|s| s.end_count);
-
-        let out_capacity = match config.encoding_type {
+        let out_capacity = match config.encoding {
             EncodingType::Binary => MAX_BINARY_FRAME_LEN + 2,
             EncodingType::Json => MAX_JSON_LINE_LEN + 1,
         };
 
+        let seal_threshold = match (cipher.is_some(), config.encoding) {
+            (true, EncodingType::Binary) => {
+                MAX_RAW_PAYLOAD - (NONCE_LEN + TAG_LEN + HEADER_LEN + 2)
+            }
+            (false, EncodingType::Binary) => MAX_RAW_PAYLOAD - (HEADER_LEN + 2),
+            (true, EncodingType::Json) => JSON_PAYLOAD_CAP_CIPHER,
+            (false, EncodingType::Json) => JSON_PAYLOAD_CAP_PLAIN,
+        };
+
         Self {
             reader,
-            raw_buf: BytesMut::with_capacity(MAX_RAW_PAYLOAD),
+            raw_buf: BytesMut::with_capacity(READ_HIGH_WATER),
             out_buf: BytesMut::with_capacity(out_capacity),
             enc_buf: BytesMut::new(),
+            json_buf: Vec::new(),
             flush_timer: tokio::time::sleep_until(Instant::now()),
             timer_armed: false,
-            stages,
-            global_threshold: config.global.padding_threshold,
-            global_range: config.global.padding_range,
+            stages: Arc::clone(&config.stages),
+            global_threshold: config.global_threshold,
+            global_range: config.global_range,
             packet_count: 0,
             cursor,
             stage_idx: 0,
             rng: SmallRng::from_rng(&mut base_rng),
             cipher,
-            encoding: config.encoding_type,
+            encoding: config.encoding,
+            seal_threshold,
             seq: start_seq,
         }
     }
 
     #[inline]
-    fn seal_and_emit(this: &mut Proj<'_, R>) -> Result<(u64, Bytes), Error> {
-        let raw_len = this.raw_buf.len();
-        debug_assert!(raw_len > 0);
-        debug_assert!(raw_len <= MAX_RAW_PAYLOAD);
-
-        *this.timer_armed = false;
-
+    fn resolve_padding(this: &mut Proj<'_, R>, raw_len: usize) -> (usize, usize) {
         *this.packet_count += 1;
-        let seq = *this.seq;
-        *this.seq = seq + 1;
 
         let stages = &this.stages;
         let pc = *this.packet_count;
@@ -494,7 +532,7 @@ impl<R> TrafficShaper<R> {
         };
 
         let padding_len = if raw_len < threshold {
-            let max_pad = MAX_RAW_PAYLOAD - raw_len;
+            let max_pad = *this.seal_threshold - raw_len;
             let wanted = this.rng.random_range(range[0]..=range[1]);
             wanted.min(max_pad)
         } else {
@@ -502,66 +540,91 @@ impl<R> TrafficShaper<R> {
         };
 
         let payload_len = HEADER_LEN + raw_len + padding_len;
+        (payload_len, padding_len)
+    }
 
-        if let Some(cipher) = this.cipher {
-            this.out_buf.clear();
-            this.out_buf.reserve(payload_len);
-            this.out_buf.put_u64(seq);
-            this.out_buf.put_u16(raw_len as u16);
-            this.out_buf.put_slice(&this.raw_buf[..raw_len]);
-            if padding_len > 0 {
-                this.out_buf.put_bytes(0u8, padding_len);
+    #[inline]
+    fn seal_into(this: &mut Proj<'_, R>, out: &mut BytesMut) -> Result<u64, Error> {
+        let raw_len = this.raw_buf.len().min(*this.seal_threshold);
+        debug_assert!(raw_len > 0);
+        debug_assert!(raw_len <= MAX_RAW_PAYLOAD);
+
+        *this.timer_armed = false;
+
+        let seq = *this.seq;
+        *this.seq = seq + 1;
+
+        let (payload_len, padding_len) = Self::resolve_padding(this, raw_len);
+
+        match (this.cipher.as_deref(), *this.encoding) {
+            (Some(cipher), EncodingType::Binary) => {
+                let enc_len = NONCE_LEN + payload_len + TAG_LEN;
+                out.reserve(2 + enc_len);
+                out.put_u16(enc_len as u16);
+                let nonce_start = out.len();
+                out.put_bytes(0u8, NONCE_LEN);
+                let ct_start = out.len();
+                out.put_u64(seq);
+                out.put_u16(raw_len as u16);
+                out.put_slice(&this.raw_buf[..raw_len]);
+                if padding_len > 0 {
+                    out.put_bytes(0u8, padding_len);
+                }
+                cipher.seal_in_place(out, nonce_start, ct_start)?;
             }
-
-            this.enc_buf.clear();
-            cipher.encrypt_into(&this.out_buf[..payload_len], this.enc_buf)?;
-            this.out_buf.clear();
-            write_encoded_frame(this.out_buf, this.enc_buf, *this.encoding);
-        } else {
-            this.out_buf.clear();
-
-            match *this.encoding {
-                EncodingType::Binary => {
-                    this.out_buf.reserve(2 + payload_len);
-                    this.out_buf.put_u16(payload_len as u16);
-                    this.out_buf.put_u64(seq);
-                    this.out_buf.put_u16(raw_len as u16);
-                    this.out_buf.put_slice(&this.raw_buf[..raw_len]);
-                    if padding_len > 0 {
-                        this.out_buf.put_bytes(0u8, padding_len);
-                    }
+            (None, EncodingType::Binary) => {
+                out.reserve(2 + payload_len);
+                out.put_u16(payload_len as u16);
+                out.put_u64(seq);
+                out.put_u16(raw_len as u16);
+                out.put_slice(&this.raw_buf[..raw_len]);
+                if padding_len > 0 {
+                    out.put_bytes(0u8, padding_len);
                 }
-                EncodingType::Json => {
-                    this.out_buf.put_u64(seq);
-                    this.out_buf.put_u16(raw_len as u16);
-                    this.out_buf.put_slice(&this.raw_buf[..raw_len]);
-                    if padding_len > 0 {
-                        this.out_buf.put_bytes(0u8, padding_len);
-                    }
-                    let payload = this.out_buf.split();
-                    write_encoded_frame(this.out_buf, &payload[..payload_len], EncodingType::Json);
+            }
+            (_, EncodingType::Json) => {
+                this.out_buf.clear();
+                this.out_buf.reserve(payload_len);
+                this.out_buf.put_u64(seq);
+                this.out_buf.put_u16(raw_len as u16);
+                this.out_buf.put_slice(&this.raw_buf[..raw_len]);
+                if padding_len > 0 {
+                    this.out_buf.put_bytes(0u8, padding_len);
                 }
+                let payload = this.out_buf.split();
+                if let Some(cipher) = this.cipher.as_deref() {
+                    this.enc_buf.clear();
+                    cipher.encrypt_into(&payload[..payload_len], this.enc_buf)?;
+                    base122_fast::encode_into(this.enc_buf, this.json_buf);
+                } else {
+                    base122_fast::encode_into(&payload[..payload_len], this.json_buf);
+                }
+                out.reserve(9 + this.json_buf.len() + 3);
+                out.put_slice(b"{\"data\":\"");
+                out.put_slice(this.json_buf);
+                out.put_slice(b"\"}\n");
             }
         }
 
-        this.raw_buf.clear();
-        let result = this.out_buf.split().freeze();
-        Ok((seq, result))
+        this.raw_buf.advance(raw_len);
+        Ok(seq)
     }
 }
 
-impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
-    type Item = Result<(u64, Bytes), Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl<R: AsyncRead> TrafficShaper<R> {
+    fn poll_fill_and_seal(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut BytesMut,
+    ) -> Poll<std::io::Result<Option<u64>>> {
         let mut this = self.project();
 
         loop {
-            if this.raw_buf.len() >= MAX_RAW_PAYLOAD {
-                return Poll::Ready(Some(Self::seal_and_emit(&mut this)));
+            if this.raw_buf.len() >= *this.seal_threshold {
+                return Poll::Ready(Self::seal_into(&mut this, out).map(Some));
             }
 
-            let remaining = MAX_RAW_PAYLOAD - this.raw_buf.len();
+            let remaining = READ_HIGH_WATER - this.raw_buf.len();
             this.raw_buf.reserve(remaining);
             let spare = this.raw_buf.spare_capacity_mut();
             let read_limit = spare.len().min(remaining);
@@ -572,9 +635,9 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
                     let n = rb.filled().len();
                     if n == 0 {
                         return if this.raw_buf.is_empty() {
-                            Poll::Ready(None)
+                            Poll::Ready(Ok(None))
                         } else {
-                            Poll::Ready(Some(Self::seal_and_emit(&mut this)))
+                            Poll::Ready(Self::seal_into(&mut this, out).map(Some))
                         };
                     }
 
@@ -586,6 +649,9 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
                     let raw_len = this.raw_buf.len();
                     if raw_len == 0 {
                         return Poll::Pending;
+                    }
+                    if raw_len >= *this.seal_threshold {
+                        return Poll::Ready(Self::seal_into(&mut this, out).map(Some));
                     }
 
                     if !*this.timer_armed {
@@ -599,12 +665,36 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
                     }
 
                     if this.flush_timer.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(Some(Self::seal_and_emit(&mut this)));
+                        return Poll::Ready(Self::seal_into(&mut this, out).map(Some));
                     }
                     return Poll::Pending;
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
+        }
+    }
+}
+
+impl<R: AsyncRead> SealInto for TrafficShaper<R> {
+    fn poll_seal_into(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut BytesMut,
+    ) -> Poll<std::io::Result<Option<u64>>> {
+        self.poll_fill_and_seal(cx, out)
+    }
+}
+
+impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
+    type Item = Result<(u64, Bytes), Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut frame = BytesMut::new();
+        match self.poll_fill_and_seal(cx, &mut frame) {
+            Poll::Ready(Ok(Some(seq))) => Poll::Ready(Some(Ok((seq, frame.freeze())))),
+            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -612,6 +702,7 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn test_config() -> TrafficConfig {
         TrafficConfig {
@@ -652,7 +743,16 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u16(100u16);
         buf.put_u8(0xAA);
-        let result = decode_from_buffer(&mut buf, None, EncodingType::Binary).unwrap();
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let result = decode_frame(
+            &mut buf,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Binary,
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -661,7 +761,15 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u16((MAX_RAW_PAYLOAD + 1000) as u16);
         buf.resize(2 + MAX_RAW_PAYLOAD + 1000, 0u8);
-        let result = decode_from_buffer(&mut buf, None, EncodingType::Binary);
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let result = decode_frame(
+            &mut buf,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Binary,
+        );
         assert!(result.is_err());
     }
 
@@ -673,27 +781,29 @@ mod tests {
             .chain(3u16.to_be_bytes())
             .chain(b"abc".iter().copied())
             .collect::<Vec<_>>();
-        let (seq, data) = extract_frame(&payload).unwrap();
+        let (seq, start, end) = extract_frame_range(&payload).unwrap();
         assert_eq!(seq, 0);
-        assert_eq!(&data[..], b"abc");
+        assert_eq!(&payload[start..end], b"abc");
     }
 
     #[test]
     fn extract_frame_too_short() {
-        assert!(extract_frame(b"short").is_err());
+        assert!(extract_frame_range(b"short").is_err());
     }
 
     #[test]
     fn parse_json_payload_valid() {
         let enc = base122_fast::encode(b"hello");
         let json = format!("{{\"data\":\"{enc}\"}}");
-        let result = parse_json_payload(json.as_bytes()).unwrap();
-        assert_eq!(result, b"hello");
+        let mut out = Vec::new();
+        let n = parse_json_payload_into(json.as_bytes(), &mut out).unwrap();
+        assert_eq!(&out[..n], b"hello");
     }
 
     #[test]
     fn parse_json_payload_missing_field() {
-        let result = parse_json_payload(b"{\"other\":\"x\"}");
+        let mut out = Vec::new();
+        let result = parse_json_payload_into(b"{\"other\":\"x\"}", &mut out);
         assert!(result.is_err());
     }
 
@@ -705,5 +815,420 @@ mod tests {
 
         let mean = table1.iter().map(|&v| v as f64).sum::<f64>() / table1.len() as f64;
         assert!((mean - AVG_LATENCY_MICROS).abs() < AVG_LATENCY_MICROS * 0.5);
+    }
+
+    #[test]
+    fn decode_frame_plain_owned_zero_copy() {
+        let data = b"plain payload";
+        let frame = encode_frame(data, 9, None, 16384, [0, 0], EncodingType::Binary).unwrap();
+        let mut src = BytesMut::from(&frame[..]);
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        match decode_frame(
+            &mut src,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .unwrap()
+        {
+            DecodedFrame::Owned { seq, data } => {
+                assert_eq!(seq, 9);
+                assert_eq!(&data[..], b"plain payload");
+            }
+            _ => panic!("expected Owned frame"),
+        }
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn decode_frame_cipher_into_scratch() {
+        use crate::crypto::AesFrameCipher;
+        use zeroize::Zeroizing;
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut *key);
+        let cipher = AesFrameCipher::new(&key);
+
+        let frame = encode_frame(
+            b"secret payload",
+            42,
+            Some(&cipher),
+            16384,
+            [0, 0],
+            EncodingType::Binary,
+        )
+        .unwrap();
+        let mut src = BytesMut::from(&frame[..]);
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        match decode_frame(
+            &mut src,
+            &mut scratch,
+            &mut json_scratch,
+            Some(&cipher),
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .unwrap()
+        {
+            DecodedFrame::InScratch { seq, start, end } => {
+                assert_eq!(seq, 42);
+                assert_eq!(&scratch[start..end], b"secret payload");
+            }
+            _ => panic!("expected InScratch frame"),
+        }
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn decode_frame_scratch_reused_across_frames() {
+        use crate::crypto::AesFrameCipher;
+        use zeroize::Zeroizing;
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut *key);
+        let cipher = AesFrameCipher::new(&key);
+
+        let mut combined = BytesMut::new();
+        for (i, msg) in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let frame = encode_frame(
+                msg,
+                i as u64,
+                Some(&cipher),
+                16384,
+                [0, 0],
+                EncodingType::Binary,
+            )
+            .unwrap();
+            combined.extend_from_slice(&frame);
+        }
+
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut expected_seq = 0u64;
+        while !combined.is_empty() {
+            match decode_frame(
+                &mut combined,
+                &mut scratch,
+                &mut json_scratch,
+                Some(&cipher),
+                EncodingType::Binary,
+            )
+            .unwrap()
+            .unwrap()
+            {
+                DecodedFrame::InScratch { seq, start, end } => {
+                    assert_eq!(seq, expected_seq);
+                    assert_eq!(
+                        &scratch[start..end],
+                        [
+                            b"first".as_slice(),
+                            b"second".as_slice(),
+                            b"third".as_slice()
+                        ][expected_seq as usize]
+                    );
+                    expected_seq += 1;
+                }
+                _ => panic!("expected InScratch frame"),
+            }
+        }
+        assert_eq!(expected_seq, 3);
+    }
+
+    #[test]
+    fn decode_frame_json_roundtrip() {
+        let frame =
+            encode_frame(b"json payload", 3, None, 16384, [0, 0], EncodingType::Json).unwrap();
+        let mut src = BytesMut::from(&frame[..]);
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        match decode_frame(
+            &mut src,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Json,
+        )
+        .unwrap()
+        .unwrap()
+        {
+            DecodedFrame::Owned { seq, data } => {
+                assert_eq!(seq, 3);
+                assert_eq!(&data[..], b"json payload");
+            }
+            _ => panic!("expected Owned frame"),
+        }
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn decode_frame_json_cipher_roundtrip() {
+        use crate::crypto::AesFrameCipher;
+        use zeroize::Zeroizing;
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut *key);
+        let cipher = AesFrameCipher::new(&key);
+
+        let frame = encode_frame(
+            b"json cipher payload",
+            5,
+            Some(&cipher),
+            16384,
+            [0, 0],
+            EncodingType::Json,
+        )
+        .unwrap();
+        let mut src = BytesMut::from(&frame[..]);
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        match decode_frame(
+            &mut src,
+            &mut scratch,
+            &mut json_scratch,
+            Some(&cipher),
+            EncodingType::Json,
+        )
+        .unwrap()
+        .unwrap()
+        {
+            DecodedFrame::InScratch { seq, start, end } => {
+                assert_eq!(seq, 5);
+                assert_eq!(&scratch[start..end], b"json cipher payload");
+            }
+            _ => panic!("expected InScratch frame"),
+        }
+        assert!(src.is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_frames_fit_single_h2_data_frame() {
+        use crate::crypto::AesFrameCipher;
+        use zeroize::Zeroizing;
+
+        let no_cipher: Option<Arc<dyn FrameCipher>> = None;
+        let aes_cipher: Option<Arc<dyn FrameCipher>> =
+            Some(Arc::new(AesFrameCipher::new(&Zeroizing::new([0u8; 32]))));
+        for cipher in [no_cipher, aes_cipher] {
+            let cipher_for_decode = cipher.clone();
+            let mut config = test_config();
+            config.encoding_type = EncodingType::Json;
+            let resolved = ResolvedShaperConfig::resolve(&config);
+            let data = vec![0xAAu8; 64 * 1024];
+            let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &resolved, cipher, 0);
+            let mut out = BytesMut::new();
+            seal_all(shaper, &mut out);
+
+            let mut frames = 0;
+            let mut src = &out[..];
+            while !src.is_empty() {
+                let newline = memchr::memchr(b'\n', src).expect("frame must end with newline");
+                let line_len = newline + 1;
+                assert!(line_len <= 16384, "JSON frame {line_len} B > 16384");
+                src = &src[line_len..];
+                frames += 1;
+            }
+            assert!(frames >= 4, "expected multiple frames, got {frames}");
+
+            let mut scratch = BytesMut::new();
+            let mut json_scratch = Vec::new();
+            let mut decoded = Vec::new();
+            let mut buf = out;
+            while !buf.is_empty() {
+                match decode_frame(
+                    &mut buf,
+                    &mut scratch,
+                    &mut json_scratch,
+                    cipher_for_decode.as_deref(),
+                    EncodingType::Json,
+                )
+                .unwrap()
+                .unwrap()
+                {
+                    DecodedFrame::InScratch { start, end, .. } => {
+                        decoded.extend_from_slice(&scratch[start..end]);
+                    }
+                    DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
+                }
+            }
+            assert_eq!(decoded, data);
+        }
+    }
+
+    fn seal_all(shaper: TrafficShaper<Cursor<Vec<u8>>>, out: &mut BytesMut) -> Vec<u64> {
+        let mut shaper = std::pin::pin!(shaper);
+        let mut seqs = Vec::new();
+        loop {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            match shaper.as_mut().poll_seal_into(&mut cx, out) {
+                Poll::Ready(Ok(Some(seq))) => seqs.push(seq),
+                Poll::Ready(Ok(None)) => break,
+                Poll::Ready(Err(e)) => panic!("seal error: {e}"),
+                Poll::Pending => panic!("unexpected Pending with Cursor reader"),
+            }
+        }
+        seqs
+    }
+
+    #[tokio::test]
+    async fn poll_seal_into_produces_valid_frames() {
+        let config = ResolvedShaperConfig::resolve(&test_config());
+        let data = vec![0xABu8; 40_000];
+        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, None, 0);
+        let mut out = BytesMut::new();
+        let seqs = seal_all(shaper, &mut out);
+
+        assert_eq!(seqs, vec![0, 1, 2]);
+
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut decoded = Vec::new();
+        let mut frame_idx = 0usize;
+        while !out.is_empty() {
+            match decode_frame(
+                &mut out,
+                &mut scratch,
+                &mut json_scratch,
+                None,
+                EncodingType::Binary,
+            )
+            .unwrap()
+            .unwrap()
+            {
+                DecodedFrame::Owned { seq, data } => {
+                    assert_eq!(seq, seqs[frame_idx]);
+                    frame_idx += 1;
+                    decoded.extend_from_slice(&data);
+                }
+                _ => panic!("expected Owned frame"),
+            }
+        }
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn poll_seal_into_cipher_matches_stream_output() {
+        use crate::crypto::AesFrameCipher;
+        use futures::StreamExt;
+        use zeroize::Zeroizing;
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut *key);
+        let cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&key));
+
+        let config = ResolvedShaperConfig::resolve(&test_config());
+        let data = vec![0x5Cu8; 33_000];
+
+        let cipher_for_decode = Arc::clone(&cipher);
+        let decode_append = |src: &mut BytesMut, out: &mut Vec<u8>| {
+            let mut scratch = BytesMut::new();
+            let mut json_scratch = Vec::new();
+            match decode_frame(
+                src,
+                &mut scratch,
+                &mut json_scratch,
+                Some(cipher_for_decode.as_ref()),
+                EncodingType::Binary,
+            )
+            .unwrap()
+            .unwrap()
+            {
+                DecodedFrame::InScratch { start, end, .. } => {
+                    out.extend_from_slice(&scratch[start..end]);
+                }
+                _ => panic!("expected InScratch frame"),
+            }
+        };
+
+        let shaper_stream = TrafficShaper::with_seq(
+            Cursor::new(data.clone()),
+            &config,
+            Some(Arc::clone(&cipher)),
+            0,
+        );
+        let mut stream_payload = Vec::new();
+        let mut stream_seqs = Vec::new();
+        let mut shaper_stream = Box::pin(shaper_stream);
+        while let Some(item) = shaper_stream.next().await {
+            let (seq, bytes) = item.unwrap();
+            stream_seqs.push(seq);
+            let mut frame_buf = BytesMut::from(&bytes[..]);
+            decode_append(&mut frame_buf, &mut stream_payload);
+        }
+
+        let shaper_seal =
+            TrafficShaper::with_seq(Cursor::new(data.clone()), &config, Some(cipher), 0);
+        let mut out = BytesMut::new();
+        let seqs = seal_all(shaper_seal, &mut out);
+        let mut seal_payload = Vec::new();
+        while !out.is_empty() {
+            decode_append(&mut out, &mut seal_payload);
+        }
+
+        assert_eq!(seqs, stream_seqs);
+        assert_eq!(seal_payload, stream_payload);
+        assert_eq!(seal_payload, data);
+    }
+
+    #[tokio::test]
+    async fn seal_in_place_default_impl_produces_valid_frames() {
+        use zeroize::Zeroizing;
+
+        struct VecCipher(Zeroizing<[u8; 32]>);
+        impl FrameCipher for VecCipher {
+            fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
+                crate::crypto::encrypt_bytes(&self.0, data).map_err(Error::other)
+            }
+            fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
+                crate::crypto::decrypt_bytes(&self.0, data).map_err(Error::other)
+            }
+        }
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut *key);
+        let cipher: Arc<dyn FrameCipher> = Arc::new(VecCipher(key));
+        let cipher_for_decode = Arc::clone(&cipher);
+
+        let config = ResolvedShaperConfig::resolve(&test_config());
+        let data = vec![0x3Du8; 20_000];
+        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, Some(cipher), 0);
+        let mut out = BytesMut::new();
+        let seqs = seal_all(shaper, &mut out);
+
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut decoded = Vec::new();
+        let mut frame_idx = 0usize;
+        while !out.is_empty() {
+            match decode_frame(
+                &mut out,
+                &mut scratch,
+                &mut json_scratch,
+                Some(cipher_for_decode.as_ref()),
+                EncodingType::Binary,
+            )
+            .unwrap()
+            .unwrap()
+            {
+                DecodedFrame::InScratch { seq, start, end } => {
+                    assert_eq!(seq, seqs[frame_idx]);
+                    frame_idx += 1;
+                    decoded.extend_from_slice(&scratch[start..end]);
+                }
+                _ => panic!("expected InScratch frame"),
+            }
+        }
+        assert_eq!(decoded, data);
     }
 }

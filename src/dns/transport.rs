@@ -151,13 +151,16 @@ impl DotTransport {
                             }
                         }
 
-                        let w = writer.as_mut().unwrap();
-                        let len_prefix = (data.len() as u16).to_be_bytes();
-                        if w.write_all(&len_prefix).await.is_err()
-                            || w.write_all(&data).await.is_err()
-                            || w.flush().await.is_err()
-                        {
-                            warn!("DoT write failed, dropping connection");
+                        let write_result = timeout(Duration::from_secs(10), async {
+                            let w = writer.as_mut().unwrap();
+                            let len_prefix = (data.len() as u16).to_be_bytes();
+                            w.write_all(&len_prefix).await?;
+                            w.write_all(&data).await?;
+                            w.flush().await
+                        })
+                        .await;
+                        if !matches!(write_result, Ok(Ok(()))) {
+                            warn!("DoT write failed or timed out, dropping connection");
 
                             for (_, tx) in actor_pending.lock().await.drain() {
                                 let _ = tx.send(Err(anyhow!("write failed, connection reset")));
@@ -191,13 +194,18 @@ impl DotTransport {
 
     async fn reader_loop(mut r: tokio::io::ReadHalf<TlsStream<TcpStream>>, pending: PendingMap) {
         let mut len_buf = [0u8; 2];
-        while r.read_exact(&mut len_buf).await.is_ok() {
+        loop {
+            let len_res = timeout(Duration::from_secs(30), r.read_exact(&mut len_buf)).await;
+            if !matches!(len_res, Ok(Ok(_))) {
+                break;
+            }
             let msg_len = u16::from_be_bytes(len_buf) as usize;
             if msg_len == 0 {
                 continue;
             }
             let mut buf = vec![0u8; msg_len];
-            if r.read_exact(&mut buf).await.is_err() {
+            let read_res = timeout(Duration::from_secs(30), r.read_exact(&mut buf)).await;
+            if !matches!(read_res, Ok(Ok(_))) {
                 break;
             }
             if buf.len() >= 2 {
@@ -216,7 +224,7 @@ impl DotTransport {
     ) -> Result<TlsStream<TcpStream>> {
         let stream = timeout(Duration::from_secs(5), TcpStream::connect(upstream)).await??;
         stream.set_nodelay(true)?;
-        Ok(connector.connect(name, stream).await?)
+        Ok(timeout(Duration::from_secs(5), connector.connect(name, stream)).await??)
     }
 
     pub(super) async fn send(&self, data: &mut [u8]) -> Result<(Vec<u8>, u16)> {

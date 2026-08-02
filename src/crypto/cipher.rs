@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 
 use crate::shaper::FrameCipher;
 
-const NONCE_LEN: usize = 12;
-const TAG_LEN: usize = 16;
+pub const NONCE_LEN: usize = 12;
+pub const TAG_LEN: usize = 16;
 const EMPTY_AAD: &[u8] = b"";
 
 #[inline]
@@ -141,6 +141,27 @@ impl FrameCipher for AesFrameCipher {
                 Tag::from_slice(&data[ct_end..]),
             )
             .map_err(|e| io::Error::other(anyhow!("decryption error: {e}")))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn seal_in_place(
+        &self,
+        out: &mut bytes::BytesMut,
+        nonce_start: usize,
+        ct_start: usize,
+    ) -> io::Result<()> {
+        let nonce_bytes = random_nonce();
+        out[nonce_start..ct_start].copy_from_slice(&nonce_bytes);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                EMPTY_AAD,
+                &mut out[ct_start..],
+            )
+            .map_err(|e| io::Error::other(anyhow!("encryption error: {e}")))?;
+        out.extend_from_slice(tag.as_ref());
         Ok(())
     }
 }

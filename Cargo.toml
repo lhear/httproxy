@@ -22,7 +22,7 @@ strip = true
 aes-gcm = "0.10.3"
 anyhow = "1.0"
 axum = {version = "0.8.9", features = ["http2", "macros"]}
-base122-fast = "0.1.3"
+base122-fast = "0.1.4"
 base64 = "0.22.1"
 bytes = "1.11"
 clap = {version = "4.6.1", features = ["derive"]}

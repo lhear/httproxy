@@ -6,7 +6,7 @@ use jsonwebtoken::{DecodingKey, Validation};
 use std::io;
 use std::sync::Arc;
 use tracing::{Instrument, info, warn};
-use uuid;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::crypto::{self, AesFrameCipher};
@@ -28,18 +28,18 @@ use crate::server::stream_registry::StreamRegistry;
 
 struct StreamGuard {
     registry: Arc<StreamRegistry>,
-    stream_id: String,
+    stream_id: Uuid,
     armed: bool,
 }
 impl Drop for StreamGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.registry.mark_consumed(&self.stream_id);
+            self.registry.mark_consumed(self.stream_id);
         }
     }
 }
 impl StreamGuard {
-    fn new(registry: Arc<StreamRegistry>, stream_id: String) -> Self {
+    fn new(registry: Arc<StreamRegistry>, stream_id: Uuid) -> Self {
         Self {
             registry,
             stream_id,
@@ -52,8 +52,8 @@ impl StreamGuard {
 }
 
 struct ActorGuard {
-    actors: Arc<dashmap::DashMap<String, SessionHandle>>,
-    key: String,
+    actors: Arc<dashmap::DashMap<Uuid, SessionHandle>>,
+    key: Uuid,
     armed: bool,
 }
 impl Drop for ActorGuard {
@@ -64,7 +64,7 @@ impl Drop for ActorGuard {
     }
 }
 impl ActorGuard {
-    fn new(actors: Arc<dashmap::DashMap<String, SessionHandle>>, key: String) -> Self {
+    fn new(actors: Arc<dashmap::DashMap<Uuid, SessionHandle>>, key: Uuid) -> Self {
         Self {
             actors,
             key,
@@ -100,14 +100,29 @@ async fn setup_tunnel_response(
     body: Body,
     host: &str,
     port: u16,
-    stream_id: &str,
+    stream_id: Uuid,
     upload_cipher: Option<Arc<dyn FrameCipher>>,
     download_cipher: Option<Arc<dyn FrameCipher>>,
 ) -> Result<Response, ServerError> {
+    let tunnel_permit = state
+        .tunnel_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ServerError::service_unavailable("too many concurrent tunnels"))?;
+
     let encoding = state.traffic_config.encoding_type;
 
-    let (download_tx, download_rx) =
-        tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(DOWNLOAD_CHANNEL_CAPACITY);
+    let max_download_bytes = state.traffic_config.max_download_bytes;
+    let direct = max_download_bytes.is_none();
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(crate::now_secs()));
+
+    let (download_tx, download_rx) = if direct {
+        (None, None)
+    } else {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(DOWNLOAD_CHANNEL_CAPACITY);
+        (Some(tx), Some(rx))
+    };
     let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
 
     let upstream = tokio::time::timeout(
@@ -155,31 +170,53 @@ async fn setup_tunnel_response(
     let mut actor = crate::server::actor::tunnel::TunnelActor::new(
         actor_rx,
         download_tx,
-        stream_id.to_owned(),
+        stream_id,
         Arc::clone(&state.stream_registry),
-        state.traffic_config.max_download_bytes,
+        max_download_bytes,
+        Arc::clone(&last_activity),
     );
     actor.set_upload_channel(upload_tx_for_actor, upload_handle);
-    actor.on_upstream_connected(
-        upstream_read,
-        None,
-        (*state.traffic_config).clone(),
-        download_cipher,
-        0,
-    );
+
+    let body_stream = if direct {
+        let shaper = crate::shaper::TrafficShaper::with_seq(
+            upstream_read,
+            &state.resolved_traffic,
+            download_cipher,
+            0,
+        );
+        let activity = Arc::clone(&last_activity);
+        Body::from_stream(shaper.map(move |r| {
+            if r.is_ok() {
+                activity.store(crate::now_secs(), std::sync::atomic::Ordering::Relaxed);
+            }
+            r.map(|(_seq, data)| data)
+        }))
+    } else {
+        actor.on_upstream_connected(
+            upstream_read,
+            None,
+            &state.resolved_traffic,
+            download_cipher,
+            0,
+        );
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
+            download_rx.expect("download channel must exist when rotation is enabled"),
+        ))
+    };
 
     let handle = SessionHandle {
         cmd_tx: actor_tx.clone(),
         upload_cipher,
         encoding,
     };
-    state.actors.insert(stream_id.to_owned(), handle);
-    let mut early_guard = ActorGuard::new(Arc::clone(&state.actors), stream_id.to_owned());
+    state.actors.insert(stream_id, handle);
+    let mut early_guard = ActorGuard::new(Arc::clone(&state.actors), stream_id);
 
-    let key = stream_id.to_owned();
+    let key = stream_id;
     let actors_ref2 = Arc::clone(&state.actors);
     let actor_handle = tokio::spawn(
         async move {
+            let _permit = tunnel_permit;
             let _guard = ActorGuard::new(actors_ref2, key);
             actor.run().await;
         }
@@ -194,9 +231,7 @@ async fn setup_tunnel_response(
     let response = Response::builder()
         .header("Cache-Control", "no-store")
         .header("Set-Cookie", padding)
-        .body(Body::from_stream(
-            tokio_stream::wrappers::ReceiverStream::new(download_rx),
-        ))
+        .body(body_stream)
         .map_err(|e| ServerError::internal(e.to_string()))?;
 
     tunnel_guard.disarm();
@@ -227,14 +262,14 @@ async fn spawn_encrypted_tunnel(
     let mut master = Zeroizing::new([0u8; 32]);
     let (username, master_z, created) = value_ref;
     master.copy_from_slice(&**master_z);
-    let username = username.clone();
+    let username = Arc::clone(username);
     let created = *created;
     if crate::now_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
         drop(entry);
         state.master_store.remove(session_id);
         return Err(ServerError::precondition_required("master key expired"));
     }
-    span.record("user", &username);
+    span.record("user", username.as_ref());
     drop(entry);
 
     let cookie_stream_key = crypto::derive_cookie_stream_key(&master);
@@ -246,23 +281,17 @@ async fn spawn_encrypted_tunnel(
     let stream_id_bytes_arr: [u8; 16] = stream_id_bytes
         .try_into()
         .map_err(|_| ServerError::precondition_required("invalid stream ID length"))?;
-    let stream_uuid = uuid::Uuid::from_bytes(stream_id_bytes_arr);
-    let stream_id = stream_uuid.to_string();
+    let stream_id = Uuid::from_bytes(stream_id_bytes_arr);
 
-    utils::validate_uuid(&stream_id)?;
-
-    if !state
-        .stream_registry
-        .register(&stream_id, crate::now_secs())
-    {
+    if !state.stream_registry.register(stream_id, crate::now_secs()) {
         warn!(stream_id = %stream_id, session_id = %session_id, "duplicate stream registration attempt");
         return Err(ServerError::precondition_required("stream already active"));
     }
 
-    let mut stream_guard = StreamGuard::new(Arc::clone(&state.stream_registry), stream_id.clone());
+    let mut stream_guard = StreamGuard::new(Arc::clone(&state.stream_registry), stream_id);
 
     let (upload_key, download_key, target_key) =
-        crypto::derive_connection_keys(&master, stream_uuid.as_bytes());
+        crypto::derive_connection_keys(&master, stream_id.as_bytes());
     let enc_target = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(enc_target_b64)
         .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
@@ -286,7 +315,7 @@ async fn spawn_encrypted_tunnel(
         body,
         host,
         port,
-        &stream_id,
+        stream_id,
         Some(upload_cipher as Arc<dyn FrameCipher>),
         Some(download_cipher),
     )
@@ -330,8 +359,8 @@ async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response
             .await
             .map_err(|_| ServerError::bad_gateway("actor closed"))?;
 
-        match reply_rx.await {
-            Ok(Some(new_download_rx)) => {
+        match tokio::time::timeout(crate::server::constants::UPLOAD_DONE_TIMEOUT, reply_rx).await {
+            Ok(Ok(Some(new_download_rx))) => {
                 let padding = utils::random_padding();
                 return Response::builder()
                     .header("Cache-Control", "no-store")
@@ -341,7 +370,7 @@ async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response
                     ))
                     .map_err(|e| ServerError::internal(e.to_string()));
             }
-            _ => {
+            Ok(Ok(None)) | Ok(Err(_)) => {
                 let padding = utils::random_padding();
                 return Response::builder()
                     .header("Cache-Control", "no-store")
@@ -349,6 +378,9 @@ async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response
                     .status(axum::http::StatusCode::NO_CONTENT)
                     .body(Body::empty())
                     .map_err(|e| ServerError::internal(e.to_string()));
+            }
+            Err(_) => {
+                return Err(ServerError::gateway_timeout("continue timed out"));
             }
         }
     }
@@ -387,31 +419,29 @@ pub async fn dispatch(
     let span = tracing::Span::current();
     let has_target = headers.get("X-Target").is_some();
 
-    let stream_cookie = utils::extract_cookie_value(&headers, "stream").map(|s| s.to_owned());
-    if let Some(ref stream_id) = stream_cookie {
-        utils::validate_uuid(stream_id)?;
+    if let Some(stream_cookie_val) = utils::extract_cookie_value(&headers, "stream") {
+        let stream_id = Uuid::parse_str(stream_cookie_val)
+            .map_err(|_| ServerError::precondition_required("invalid stream id"))?;
 
-        if let Some(handle) = state.actors.get(stream_id).map(|r| r.value().clone()) {
+        if let Some(handle) = state.actors.get(&stream_id).map(|r| r.value().clone()) {
             return dispatch_to_actor(handle, body).await;
         }
 
         if has_target {
-            return handle_plaintext_tunnel(state, headers, body, span, Some(stream_id.clone()))
-                .await;
+            return handle_plaintext_tunnel(state, headers, body, span, Some(stream_id)).await;
         }
 
         return handle_stream_not_found(&state, stream_id);
     }
 
-    let session_cookie = utils::extract_cookie_value(&headers, "session").map(|s| s.to_owned());
-    if let Some(ref session_val) = session_cookie {
+    if let Some(session_val) = utils::extract_cookie_value(&headers, "session") {
         if session_val.contains(':') {
             return spawn_encrypted_tunnel(state, session_val, body, span).await;
         }
         if has_target {
-            utils::validate_uuid(session_val)?;
-            return handle_plaintext_tunnel(state, headers, body, span, Some(session_val.clone()))
-                .await;
+            let stream_id = Uuid::parse_str(session_val)
+                .map_err(|_| ServerError::precondition_required("invalid stream id"))?;
+            return handle_plaintext_tunnel(state, headers, body, span, Some(stream_id)).await;
         }
         return Err(ServerError::precondition_required(
             "invalid session cookie — missing target or encrypted payload",
@@ -434,7 +464,7 @@ pub async fn dispatch(
 
 fn handle_stream_not_found(
     state: &Arc<AppState>,
-    stream_id: &str,
+    stream_id: Uuid,
 ) -> Result<Response, ServerError> {
     match state.stream_registry.check(stream_id) {
         StreamQueryResult::Consumed => {
@@ -461,7 +491,7 @@ async fn handle_plaintext_tunnel(
     headers: HeaderMap,
     body: Body,
     span: tracing::Span,
-    stream_id_opt: Option<String>,
+    stream_id_opt: Option<Uuid>,
 ) -> Result<Response, ServerError> {
     let user = validate_jwt_if_needed(&headers, &state.decoding_key, &state.jwt_validation)?;
     span.record("user", &user);
@@ -473,11 +503,8 @@ async fn handle_plaintext_tunnel(
     span.record("target", target);
 
     let stream_id = match stream_id_opt {
-        Some(id) => {
-            utils::validate_uuid(&id)?;
-            id
-        }
-        None => uuid::Uuid::new_v4().to_string(),
+        Some(id) => id,
+        None => Uuid::new_v4(),
     };
 
     let (host, port_str) = target
@@ -487,17 +514,14 @@ async fn handle_plaintext_tunnel(
         .parse()
         .map_err(|_| ServerError::bad_request("invalid port"))?;
 
-    if !state
-        .stream_registry
-        .register(&stream_id, crate::now_secs())
-    {
+    if !state.stream_registry.register(stream_id, crate::now_secs()) {
         warn!(stream_id = %stream_id, "duplicate stream registration for plaintext tunnel");
         return Err(ServerError::precondition_required("stream already active"));
     }
 
-    let mut stream_guard = StreamGuard::new(Arc::clone(&state.stream_registry), stream_id.clone());
+    let mut stream_guard = StreamGuard::new(Arc::clone(&state.stream_registry), stream_id);
 
-    let response = setup_tunnel_response(&state, body, host, port, &stream_id, None, None).await?;
+    let response = setup_tunnel_response(&state, body, host, port, stream_id, None, None).await?;
 
     stream_guard.disarm();
 
@@ -591,10 +615,10 @@ async fn handle_fresh_handshake(
         crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
     };
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
     state.master_store.insert(
         session_id.clone(),
-        (user.clone(), master, crate::now_secs()),
+        (Arc::from(user.as_str()), master, crate::now_secs()),
     );
 
     info!(session_id = %session_id, "handshake: master key derived");

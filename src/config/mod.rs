@@ -45,6 +45,8 @@ pub struct ServerSection {
     pub listen: String,
     pub path: String,
     pub private_key: Option<String>,
+    #[serde(default)]
+    pub max_tunnels: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -57,6 +59,12 @@ pub struct ClientSection {
     pub public_key: Option<String>,
     #[serde(default)]
     pub auth: Option<ClientProxyAuth>,
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    #[serde(default)]
+    pub max_in_flight_bytes: Option<usize>,
+    #[serde(default)]
+    pub upload_concurrency: Option<usize>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

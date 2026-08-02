@@ -6,14 +6,16 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 use tracing::{Instrument, warn};
+use uuid::Uuid;
 
 use super::super::state::SharedState;
 use crate::client::constants::{
     DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, PREFETCH_LEAD_BYTES, PREFETCH_ROTATE_TIMEOUT,
+    WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT,
 };
 use crate::client::utils;
 use crate::crypto::AesFrameCipher;
-use crate::shaper::{self, EncodingType, FrameCipher};
+use crate::shaper::{self, DecodedFrame, EncodingType, FrameCipher};
 
 enum Phase {
     Streaming {
@@ -34,7 +36,7 @@ pub struct DownloadLoopActor {
     write_half: tokio::net::tcp::OwnedWriteHalf,
     cipher: Option<Arc<dyn FrameCipher>>,
     encoding: EncodingType,
-    stream_id: String,
+    stream_id: Uuid,
     http_client: Arc<wreq::Client>,
     state: Arc<SharedState>,
     max_bytes: Option<u64>,
@@ -46,7 +48,7 @@ impl DownloadLoopActor {
         initial_response: wreq::Response,
         write_half: tokio::net::tcp::OwnedWriteHalf,
         cipher: Option<Arc<AesFrameCipher>>,
-        stream_id: String,
+        stream_id: Uuid,
         http_client: Arc<wreq::Client>,
         state: Arc<SharedState>,
     ) -> Self {
@@ -58,7 +60,7 @@ impl DownloadLoopActor {
         let use_prefetch = prefetch_at.is_some_and(|at| at > 0);
 
         let (prefetch_trigger, prefetch_rx) = if rotate_enabled && use_prefetch {
-            let (tx, rx) = spawn_prefetch_continuation(&http_client, &state, &stream_id);
+            let (tx, rx) = spawn_prefetch_continuation(&http_client, &state, stream_id);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -148,18 +150,27 @@ impl DownloadLoopActor {
         prefetch_rx: Option<oneshot::Receiver<Result<wreq::Response>>>,
     ) -> Result<Phase> {
         let response = if let Some(rx) = prefetch_rx {
-            match tokio::time::timeout(PREFETCH_ROTATE_TIMEOUT, rx).await {
+            tokio::pin!(rx);
+            match tokio::time::timeout(PREFETCH_ROTATE_TIMEOUT, &mut rx).await {
                 Ok(Ok(Ok(resp))) => resp,
                 Ok(Ok(Err(_))) | Ok(Err(_)) => {
-                    send_continue_request(&self.http_client, &self.state, &self.stream_id).await?
+                    send_continue_request(&self.http_client, &self.state, self.stream_id).await?
                 }
                 Err(_elapsed) => {
-                    warn!("prefetch timed out, falling back to synchronous continue");
-                    send_continue_request(&self.http_client, &self.state, &self.stream_id).await?
+                    warn!("prefetch slow, waiting one more window");
+                    match tokio::time::timeout(PREFETCH_ROTATE_TIMEOUT, &mut rx).await {
+                        Ok(Ok(Ok(resp))) => resp,
+                        _ => {
+                            return Err(anyhow!(
+                                "prefetch continuation timed out after {}s",
+                                2 * PREFETCH_ROTATE_TIMEOUT.as_secs()
+                            ));
+                        }
+                    }
                 }
             }
         } else {
-            send_continue_request(&self.http_client, &self.state, &self.stream_id).await?
+            send_continue_request(&self.http_client, &self.state, self.stream_id).await?
         };
 
         let use_prefetch = self
@@ -168,7 +179,7 @@ impl DownloadLoopActor {
             .is_some_and(|at| at > 0);
         let (prefetch_trigger, prefetch_rx) = if use_prefetch {
             let (tx, rx) =
-                spawn_prefetch_continuation(&self.http_client, &self.state, &self.stream_id);
+                spawn_prefetch_continuation(&self.http_client, &self.state, self.stream_id);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -186,6 +197,36 @@ impl DownloadLoopActor {
             prefetch_rx,
         })
     }
+
+    #[inline]
+    fn handle_frame(
+        frame: DecodedFrame,
+        write_buf: &mut BytesMut,
+        scratch: &BytesMut,
+        expected_seq: &mut u64,
+    ) -> Result<(), anyhow::Error> {
+        match frame {
+            DecodedFrame::InScratch { seq, start, end } => {
+                if seq != *expected_seq {
+                    return Err(anyhow!(
+                        "download frame seq {seq} out of order, expected {expected_seq}"
+                    ));
+                }
+                *expected_seq += 1;
+                write_buf.extend_from_slice(&scratch[start..end]);
+            }
+            DecodedFrame::Owned { seq, data } => {
+                if seq != *expected_seq {
+                    return Err(anyhow!(
+                        "download frame seq {seq} out of order, expected {expected_seq}"
+                    ));
+                }
+                *expected_seq += 1;
+                write_buf.extend_from_slice(&data);
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn download_single_response(
@@ -198,32 +239,116 @@ async fn download_single_response(
     mut prefetch_trigger: Option<oneshot::Sender<()>>,
 ) -> Result<(u64, u64)> {
     let mut buffer = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
+    let mut scratch = BytesMut::new();
+    let mut json_scratch = Vec::new();
+    let mut write_buf = BytesMut::with_capacity(WRITE_BUF_CAPACITY);
+    let flush_deadline = tokio::time::sleep(WRITE_FLUSH_TIMEOUT);
+    tokio::pin!(flush_deadline);
     let mut data_stream = response.into_data_stream();
     let mut bytes_received: u64 = 0;
 
-    while let Some(chunk) = data_stream.next().await {
-        let chunk = chunk.context("response read error")?;
-        bytes_received += chunk.len() as u64;
+    loop {
+        tokio::select! {
+            chunk = data_stream.next() => {
+                let Some(chunk) = chunk else { break };
+                let chunk = chunk.context("response read error")?;
+                bytes_received += chunk.len() as u64;
 
-        if let Some(at) = prefetch_at
-            && bytes_received >= at
-            && let Some(tx) = prefetch_trigger.take()
-        {
-            let _ = tx.send(());
-        }
+                if let Some(at) = prefetch_at
+                    && bytes_received >= at
+                    && let Some(tx) = prefetch_trigger.take()
+                {
+                    let _ = tx.send(());
+                }
 
-        buffer.extend_from_slice(&chunk);
-        while let Some((seq, frame_data, start, end)) =
-            shaper::decode_frame_owned(&mut buffer, cipher, encoding)?
-        {
-            if seq != expected_seq {
-                return Err(anyhow!(
-                    "download frame seq {seq} out of order, expected {expected_seq}"
-                ));
+                if buffer.is_empty() {
+                    match chunk.try_into_mut() {
+                        Ok(mut chunk_mut) => {
+                            while let Some(frame) = shaper::decode_frame(
+                                &mut chunk_mut,
+                                &mut scratch,
+                                &mut json_scratch,
+                                cipher,
+                                encoding,
+                            )? {
+                                DownloadLoopActor::handle_frame(
+                                    frame,
+                                    &mut write_buf,
+                                    &scratch,
+                                    &mut expected_seq,
+                                )?;
+                                if write_buf.len() >= WRITE_BUF_CAPACITY {
+                                    write_half.write_all(&write_buf).await?;
+                                    write_buf.clear();
+                                    flush_deadline.as_mut().reset(
+                                        tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT,
+                                    );
+                                }
+                            }
+                            buffer = chunk_mut;
+                        }
+                        Err(chunk) => {
+                            buffer.extend_from_slice(&chunk);
+                            while let Some(frame) = shaper::decode_frame(
+                                &mut buffer,
+                                &mut scratch,
+                                &mut json_scratch,
+                                cipher,
+                                encoding,
+                            )? {
+                                DownloadLoopActor::handle_frame(
+                                    frame,
+                                    &mut write_buf,
+                                    &scratch,
+                                    &mut expected_seq,
+                                )?;
+                                if write_buf.len() >= WRITE_BUF_CAPACITY {
+                                    write_half.write_all(&write_buf).await?;
+                                    write_buf.clear();
+                                    flush_deadline.as_mut().reset(
+                                        tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(frame) = shaper::decode_frame(
+                        &mut buffer,
+                        &mut scratch,
+                        &mut json_scratch,
+                        cipher,
+                        encoding,
+                    )? {
+                        DownloadLoopActor::handle_frame(
+                            frame,
+                            &mut write_buf,
+                            &scratch,
+                            &mut expected_seq,
+                        )?;
+                        if write_buf.len() >= WRITE_BUF_CAPACITY {
+                            write_half.write_all(&write_buf).await?;
+                            write_buf.clear();
+                            flush_deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT);
+                        }
+                    }
+                }
             }
-            expected_seq += 1;
-            write_half.write_all(&frame_data[start..end]).await?;
+            _ = &mut flush_deadline, if !write_buf.is_empty() => {
+                write_half.write_all(&write_buf).await?;
+                write_buf.clear();
+                flush_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT);
+            }
         }
+    }
+
+    if !write_buf.is_empty() {
+        write_half.write_all(&write_buf).await?;
     }
 
     if !buffer.is_empty() {
@@ -238,7 +363,7 @@ async fn download_single_response(
 async fn send_continue_request(
     http_client: &wreq::Client,
     state: &SharedState,
-    stream_id: &str,
+    stream_id: Uuid,
 ) -> Result<wreq::Response> {
     let mut cookie = String::new();
     utils::build_stream_cookie(&mut cookie, stream_id);
@@ -259,7 +384,7 @@ async fn send_continue_request(
 fn spawn_prefetch_continuation(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
-    stream_id: &str,
+    stream_id: Uuid,
 ) -> (
     oneshot::Sender<()>,
     oneshot::Receiver<Result<wreq::Response>>,
@@ -268,13 +393,12 @@ fn spawn_prefetch_continuation(
     let (result_tx, result_rx) = oneshot::channel();
     let pre_client = Arc::clone(http_client);
     let pre_state = Arc::clone(state);
-    let pre_stream_id = stream_id.to_owned();
     tokio::spawn(
         async move {
             if trigger_rx.await.is_err() {
                 return;
             }
-            match send_continue_request(&pre_client, &pre_state, &pre_stream_id).await {
+            match send_continue_request(&pre_client, &pre_state, stream_id).await {
                 Ok(resp) => {
                     let _ = result_tx.send(Ok(resp));
                 }

@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tracing::warn;
 
+use crate::error::ServerError;
 use crate::server::constants::{
     MAX_EOS_WAITERS, MAX_PENDING_BYTES, MAX_PENDING_FRAMES, MAX_REORDER_SECS, WRITE_TIMEOUT,
 };
@@ -17,7 +18,7 @@ pub enum UploadCmd {
     },
     Eos {
         max_seq: u64,
-        done: oneshot::Sender<()>,
+        ack: oneshot::Sender<Result<(), ServerError>>,
     },
     Shutdown,
 }
@@ -27,10 +28,10 @@ enum UploadPhase {
         next_seq: u64,
         pending: BTreeMap<u64, Bytes>,
         pending_bytes: usize,
-        eos_waiters: Vec<(u64, oneshot::Sender<()>)>,
+        eos_waiters: Vec<(u64, oneshot::Sender<Result<(), ServerError>>)>,
     },
     Draining {
-        eos_waiters: Vec<oneshot::Sender<()>>,
+        eos_waiters: Vec<oneshot::Sender<Result<(), ServerError>>>,
     },
     Closed,
 }
@@ -91,7 +92,7 @@ impl UploadActor {
                 true
             }
             UploadCmd::Frame { seq, data } => self.handle_frame(seq, data).await,
-            UploadCmd::Eos { max_seq, done } => self.handle_eos(max_seq, done),
+            UploadCmd::Eos { max_seq, ack } => self.handle_eos(max_seq, ack),
         }
     }
 
@@ -109,9 +110,10 @@ impl UploadActor {
                 }
                 if seq == *next_seq {
                     if let Some(ref mut upstream) = self.upstream
-                        && tokio::time::timeout(WRITE_TIMEOUT, upstream.write_all(&data))
-                            .await
-                            .is_err()
+                        && !matches!(
+                            tokio::time::timeout(WRITE_TIMEOUT, upstream.write_all(&data)).await,
+                            Ok(Ok(()))
+                        )
                     {
                         self.shutdown_and_drain().await;
                         return true;
@@ -120,12 +122,14 @@ impl UploadActor {
                     while let Some(pending_data) = pending.remove(next_seq) {
                         *pending_bytes -= pending_data.len();
                         if let Some(ref mut upstream) = self.upstream
-                            && tokio::time::timeout(
-                                WRITE_TIMEOUT,
-                                upstream.write_all(&pending_data),
+                            && !matches!(
+                                tokio::time::timeout(
+                                    WRITE_TIMEOUT,
+                                    upstream.write_all(&pending_data),
+                                )
+                                .await,
+                                Ok(Ok(()))
                             )
-                            .await
-                            .is_err()
                         {
                             self.shutdown_and_drain().await;
                             return true;
@@ -135,8 +139,8 @@ impl UploadActor {
                     let mut i = 0;
                     while i < eos_waiters.len() {
                         if *next_seq > eos_waiters[i].0 {
-                            let (_, done) = eos_waiters.swap_remove(i);
-                            let _ = done.send(());
+                            let (_, ack) = eos_waiters.swap_remove(i);
+                            let _ = ack.send(Ok(()));
                         } else {
                             i += 1;
                         }
@@ -155,9 +159,10 @@ impl UploadActor {
                         pending_bytes,
                         max_pending_frames = MAX_PENDING_FRAMES,
                         max_pending_bytes = MAX_PENDING_BYTES,
-                        "reorder buffer overflow, discarding frame"
+                        "reorder buffer overflow, aborting upload"
                     );
-                    return false;
+                    self.shutdown_and_drain().await;
+                    return true;
                 }
                 pending.insert(seq, data);
                 *pending_bytes += len;
@@ -167,7 +172,7 @@ impl UploadActor {
         }
     }
 
-    fn handle_eos(&mut self, max_seq: u64, done: oneshot::Sender<()>) -> bool {
+    fn handle_eos(&mut self, max_seq: u64, ack: oneshot::Sender<Result<(), ServerError>>) -> bool {
         match &mut self.phase {
             UploadPhase::Reordering {
                 next_seq,
@@ -175,25 +180,26 @@ impl UploadActor {
                 ..
             } => {
                 if *next_seq > max_seq {
-                    let _ = done.send(());
+                    let _ = ack.send(Ok(()));
                 } else if eos_waiters.len() >= MAX_EOS_WAITERS {
                     warn!(
                         max_seq,
                         eos_waiters = eos_waiters.len(),
                         "EOS waiters overflow, shutting down upload actor"
                     );
+                    let _ = ack.send(Err(ServerError::bad_gateway("upload EOS waiters overflow")));
                     return true;
                 } else {
-                    eos_waiters.push((max_seq, done));
+                    eos_waiters.push((max_seq, ack));
                 }
                 false
             }
             UploadPhase::Draining { eos_waiters } => {
-                eos_waiters.push(done);
+                eos_waiters.push(ack);
                 false
             }
             UploadPhase::Closed => {
-                let _ = done.send(());
+                let _ = ack.send(Err(ServerError::bad_gateway("upload actor closed")));
                 true
             }
         }
@@ -206,7 +212,7 @@ impl UploadActor {
         self.upstream = None;
         self.phase = match std::mem::replace(&mut self.phase, UploadPhase::Closed) {
             UploadPhase::Reordering { eos_waiters, .. } => UploadPhase::Draining {
-                eos_waiters: eos_waiters.into_iter().map(|(_, done)| done).collect(),
+                eos_waiters: eos_waiters.into_iter().map(|(_, ack)| ack).collect(),
             },
             other @ UploadPhase::Draining { .. } => other,
             UploadPhase::Closed => UploadPhase::Closed,
@@ -215,15 +221,16 @@ impl UploadActor {
 
     fn ack_all_waiters(&mut self) {
         let phase = std::mem::replace(&mut self.phase, UploadPhase::Closed);
+        let err = ServerError::gateway_timeout("upload drain timeout");
         match phase {
             UploadPhase::Reordering { eos_waiters, .. } => {
-                for (_, waiter) in eos_waiters {
-                    let _ = waiter.send(());
+                for (_, ack) in eos_waiters {
+                    let _ = ack.send(Err(err.clone()));
                 }
             }
             UploadPhase::Draining { eos_waiters } => {
-                for waiter in eos_waiters {
-                    let _ = waiter.send(());
+                for ack in eos_waiters {
+                    let _ = ack.send(Err(err.clone()));
                 }
             }
             UploadPhase::Closed => {}
@@ -267,14 +274,14 @@ mod tests {
         })
         .await
         .unwrap();
-        let (done_tx, done_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
         tx.send(UploadCmd::Eos {
             max_seq: 1,
-            done: done_tx,
+            ack: ack_tx,
         })
         .await
         .unwrap();
-        done_rx.await.unwrap();
+        assert!(ack_rx.await.unwrap().is_ok());
 
         drop(tx);
         handle.await.unwrap();
@@ -305,14 +312,14 @@ mod tests {
         })
         .await
         .unwrap();
-        let (done_tx, done_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
         tx.send(UploadCmd::Eos {
             max_seq: 2,
-            done: done_tx,
+            ack: ack_tx,
         })
         .await
         .unwrap();
-        done_rx.await.unwrap();
+        assert!(ack_rx.await.unwrap().is_ok());
 
         drop(tx);
         handle.await.unwrap();
@@ -325,14 +332,14 @@ mod tests {
         let actor = UploadActor::new(rx, server_write, 5);
         let handle = tokio::spawn(async move { actor.run().await });
 
-        let (done_tx, done_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
         tx.send(UploadCmd::Eos {
             max_seq: 3,
-            done: done_tx,
+            ack: ack_tx,
         })
         .await
         .unwrap();
-        done_rx.await.unwrap();
+        assert!(ack_rx.await.unwrap().is_ok());
 
         drop(tx);
         handle.await.unwrap();
@@ -351,17 +358,37 @@ mod tests {
         })
         .await
         .unwrap();
-        let (done_tx, done_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
         tx.send(UploadCmd::Eos {
             max_seq: 5,
-            done: done_tx,
+            ack: ack_tx,
         })
         .await
         .unwrap();
 
         tx.send(UploadCmd::Shutdown).await.unwrap();
         drop(tx);
-        done_rx.await.unwrap();
+        assert!(ack_rx.await.unwrap().is_err());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_close_acks_waiters_with_error() {
+        let (_rx, server_write) = tcp_pair().await;
+        let (tx, rx) = mpsc::channel::<UploadCmd>(16);
+        let actor = UploadActor::new(rx, server_write, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(UploadCmd::Eos {
+            max_seq: 5,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        assert!(ack_rx.await.unwrap().is_err());
         handle.await.unwrap();
     }
 }

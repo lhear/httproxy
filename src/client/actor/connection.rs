@@ -69,7 +69,7 @@ impl ClientConnectionActor {
         let (method, header_len, url) = loop {
             let (method, header_len, url, proxy_auth_header) = tokio::time::timeout(
                 PROXY_REQUEST_PARSE_TIMEOUT,
-                proxy::parse_proxy_request(&mut read_half, buf),
+                proxy::parse_proxy_request(&mut read_half, buf, state.proxy_auth.is_some()),
             )
             .await
             .map_err(|_| anyhow::anyhow!("proxy request parse timeout"))??;

@@ -10,7 +10,7 @@ pub mod utils;
 use crate::config::ServerTopConfig;
 use crate::crypto;
 use crate::dns::{self, DnsClient};
-use crate::shaper::{EncodingType, FrameCipher, TrafficConfig};
+use crate::shaper::{EncodingType, FrameCipher, ResolvedShaperConfig, TrafficConfig};
 
 use anyhow::Context;
 use axum::serve::ListenerExt;
@@ -26,15 +26,17 @@ use std::{
     },
 };
 use stream_registry::StreamRegistry;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::server::actor::tunnel::TunnelCmd;
+use crate::server::constants::MAX_TUNNELS;
 
-pub type MasterStoreEntry = (String, Zeroizing<[u8; 32]>, u64);
+pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -57,10 +59,12 @@ pub struct AppState {
     pub dns_client: Option<Arc<DnsClient>>,
     pub client_subnet: Option<IpAddr>,
     pub traffic_config: Arc<TrafficConfig>,
+    pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub private_key: Option<x25519_dalek::StaticSecret>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
     pub stream_registry: Arc<StreamRegistry>,
-    pub actors: Arc<DashMap<String, SessionHandle>>,
+    pub actors: Arc<DashMap<Uuid, SessionHandle>>,
+    pub tunnel_semaphore: Arc<Semaphore>,
     pub stream_id_counter: Arc<AtomicU64>,
 }
 
@@ -86,6 +90,8 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         .map(crypto::b64_to_private_key)
         .transpose()?;
 
+    let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
+
     Ok(Arc::new(AppState {
         decoding_key: DecodingKey::from_secret(config.auth.secret.as_bytes()),
         jwt_validation: {
@@ -101,10 +107,12 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         dns_client,
         client_subnet,
         traffic_config: Arc::new(config.traffic_shaping.clone()),
+        resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&config.traffic_shaping)),
         private_key,
         master_store: Arc::new(DashMap::new()),
         stream_registry: Arc::new(StreamRegistry::new()),
         actors: Arc::new(DashMap::new()),
+        tunnel_semaphore: Arc::new(Semaphore::new(max_tunnels)),
         stream_id_counter: Arc::new(AtomicU64::new(1)),
     }))
 }
@@ -178,6 +186,7 @@ mod tests {
                 listen: "0.0.0.0:0".into(),
                 path: "/t".into(),
                 private_key: None,
+                max_tunnels: None,
             },
             auth: AuthSection {
                 secret: "test-key".into(),

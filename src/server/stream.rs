@@ -6,13 +6,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::shaper::{self, EncodingType, FrameCipher};
+use crate::shaper::{self, DecodedFrame, EncodingType, FrameCipher};
 
 pin_project! {
     pub struct FrameDecoder<S> {
         #[pin]
         inner: S,
         buf: BytesMut,
+        scratch: BytesMut,
+        json_scratch: Vec<u8>,
         cipher: Option<Arc<dyn FrameCipher>>,
         encoding: EncodingType,
         max_buf_size: usize,
@@ -33,6 +35,8 @@ where
         Self {
             inner,
             buf: BytesMut::with_capacity(max_buf_size),
+            scratch: BytesMut::new(),
+            json_scratch: Vec::new(),
             cipher,
             encoding,
             max_buf_size,
@@ -53,9 +57,22 @@ where
         loop {
             let cipher_ref: Option<&dyn FrameCipher> =
                 this.cipher.as_ref().map(|c| c.as_ref() as &dyn FrameCipher);
-            match shaper::decode_from_buffer(this.buf, cipher_ref, *this.encoding) {
+            match shaper::decode_frame(
+                this.buf,
+                this.scratch,
+                this.json_scratch,
+                cipher_ref,
+                *this.encoding,
+            ) {
                 Ok(Some(frame)) => {
-                    return Poll::Ready(Some(Ok(frame)));
+                    let (seq, data) = match frame {
+                        DecodedFrame::InScratch { seq, start, end } => {
+                            let plain = this.scratch.split().freeze();
+                            (seq, plain.slice(start..end))
+                        }
+                        DecodedFrame::Owned { seq, data } => (seq, data),
+                    };
+                    return Poll::Ready(Some(Ok((seq, data))));
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -208,5 +225,35 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("buffer exceeded"), "got: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn encrypted_frames_decoded_with_scratch() {
+        use crate::crypto::AesFrameCipher;
+        use zeroize::Zeroizing;
+
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut *key);
+        let cipher = Arc::new(AesFrameCipher::new(&key));
+
+        let frame = shaper::encode_frame(
+            b"encrypted hello",
+            0,
+            Some(cipher.as_ref() as &dyn shaper::FrameCipher),
+            16384,
+            [0, 0],
+            shaper::EncodingType::Binary,
+        )
+        .unwrap();
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(frame))]);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Some(cipher),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
+        let (seq, data) = decoder.next().await.unwrap().unwrap();
+        assert_eq!(seq, 0);
+        assert_eq!(&data[..], b"encrypted hello");
     }
 }
