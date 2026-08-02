@@ -91,7 +91,7 @@ pub async fn try_pq_connect(
     .context("session resumption POST failed")?;
 
     if response.status().as_u16() == 428 {
-        let _ = response.bytes().await;
+        let _ = tokio::time::timeout(DOWNLOAD_CONNECT_TIMEOUT, response.bytes()).await;
         return Err(anyhow::Error::new(RehandshakeRequired(
             "server requests re-handshake (428)".into(),
         )));
@@ -109,7 +109,6 @@ pub async fn try_pq_connect(
     let upload_client = Arc::clone(http_client);
     let upload_state = Arc::clone(state);
     let upload_cipher_clone = Arc::clone(&upload_cipher);
-    let stream_id_str = stream_id.to_string();
 
     let upload_actor = UploadLoopActor::new(
         upload_client.clone(),
@@ -117,7 +116,7 @@ pub async fn try_pq_connect(
         remaining_payload,
         read_half,
         Some(upload_cipher_clone),
-        stream_id_str.clone(),
+        stream_id,
         frames_sent,
     );
     let upload_task =
@@ -127,7 +126,7 @@ pub async fn try_pq_connect(
         response,
         write_half,
         Some(download_cipher),
-        stream_id_str,
+        stream_id,
         Arc::clone(http_client),
         Arc::clone(state),
     );

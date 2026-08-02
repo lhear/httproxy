@@ -7,16 +7,16 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{Instrument, info, warn};
+use uuid::Uuid;
 
-use crate::error::ServerError;
 use crate::now_secs;
 use crate::server::actor::upload::{UploadActor, UploadCmd};
 use crate::server::constants::{
     DOWNLOAD_CHANNEL_CAPACITY, ROTATION_STALENESS, STREAM_IDLE_TIMEOUT_SECS,
-    UPLOAD_CMD_CHANNEL_CAPACITY, UPLOAD_DONE_TIMEOUT,
+    UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream_registry::StreamRegistry;
-use crate::shaper::{FrameCipher, TrafficConfig, TrafficShaper};
+use crate::shaper::{FrameCipher, ResolvedShaperConfig, TrafficShaper};
 
 pub enum TunnelCmd {
     UploadFrame {
@@ -25,7 +25,7 @@ pub enum TunnelCmd {
     },
     UploadEos {
         max_seq: u64,
-        ack: oneshot::Sender<Result<(), ServerError>>,
+        ack: oneshot::Sender<Result<(), crate::error::ServerError>>,
     },
     Continue {
         reply: oneshot::Sender<Option<mpsc::Receiver<std::io::Result<Bytes>>>>,
@@ -54,7 +54,7 @@ pub struct TunnelActor {
     pending_continue: Vec<oneshot::Sender<Option<mpsc::Receiver<std::io::Result<Bytes>>>>>,
     segment_done_tx: mpsc::Sender<Option<ShaperStream>>,
     segment_done_rx: mpsc::Receiver<Option<ShaperStream>>,
-    stream_id: String,
+    stream_id: Uuid,
     stream_registry: Arc<StreamRegistry>,
     shutdown_signal: Arc<Notify>,
     max_download_bytes: Option<u64>,
@@ -67,10 +67,11 @@ impl TunnelActor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx: mpsc::Receiver<TunnelCmd>,
-        download_tx: mpsc::Sender<std::io::Result<Bytes>>,
-        stream_id: String,
+        download_tx: Option<mpsc::Sender<std::io::Result<Bytes>>>,
+        stream_id: Uuid,
         stream_registry: Arc<StreamRegistry>,
         max_download_bytes: Option<u64>,
+        last_activity: Arc<AtomicU64>,
     ) -> Self {
         let (seg_tx, seg_rx) = mpsc::channel::<Option<ShaperStream>>(2);
         Self {
@@ -80,7 +81,7 @@ impl TunnelActor {
             upload_handle: None,
             download_handle: None,
             shaper: None,
-            download_tx: Some(download_tx),
+            download_tx,
             pending_continue: Vec::new(),
             segment_done_tx: seg_tx,
             segment_done_rx: seg_rx,
@@ -90,7 +91,7 @@ impl TunnelActor {
             max_download_bytes,
             pending_write_half: None,
             pending_initial_seq: 0,
-            last_activity: Arc::new(AtomicU64::new(now_secs())),
+            last_activity,
         }
     }
 
@@ -111,7 +112,7 @@ impl TunnelActor {
         &mut self,
         read_half: OwnedReadHalf,
         write_half: Option<OwnedWriteHalf>,
-        config: TrafficConfig,
+        config: &ResolvedShaperConfig,
         download_cipher: Option<Arc<dyn FrameCipher>>,
         initial_seq: u64,
     ) {
@@ -140,23 +141,24 @@ impl TunnelActor {
         self.download_handle = Some(tokio::spawn(
             async move {
                 let mut bytes_sent: u64 = 0;
-                while let Some(result) = shaper.as_mut().next().await {
-                    match result {
-                        Ok((_seq, data)) => {
+                loop {
+                    match shaper.as_mut().next().await {
+                        Some(Ok((_seq, data))) => {
                             bytes_sent += data.len() as u64;
+                            activity.store(now_secs(), Ordering::Relaxed);
                             if download_tx.send(Ok(data)).await.is_err() {
                                 break;
                             }
-                            activity.store(now_secs(), Ordering::Relaxed);
                             if max_bytes.is_some_and(|m| bytes_sent >= m) {
                                 let _ = done_tx.send(Some(shaper)).await;
                                 return;
                             }
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             let _ = download_tx.send(Err(e)).await;
                             break;
                         }
+                        None => break,
                     }
                 }
                 let _ = done_tx.send(None).await;
@@ -169,9 +171,10 @@ impl TunnelActor {
         let max_bytes = self.max_download_bytes;
 
         if self.upload_tx.is_none() {
-            let write_half = self.pending_write_half.take().expect(
-                "on_upstream_connected must provide write_half when upload channel not pre-set",
-            );
+            let write_half = self
+                .pending_write_half
+                .take()
+                .expect("upstream write half must be provided before run");
             let (upload_tx, upload_rx) = mpsc::channel::<UploadCmd>(UPLOAD_CMD_CHANNEL_CAPACITY);
             self.upload_tx = Some(upload_tx);
             let upload_actor = UploadActor::new(upload_rx, write_half, self.pending_initial_seq);
@@ -180,7 +183,10 @@ impl TunnelActor {
             ));
         }
 
-        self.spawn_download_segment(max_bytes);
+        let direct_mode = self.download_tx.is_none();
+        if !direct_mode {
+            self.spawn_download_segment(max_bytes);
+        }
 
         let rotation_timeout = tokio::time::sleep(ROTATION_STALENESS);
         tokio::pin!(rotation_timeout);
@@ -192,7 +198,7 @@ impl TunnelActor {
         loop {
             tokio::select! {
                 biased;
-                returned = self.segment_done_rx.recv() => {
+                returned = self.segment_done_rx.recv(), if !direct_mode => {
                     self.download_tx = None;
 
                     match returned {
@@ -215,10 +221,12 @@ impl TunnelActor {
                         if self.shaper.is_some() {
                             let (new_tx, new_rx) =
                                 mpsc::channel::<std::io::Result<Bytes>>(DOWNLOAD_CHANNEL_CAPACITY);
+                            if reply.send(Some(new_rx)).is_err() {
+                                continue;
+                            }
                             self.download_tx = Some(new_tx);
                             self.spawn_download_segment(self.max_download_bytes);
                             self.phase = Phase::Active;
-                            let _ = reply.send(Some(new_rx));
                         } else {
                             let _ = reply.send(None);
                         }
@@ -280,49 +288,30 @@ impl TunnelActor {
                 }
             }
             TunnelCmd::UploadEos { max_seq, ack } => {
-                let (done_tx, done_rx) = oneshot::channel();
                 if upload_tx
-                    .send(UploadCmd::Eos {
-                        max_seq,
-                        done: done_tx,
-                    })
+                    .send(UploadCmd::Eos { max_seq, ack })
                     .await
                     .is_err()
                 {
                     warn!("upload actor closed before EOS");
-                    let _ = ack.send(Err(ServerError::bad_gateway("upload actor closed")));
-                    return;
                 }
-                let upload_done_timeout = UPLOAD_DONE_TIMEOUT;
-                tokio::spawn(
-                    async move {
-                        let confirmed = tokio::time::timeout(upload_done_timeout, done_rx)
-                            .await
-                            .map(|r| r.is_ok())
-                            .unwrap_or(false);
-                        if confirmed {
-                            let _ = ack.send(Ok(()));
-                        } else {
-                            warn!("upload EOS ack timed out or upload actor closed");
-                            let _ =
-                                ack.send(Err(ServerError::gateway_timeout("upload drain timeout")));
-                        }
-                    }
-                    .instrument(tracing::Span::current()),
-                );
             }
-            TunnelCmd::Continue { reply } => {
-                if self.shaper.is_some() {
+            TunnelCmd::Continue { reply } => match self.phase {
+                Phase::Rotating => {
                     let (new_tx, new_rx) =
                         mpsc::channel::<std::io::Result<Bytes>>(DOWNLOAD_CHANNEL_CAPACITY);
                     self.download_tx = Some(new_tx);
                     self.spawn_download_segment(self.max_download_bytes);
                     self.phase = Phase::Active;
                     let _ = reply.send(Some(new_rx));
-                } else {
+                }
+                Phase::Active if self.shaper.is_none() => {
                     self.pending_continue.push(reply);
                 }
-            }
+                _ => {
+                    let _ = reply.send(None);
+                }
+            },
             TunnelCmd::Shutdown => {}
         }
     }
@@ -346,7 +335,7 @@ impl TunnelActor {
     }
 
     fn consume_stream(&mut self) {
-        self.stream_registry.mark_consumed(&self.stream_id);
+        self.stream_registry.mark_consumed(self.stream_id);
     }
 }
 

@@ -216,6 +216,9 @@ impl DnsClient {
                 msg.header().id()
             ));
         }
+        if msg.header().tc() {
+            return Err(anyhow!("DNS response truncated (TC set)"));
+        }
         let rcode = msg.header().rcode();
         if rcode == Rcode::NXDOMAIN {
             return Ok((vec![], Duration::from_secs(self.config.options.empty_ttl)));

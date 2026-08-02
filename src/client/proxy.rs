@@ -7,6 +7,7 @@ use url::Url;
 pub async fn parse_proxy_request(
     reader: &mut (impl AsyncReadExt + Unpin),
     buffer: &mut BytesMut,
+    need_proxy_auth: bool,
 ) -> Result<(String, usize, String, Option<String>)> {
     const MAX_HEADER_LEN: usize = 16 * 1024;
 
@@ -17,7 +18,11 @@ pub async fn parse_proxy_request(
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = httparse::Request::new(&mut headers);
         if let httparse::Status::Complete(amt) = req.parse(buffer)? {
-            let proxy_auth = extract_header(req.headers, "proxy-authorization");
+            let proxy_auth = if need_proxy_auth {
+                extract_header(req.headers, "proxy-authorization")
+            } else {
+                None
+            };
             return Ok((
                 req.method.context("no method")?.to_owned(),
                 amt,
@@ -47,7 +52,12 @@ pub fn resolve_target_host(method: &str, url_str: &str) -> Result<String> {
         let port = auth
             .port_u16()
             .ok_or_else(|| anyhow!("port required: {url_str}"))?;
-        return Ok(format!("{}:{port}", auth.host()));
+        let host = auth.host();
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        return Ok(format!("{host}:{port}"));
     }
 
     let url = Url::parse(url_str).context("invalid proxy URL")?;

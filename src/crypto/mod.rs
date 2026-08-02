@@ -2,7 +2,7 @@ mod cipher;
 mod handshake;
 mod keys;
 
-pub use cipher::{AesFrameCipher, decrypt_bytes, encrypt_bytes};
+pub use cipher::{AesFrameCipher, NONCE_LEN, TAG_LEN, decrypt_bytes, encrypt_bytes};
 pub use handshake::{
     derive_connection_keys, derive_cookie_stream_key, derive_handshake_key, derive_initial_master,
 };

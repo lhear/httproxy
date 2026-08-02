@@ -55,7 +55,7 @@ impl From<std::io::Error> for HttpProxyError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ServerError(pub StatusCode, pub String);
 
 impl ServerError {
@@ -90,6 +90,10 @@ impl ServerError {
     #[inline]
     pub fn precondition_required(msg: impl Into<String>) -> Self {
         Self(StatusCode::PRECONDITION_REQUIRED, msg.into())
+    }
+    #[inline]
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self(StatusCode::SERVICE_UNAVAILABLE, msg.into())
     }
 }
 
@@ -147,6 +151,10 @@ mod tests {
         assert_eq!(
             ServerError::precondition_required("x").0,
             StatusCode::PRECONDITION_REQUIRED
+        );
+        assert_eq!(
+            ServerError::service_unavailable("x").0,
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

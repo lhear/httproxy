@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
+use uuid::Uuid;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +20,7 @@ pub enum StreamQueryResult {
 pub struct StreamConsumedError;
 
 pub struct StreamRegistry {
-    streams: DashMap<String, (AtomicU8, u64)>,
+    streams: DashMap<Uuid, (AtomicU8, u64)>,
 }
 
 impl StreamRegistry {
@@ -29,8 +30,8 @@ impl StreamRegistry {
         }
     }
 
-    pub fn register(&self, stream_id: &str, now_secs: u64) -> bool {
-        match self.streams.entry(stream_id.to_owned()) {
+    pub fn register(&self, stream_id: Uuid, now_secs: u64) -> bool {
+        match self.streams.entry(stream_id) {
             dashmap::Entry::Occupied(_) => false,
             dashmap::Entry::Vacant(entry) => {
                 entry.insert((AtomicU8::new(StreamState::Active as u8), now_secs));
@@ -39,16 +40,16 @@ impl StreamRegistry {
         }
     }
 
-    pub fn mark_consumed(&self, stream_id: &str) {
-        if let Some(entry) = self.streams.get(stream_id) {
+    pub fn mark_consumed(&self, stream_id: Uuid) {
+        if let Some(entry) = self.streams.get(&stream_id) {
             entry
                 .0
                 .store(StreamState::Consumed as u8, Ordering::Release);
         }
     }
 
-    pub fn check(&self, stream_id: &str) -> StreamQueryResult {
-        match self.streams.get(stream_id) {
+    pub fn check(&self, stream_id: Uuid) -> StreamQueryResult {
+        match self.streams.get(&stream_id) {
             None => StreamQueryResult::Fresh,
             Some(entry) => match entry.0.load(Ordering::Acquire) {
                 s if s == StreamState::Active as u8 => StreamQueryResult::Active,
@@ -90,64 +91,75 @@ mod tests {
         1_700_000_000
     }
 
+    fn ids() -> (Uuid, Uuid, Uuid) {
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())
+    }
+
     #[test]
     fn fresh_register_succeeds() {
         let reg = StreamRegistry::new();
-        assert!(reg.register("s1", dummy_ts()));
-        assert_eq!(reg.check("s1"), StreamQueryResult::Active);
+        let (s1, _, _) = ids();
+        assert!(reg.register(s1, dummy_ts()));
+        assert_eq!(reg.check(s1), StreamQueryResult::Active);
     }
 
     #[test]
     fn duplicate_register_rejected() {
         let reg = StreamRegistry::new();
-        assert!(reg.register("s1", dummy_ts()));
-        assert!(!reg.register("s1", dummy_ts()));
+        let (s1, _, _) = ids();
+        assert!(reg.register(s1, dummy_ts()));
+        assert!(!reg.register(s1, dummy_ts()));
     }
 
     #[test]
     fn consumed_stream_reports_consumed() {
         let reg = StreamRegistry::new();
-        reg.register("s1", dummy_ts());
-        reg.mark_consumed("s1");
-        assert_eq!(reg.check("s1"), StreamQueryResult::Consumed);
+        let (s1, _, _) = ids();
+        reg.register(s1, dummy_ts());
+        reg.mark_consumed(s1);
+        assert_eq!(reg.check(s1), StreamQueryResult::Consumed);
     }
 
     #[test]
     fn fresh_stream_returns_fresh() {
         let reg = StreamRegistry::new();
-        assert_eq!(reg.check("nonexistent"), StreamQueryResult::Fresh);
+        let (_, s2, _) = ids();
+        assert_eq!(reg.check(s2), StreamQueryResult::Fresh);
     }
 
     #[test]
     fn remove_consumed_before_removes_expired() {
         let reg = StreamRegistry::new();
-        reg.register("s1", 100);
-        reg.mark_consumed("s1");
-        reg.register("s2", 200);
+        let (s1, s2, _) = ids();
+        reg.register(s1, 100);
+        reg.mark_consumed(s1);
+        reg.register(s2, 200);
         let removed = reg.remove_consumed_before(150);
         assert!(removed >= 1);
-        assert_eq!(reg.check("s1"), StreamQueryResult::Fresh);
-        assert_eq!(reg.check("s2"), StreamQueryResult::Active);
+        assert_eq!(reg.check(s1), StreamQueryResult::Fresh);
+        assert_eq!(reg.check(s2), StreamQueryResult::Active);
     }
 
     #[test]
     fn remove_consumed_before_keeps_recent() {
         let reg = StreamRegistry::new();
-        reg.register("s1", 1000);
-        reg.mark_consumed("s1");
+        let (s1, _, _) = ids();
+        reg.register(s1, 1000);
+        reg.mark_consumed(s1);
         let removed = reg.remove_consumed_before(900);
         assert_eq!(removed, 0);
-        assert_eq!(reg.check("s1"), StreamQueryResult::Consumed);
+        assert_eq!(reg.check(s1), StreamQueryResult::Consumed);
     }
 
     #[test]
     fn concurrent_streams_independent() {
         let reg = StreamRegistry::new();
-        assert!(reg.register("s1", dummy_ts()));
-        assert!(reg.register("s2", dummy_ts()));
-        reg.mark_consumed("s1");
-        assert_eq!(reg.check("s1"), StreamQueryResult::Consumed);
-        assert_eq!(reg.check("s2"), StreamQueryResult::Active);
+        let (s1, s2, _) = ids();
+        assert!(reg.register(s1, dummy_ts()));
+        assert!(reg.register(s2, dummy_ts()));
+        reg.mark_consumed(s1);
+        assert_eq!(reg.check(s1), StreamQueryResult::Consumed);
+        assert_eq!(reg.check(s2), StreamQueryResult::Active);
     }
 
     #[tokio::test]
@@ -155,11 +167,11 @@ mod tests {
         let reg = Arc::new(StreamRegistry::new());
         let mut handles = Vec::new();
 
-        for i in 0..16u8 {
+        for _ in 0..16u8 {
             let reg = Arc::clone(&reg);
             handles.push(tokio::spawn(async move {
-                let id = format!("stream-{i}");
-                reg.register(&id, dummy_ts())
+                let id = Uuid::new_v4();
+                reg.register(id, dummy_ts())
             }));
         }
 
@@ -178,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_register_and_consume_race() {
         let reg = Arc::new(StreamRegistry::new());
-        let id = "race-stream";
+        let id = Uuid::new_v4();
 
         assert!(reg.register(id, dummy_ts()));
 

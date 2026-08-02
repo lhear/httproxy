@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::server::SessionHandle;
 use crate::server::constants::{
@@ -41,7 +42,7 @@ pub async fn master_and_stream_janitor(
     }
 }
 
-pub async fn stream_janitor(actors: Arc<DashMap<String, SessionHandle>>) {
+pub async fn stream_janitor(actors: Arc<DashMap<Uuid, SessionHandle>>) {
     let mut interval = tokio::time::interval(JANITOR_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

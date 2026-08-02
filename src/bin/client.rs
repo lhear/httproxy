@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::{Instrument, error_span, info, warn};
+use tokio::sync::Semaphore;
+use tracing::{Instrument, debug, error_span, info, warn};
 
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -54,11 +55,25 @@ async fn main() -> anyhow::Result<()> {
 
     info!(listen = %addr, "proxy listening");
 
+    let conn_sem = Arc::new(Semaphore::new(state.max_connections));
+
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 warn!(reason = %e, "accept failed");
+                continue;
+            }
+        };
+
+        let permit = match conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!(
+                    client = %peer,
+                    max_connections = state.max_connections,
+                    "connection rejected: admission limit reached"
+                );
                 continue;
             }
         };
@@ -70,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::spawn(
             async move {
+                let _permit = permit;
                 if let Err(e) = httproxy::client::connection::handle_connection_actor(
                     socket,
                     http_client,

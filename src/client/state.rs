@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use crate::bypass::BypassRules;
 use crate::client::constants::MASTER_RESUME_WINDOW_SECS;
 use crate::client::handshake::{self, PqSessionTicket};
-use crate::shaper::TrafficConfig;
+use crate::shaper::{ResolvedShaperConfig, TrafficConfig};
 
 pub type InitialMasterEntry = (String, Zeroizing<[u8; 32]>, u64);
 
@@ -41,12 +41,16 @@ pub struct SharedState {
     pub remote_str: String,
     pub auth_header: String,
     pub traffic_config: TrafficConfig,
+    pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub bypass: Option<Arc<BypassRules>>,
     pub server_public_key: Option<x25519_dalek::PublicKey>,
     pub proxy_auth: Option<(String, String)>,
     pub initial_master: Mutex<Option<InitialMasterEntry>>,
     pub handshake_lock: Mutex<()>,
     pub max_download_bytes: Option<u64>,
+    pub max_connections: usize,
+    pub max_in_flight_bytes: usize,
+    pub upload_concurrency: usize,
 }
 
 pub struct Resuming {

@@ -19,9 +19,9 @@ pub(crate) async fn handle_plain_proxy(
     payload: Bytes,
     target_host: &str,
 ) -> Result<()> {
-    let stream_id = uuid::Uuid::new_v4().to_string();
+    let stream_id = uuid::Uuid::new_v4();
     let mut cookie = String::new();
-    utils::build_stream_cookie(&mut cookie, &stream_id);
+    utils::build_stream_cookie(&mut cookie, stream_id);
 
     let (early_data, remaining_payload, frames_sent) = utils::encode_initial_payload(
         &payload,
@@ -54,7 +54,7 @@ pub(crate) async fn handle_plain_proxy(
         remaining_payload,
         read_half,
         None,
-        stream_id.clone(),
+        stream_id,
         frames_sent,
     );
     let upload_task =
