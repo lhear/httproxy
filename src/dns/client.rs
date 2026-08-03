@@ -58,7 +58,7 @@ pub struct DnsClient {
 impl DnsClient {
     pub async fn new(config: &DnsConfig) -> Result<Self> {
         let transport = match config.options.protocol {
-            Protocol::Udp => Transport::Udp(UdpTransport::new(config.upstream).await?),
+            Protocol::Udp => Transport::Udp(UdpTransport::new(config.upstream)),
             Protocol::Dot => Transport::Dot(init_dot_transport(config)?),
         };
         Ok(Self {
@@ -164,7 +164,7 @@ impl DnsClient {
             Transport::Dot(dot) => dot.send(&mut query).await?,
         };
 
-        self.parse_response(&resp, id, rtype)
+        self.parse_response(&resp, id, rtype, domain)
     }
 
     fn build_query(
@@ -207,6 +207,7 @@ impl DnsClient {
         data: &[u8],
         id: u16,
         qtype: Rtype,
+        domain: &str,
     ) -> Result<(Vec<IpAddr>, Duration)> {
         let msg = Message::from_octets(data).map_err(|_| anyhow!("invalid DNS response"))?;
         if msg.header().id() != id {
@@ -214,6 +215,19 @@ impl DnsClient {
                 "DNS ID mismatch: expected {}, got {}",
                 id,
                 msg.header().id()
+            ));
+        }
+        let question = msg
+            .sole_question()
+            .map_err(|_| anyhow!("DNS response question missing or malformed"))?;
+        let name_matches = question
+            .qname()
+            .to_string()
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(domain.trim_end_matches('.'));
+        if question.qtype() != qtype || !name_matches {
+            return Err(anyhow!(
+                "DNS response question does not match query for {domain}"
             ));
         }
         if msg.header().tc() {
@@ -429,16 +443,36 @@ mod tests {
     use std::net::Ipv4Addr;
 
     fn make_response(id: u16, tc: bool, rcode: Rcode, ttl: u32, a_ips: &[Ipv4Addr]) -> Vec<u8> {
+        make_response_for(id, tc, rcode, ttl, a_ips, "example.com", Rtype::A)
+    }
+
+    fn make_response_for(
+        id: u16,
+        tc: bool,
+        rcode: Rcode,
+        ttl: u32,
+        a_ips: &[Ipv4Addr],
+        qname: &str,
+        qtype: Rtype,
+    ) -> Vec<u8> {
         let mut builder = MessageBuilder::new_vec();
         builder.header_mut().set_id(id);
         builder.header_mut().set_rcode(rcode);
         if tc {
             builder.header_mut().set_tc(true);
         }
-        let mut answer = builder.answer();
+        let mut question = builder.question();
+        question
+            .push(Question::new(
+                Name::<Vec<u8>>::from_str(qname).unwrap(),
+                qtype,
+                Class::IN,
+            ))
+            .unwrap();
+        let mut answer = question.answer();
         for ip in a_ips {
             let rec = Record::new(
-                Name::<Vec<u8>>::from_str("example.com").unwrap(),
+                Name::<Vec<u8>>::from_str(qname).unwrap(),
                 Class::IN,
                 Ttl::from_secs(ttl),
                 A::new(*ip),
@@ -461,7 +495,9 @@ mod tests {
     async fn parse_response_accepts_valid_a_record() {
         let c = test_client().await;
         let bytes = make_response(1, false, Rcode::NOERROR, 120, &[Ipv4Addr::new(1, 2, 3, 4)]);
-        let (ips, ttl) = c.parse_response(&bytes, 1, Rtype::A).unwrap();
+        let (ips, ttl) = c
+            .parse_response(&bytes, 1, Rtype::A, "example.com")
+            .unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
         assert_eq!(ttl.as_secs(), 120);
     }
@@ -470,21 +506,29 @@ mod tests {
     async fn parse_response_rejects_truncated() {
         let c = test_client().await;
         let bytes = make_response(2, true, Rcode::NOERROR, 120, &[]);
-        assert!(c.parse_response(&bytes, 2, Rtype::A).is_err());
+        assert!(
+            c.parse_response(&bytes, 2, Rtype::A, "example.com")
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn parse_response_rejects_id_mismatch() {
         let c = test_client().await;
         let bytes = make_response(3, false, Rcode::NOERROR, 120, &[]);
-        assert!(c.parse_response(&bytes, 99, Rtype::A).is_err());
+        assert!(
+            c.parse_response(&bytes, 99, Rtype::A, "example.com")
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn parse_response_nxdomain_returns_empty_with_empty_ttl() {
         let c = test_client().await;
         let bytes = make_response(4, false, Rcode::NXDOMAIN, 120, &[]);
-        let (ips, ttl) = c.parse_response(&bytes, 4, Rtype::A).unwrap();
+        let (ips, ttl) = c
+            .parse_response(&bytes, 4, Rtype::A, "example.com")
+            .unwrap();
         assert!(ips.is_empty());
         assert_eq!(ttl.as_secs(), c.config.options.empty_ttl);
     }
@@ -493,14 +537,19 @@ mod tests {
     async fn parse_response_rejects_error_rcode() {
         let c = test_client().await;
         let bytes = make_response(5, false, Rcode::SERVFAIL, 120, &[]);
-        assert!(c.parse_response(&bytes, 5, Rtype::A).is_err());
+        assert!(
+            c.parse_response(&bytes, 5, Rtype::A, "example.com")
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn parse_response_clamps_ttl() {
         let c = test_client().await;
         let bytes = make_response(6, false, Rcode::NOERROR, 10, &[Ipv4Addr::new(9, 9, 9, 9)]);
-        let (_, ttl) = c.parse_response(&bytes, 6, Rtype::A).unwrap();
+        let (_, ttl) = c
+            .parse_response(&bytes, 6, Rtype::A, "example.com")
+            .unwrap();
         assert_eq!(ttl.as_secs(), c.config.options.min_ttl);
         let bytes = make_response(
             7,
@@ -509,7 +558,9 @@ mod tests {
             999_999,
             &[Ipv4Addr::new(9, 9, 9, 9)],
         );
-        let (_, ttl) = c.parse_response(&bytes, 7, Rtype::A).unwrap();
+        let (_, ttl) = c
+            .parse_response(&bytes, 7, Rtype::A, "example.com")
+            .unwrap();
         assert_eq!(ttl.as_secs(), c.config.options.max_ttl);
     }
 
@@ -526,11 +577,71 @@ mod tests {
         };
         let c = DnsClient::new(&cfg).await.unwrap();
         let bytes = make_response(8, false, Rcode::NOERROR, 60, &[Ipv4Addr::new(9, 9, 9, 9)]);
-        let (_, ttl) = c.parse_response(&bytes, 8, Rtype::A).unwrap();
+        let (_, ttl) = c
+            .parse_response(&bytes, 8, Rtype::A, "example.com")
+            .unwrap();
         assert_eq!(
             ttl.as_secs(),
             100,
             "inverted bounds must not panic and clamp to max"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_response_rejects_question_name_mismatch() {
+        let c = test_client().await;
+        let bytes = make_response_for(
+            9,
+            false,
+            Rcode::NOERROR,
+            120,
+            &[Ipv4Addr::new(1, 2, 3, 4)],
+            "evil.com",
+            Rtype::A,
+        );
+        assert!(
+            c.parse_response(&bytes, 9, Rtype::A, "example.com")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_response_rejects_question_type_mismatch() {
+        let c = test_client().await;
+        let bytes = make_response_for(
+            10,
+            false,
+            Rcode::NOERROR,
+            120,
+            &[Ipv4Addr::new(1, 2, 3, 4)],
+            "example.com",
+            Rtype::AAAA,
+        );
+        assert!(
+            c.parse_response(&bytes, 10, Rtype::A, "example.com")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_response_rejects_missing_question() {
+        let c = test_client().await;
+        let mut builder = MessageBuilder::new_vec();
+        builder.header_mut().set_id(11);
+        builder.header_mut().set_rcode(Rcode::NOERROR);
+        let mut answer = builder.answer();
+        answer
+            .push(Record::new(
+                Name::<Vec<u8>>::from_str("example.com").unwrap(),
+                Class::IN,
+                Ttl::from_secs(120),
+                A::new(Ipv4Addr::new(1, 2, 3, 4)),
+            ))
+            .unwrap();
+        let bytes = answer.into_message().into_octets();
+        assert!(
+            c.parse_response(&bytes, 11, Rtype::A, "example.com")
+                .is_err()
         );
     }
 
@@ -581,7 +692,15 @@ mod tests {
         let mut builder = MessageBuilder::new_vec();
         builder.header_mut().set_id(10);
         builder.header_mut().set_rcode(Rcode::NOERROR);
-        let mut answer = builder.answer();
+        let mut question = builder.question();
+        question
+            .push(Question::new(
+                Name::<Vec<u8>>::from_str("example.com").unwrap(),
+                Rtype::AAAA,
+                Class::IN,
+            ))
+            .unwrap();
+        let mut answer = question.answer();
         let v6 = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let rec = Record::new(
             Name::<Vec<u8>>::from_str("example.com").unwrap(),
@@ -591,7 +710,9 @@ mod tests {
         );
         answer.push(rec).unwrap();
         let bytes = answer.into_message().into_octets();
-        let (ips, ttl) = c.parse_response(&bytes, 10, Rtype::AAAA).unwrap();
+        let (ips, ttl) = c
+            .parse_response(&bytes, 10, Rtype::AAAA, "example.com")
+            .unwrap();
         assert_eq!(ips, vec![IpAddr::V6(v6)]);
         assert_eq!(ttl.as_secs(), 300);
     }

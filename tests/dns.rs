@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
-fn extract_domain(query: &[u8], mut offset: usize) -> Option<String> {
+fn extract_question(query: &[u8], mut offset: usize) -> Option<(String, u16)> {
     let mut labels = Vec::new();
     loop {
         let len = *query.get(offset)? as usize;
@@ -21,15 +21,16 @@ fn extract_domain(query: &[u8], mut offset: usize) -> Option<String> {
         labels.push(label.to_string());
         offset += len;
     }
-    Some(labels.join("."))
+    let qtype = u16::from_be_bytes([*query.get(offset)?, *query.get(offset + 1)?]);
+    Some((labels.join("."), qtype))
 }
 
 async fn spawn_mock_dns(
     records: HashMap<String, IpAddr>,
     query_count: Arc<AtomicUsize>,
 ) -> std::net::SocketAddr {
-    use domain::base::iana::{Class, Rcode};
-    use domain::base::{MessageBuilder, Name, Record, Ttl};
+    use domain::base::iana::{Class, Rcode, Rtype};
+    use domain::base::{MessageBuilder, Name, Question, Record, Ttl};
     use domain::rdata::{A, Aaaa};
     use std::str::FromStr;
 
@@ -47,7 +48,8 @@ async fn spawn_mock_dns(
             }
             query_count.fetch_add(1, Ordering::Relaxed);
             let id = u16::from_be_bytes([query[0], query[1]]);
-            let domain = extract_domain(query, 12).unwrap_or_default();
+            let (domain, qtype_int) = extract_question(query, 12).unwrap_or_default();
+            let qtype = Rtype::from_int(qtype_int);
             let mut builder = MessageBuilder::new_vec();
             builder.header_mut().set_id(id);
             if records.contains_key(&domain) {
@@ -56,17 +58,19 @@ async fn spawn_mock_dns(
                 builder.header_mut().set_rcode(Rcode::NXDOMAIN);
             }
             let name = Name::<Vec<u8>>::from_str(&domain).unwrap_or_else(|_| Name::root());
-            let mut answer = builder.answer();
+            let mut question = builder.question();
+            let _ = question.push(Question::new(name.clone(), qtype, Class::IN));
+            let mut answer = question.answer();
             if let Some(ip) = records.get(&domain) {
                 let _ = match ip {
                     IpAddr::V4(v4) => answer.push(Record::new(
-                        name,
+                        name.clone(),
                         Class::IN,
                         Ttl::from_secs(60),
                         A::new(*v4),
                     )),
                     IpAddr::V6(v6) => answer.push(Record::new(
-                        name,
+                        name.clone(),
                         Class::IN,
                         Ttl::from_secs(60),
                         Aaaa::new(*v6),
