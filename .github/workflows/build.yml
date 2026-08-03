@@ -21,7 +21,7 @@ jobs:
 
   test:
     needs: lint-audit
-    name: cargo test --lib
+    name: cargo test (unit + integration)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -29,8 +29,14 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           key: test-ubuntu
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint with clippy
+        run: cargo clippy --all-targets -- -D warnings
       - name: Run unit tests
         run: cargo test --lib
+      - name: Run integration tests
+        run: cargo test --test bypass --test dns --test encrypted_tunnel --test plain_tunnel --test rotation
 
   linux-gnu:
     needs: [lint-audit, test]
