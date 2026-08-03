@@ -6,16 +6,16 @@ use ml_kem::{
     Ciphertext, DecapsulationKey, EncapsulationKey, MlKem768,
     kem::{Decapsulate, Encapsulate},
 };
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 const X25519_KEY_LEN: usize = 32;
 const X25519_B64_LEN: usize = 43;
 
 #[inline]
-pub fn generate_keypair() -> (StaticSecret, X25519PublicKey) {
+pub fn generate_keypair() -> (StaticSecret, PublicKey) {
     let secret = StaticSecret::random();
-    let public = X25519PublicKey::from(&secret);
+    let public = PublicKey::from(&secret);
     (secret, public)
 }
 
@@ -38,7 +38,7 @@ fn decode_fixed_32(s: &str) -> Result<[u8; X25519_KEY_LEN]> {
 }
 
 #[inline]
-pub fn public_key_to_b64(pk: &X25519PublicKey) -> String {
+pub fn public_key_to_b64(pk: &PublicKey) -> String {
     encode_fixed_32(pk.as_bytes())
 }
 
@@ -48,8 +48,8 @@ pub fn private_key_to_b64(sk: &StaticSecret) -> String {
 }
 
 #[inline]
-pub fn b64_to_public_key(s: &str) -> Result<X25519PublicKey> {
-    Ok(X25519PublicKey::from(decode_fixed_32(s)?))
+pub fn b64_to_public_key(s: &str) -> Result<PublicKey> {
+    Ok(PublicKey::from(decode_fixed_32(s)?))
 }
 
 #[inline]
@@ -58,7 +58,7 @@ pub fn b64_to_private_key(s: &str) -> Result<StaticSecret> {
 }
 
 #[inline]
-pub fn diffie_hellman(our_sk: &StaticSecret, their_pk: &X25519PublicKey) -> Zeroizing<[u8; 32]> {
+pub fn diffie_hellman(our_sk: &StaticSecret, their_pk: &PublicKey) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(*our_sk.diffie_hellman(their_pk).as_bytes())
 }
 

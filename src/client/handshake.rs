@@ -142,7 +142,6 @@ pub async fn perform_pq_handshake(
     info!("PQ handshake initiated");
 
     let (eph_sk_a, eph_pk_a) = crypto::generate_keypair();
-    let eph_sk_a = Zeroizing::new(eph_sk_a);
     let x25519_shared_a = crypto::diffie_hellman(&eph_sk_a, server_pk);
     let handshake_key = crypto::derive_handshake_key(&x25519_shared_a);
     let handshake_cipher = AesFrameCipher::new(&handshake_key);
@@ -151,7 +150,6 @@ pub async fn perform_pq_handshake(
     let kem_pk_bytes = kem_pk.to_bytes();
 
     let (eph_sk_b, eph_pk_b) = crypto::generate_keypair();
-    let eph_sk_b = Zeroizing::new(eph_sk_b);
     let eph_pk_b_bytes = eph_pk_b.to_bytes().to_vec();
 
     let mut client_hello = Vec::with_capacity(2 + kem_pk_bytes.len() + 2 + eph_pk_b_bytes.len());

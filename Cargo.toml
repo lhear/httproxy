@@ -19,44 +19,44 @@ panic = "abort"
 strip = true
 
 [dependencies]
-aes-gcm = "0.10.3"
-anyhow = "1.0"
+aes-gcm = "0.11.0"
+anyhow = "1.0.104"
 axum = {version = "0.8.9", features = ["http2", "macros"]}
 base122-fast = "0.1.4"
-base64 = "0.22.1"
-bytes = "1.11"
-clap = {version = "4.6.1", features = ["derive"]}
+base64 = "0.23.0"
+bytes = "1.12.1"
+clap = {version = "4.6.5", features = ["derive"]}
 crypto-common = "0.2.2"
 dashmap = "6.2.1"
-domain = "0.12.1"
+domain = "0.12.2"
 fst = "0.4.7"
-futures = "0.3"
-h2 = "0.4.14"
+futures = "0.3.33"
+h2 = "0.4.15"
 hkdf = "0.13.0"
-http = "1.4.1"
-http-body-util = "0.1"
+http = "1.5.0"
+http-body-util = "0.1.4"
 httparse = "1.10"
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
-jsonwebtoken = {version = "10.4", features = ["aws_lc_rs"]}
-memchr = "2.8.1"
+jsonwebtoken = {version = "11.0.0", features = ["aws_lc_rs"]}
+memchr = "2.8.3"
 ml-kem = {version = "0.3.2", features = ["zeroize"]}
 moka = {version = "0.12", features = ["future"]}
 pin-project-lite = "0.2"
-rand = "0.10"
+rand = "0.10.2"
 rand_distr = "0.6"
-rustls = "0.23.40"
-serde = {version = "1.0", features = ["derive"]}
-serde_json = "1.0.150"
+rustls = "0.23.43"
+serde = {version = "1.0.229", features = ["derive"]}
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 singleflight-async = "0.2"
-tokio = {version = "1.52.3", features = ["rt-multi-thread", "test-util"]}
+tokio = {version = "1.53.1", features = ["rt-multi-thread", "test-util"]}
 tokio-rustls = "0.26"
 tokio-socks = "0.5.3"
-tokio-stream = {version = "0.1", features = ["net"]}
-toml = "1.1"
+tokio-stream = {version = "0.1.19", features = ["net"]}
+toml = "1.1.4"
 tower = "0.5"
-tower-http = {version = "0.6.11", features = ["trace"]}
+tower-http = {version = "0.7.0", features = ["trace"]}
 tracing = "0.1"
 tracing-appender = "0.2.5"
 tracing-subscriber = {version = "0.3", features = [
@@ -65,16 +65,16 @@ tracing-subscriber = {version = "0.3", features = [
   "json",
 ]}
 url = "2.5"
-uuid = "1.23.2"
-webpki-roots = "1.0.7"
+uuid = "1.24.0"
+webpki-roots = "1.0.9"
 wreq = "6.0.0-rc.29"
 wreq-util = "3.0.0-rc.12"
-x25519-dalek = {version = "2.0", features = ["static_secrets", "getrandom"]}
-zeroize = "1.8.2"
+x25519-dalek = {version = "3.0.0", features = ["static_secrets", "getrandom", "zeroize"]}
+zeroize = "1.9.0"
 
 [dev-dependencies]
 axum = {version = "0.8.9", features = ["http2", "macros"]}
-jsonwebtoken = {version = "10.4", features = ["aws_lc_rs"]}
+jsonwebtoken = {version = "11.0.0", features = ["aws_lc_rs"]}
 serde_json = "1.0.150"
 tokio = {version = "1.52.3", features = ["full"]}
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
