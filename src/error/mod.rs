@@ -72,6 +72,10 @@ impl ServerError {
         Self(StatusCode::GATEWAY_TIMEOUT, msg.into())
     }
     #[inline]
+    pub fn request_timeout(msg: impl Into<String>) -> Self {
+        Self(StatusCode::REQUEST_TIMEOUT, msg.into())
+    }
+    #[inline]
     pub fn unauthorized(msg: impl Into<String>) -> Self {
         Self(StatusCode::UNAUTHORIZED, msg.into())
     }
@@ -137,6 +141,10 @@ mod tests {
         assert_eq!(
             ServerError::gateway_timeout("x").0,
             StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            ServerError::request_timeout("x").0,
+            StatusCode::REQUEST_TIMEOUT
         );
         assert_eq!(ServerError::unauthorized("x").0, StatusCode::UNAUTHORIZED);
         assert_eq!(ServerError::not_found("x").0, StatusCode::NOT_FOUND);

@@ -14,8 +14,8 @@ use crate::error::ServerError;
 use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::connection::connect_upstream;
 use crate::server::constants::{
-    CONNECT_TIMEOUT, DOWNLOAD_CHANNEL_CAPACITY, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE,
-    TUNNEL_CMD_CHANNEL_CAPACITY,
+    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, DOWNLOAD_CHANNEL_CAPACITY, MASTER_EXPIRY,
+    MAX_FRAME_BUF_SIZE, TUNNEL_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream::FrameDecoder;
 use crate::server::stream_registry::StreamQueryResult;
@@ -156,7 +156,11 @@ async fn setup_tunnel_response(
         MAX_FRAME_BUF_SIZE,
     );
 
-    while let Some(result) = decoder.next().await {
+    let body_deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
+    while let Some(result) = tokio::time::timeout_at(body_deadline, decoder.next())
+        .await
+        .map_err(|_| ServerError::request_timeout("request body read timed out"))?
+    {
         let (seq, data) =
             result.map_err(|e| ServerError::bad_request(format!("decode error: {e}")))?;
         upload_tx
@@ -339,7 +343,11 @@ async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response
     let mut max_seq: u64 = 0;
     let mut frame_count = 0;
 
-    while let Some(result) = decoder.next().await {
+    let body_deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
+    while let Some(result) = tokio::time::timeout_at(body_deadline, decoder.next())
+        .await
+        .map_err(|_| ServerError::request_timeout("request body read timed out"))?
+    {
         let (seq, data) =
             result.map_err(|e| ServerError::bad_request(format!("frame decode error: {e}")))?;
         max_seq = max_seq.max(seq);
@@ -560,9 +568,13 @@ async fn handle_fresh_handshake(
     let handshake_key = crypto::derive_handshake_key(&shared_a);
     let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
-    let body_bytes = axum::body::to_bytes(body, MAX_FRAME_BUF_SIZE)
-        .await
-        .map_err(|e| ServerError::payload_too_large(format!("request body error: {e}")))?;
+    let body_bytes = tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(body, MAX_FRAME_BUF_SIZE),
+    )
+    .await
+    .map_err(|_| ServerError::request_timeout("request body read timed out"))?
+    .map_err(|e| ServerError::payload_too_large(format!("request body error: {e}")))?;
 
     let mut buf = BytesMut::from(&body_bytes[..]);
     let Some((_seq, client_hello_data)) = shaper::decode_from_buffer(
