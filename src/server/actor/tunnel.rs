@@ -204,15 +204,15 @@ impl TunnelActor {
                     match returned {
                         Some(Some(s)) => {
                             self.shaper = Some(s);
-                            self.phase = Phase::Rotating;
+                    self.phase = Phase::Rotating;
                             rotation_timeout.as_mut().reset(Instant::now() + ROTATION_STALENESS);
                         }
                         Some(None) => {
                             self.shaper = None;
-                            self.phase = Phase::Draining;
+                    self.phase = Phase::Draining;
                         }
                         None => {
-                            self.phase = Phase::Draining;
+                    self.phase = Phase::Draining;
                         }
                     }
 
@@ -235,7 +235,12 @@ impl TunnelActor {
                 cmd = self.rx.recv() => {
                     self.last_activity.store(now_secs(), Ordering::Relaxed);
                     match cmd {
-                        Some(TunnelCmd::Shutdown) | None => break,
+                        Some(TunnelCmd::Shutdown) => {
+                            break;
+                        }
+                        None => {
+                            break;
+                        }
                         Some(cmd) => {
                             self.dispatch_cmd(cmd).await;
                         }
@@ -342,5 +347,237 @@ impl TunnelActor {
 impl Drop for TunnelActor {
     fn drop(&mut self) {
         self.consume_stream();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf, OwnedWriteHalf) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_stream = server.await.unwrap();
+        let (client_read, client_write) = client.into_split();
+        let (_server_read, server_write) = server_stream.into_split();
+        (client_read, client_write, server_write)
+    }
+
+    fn resolved_config() -> Arc<ResolvedShaperConfig> {
+        let cfg = TrafficConfig {
+            global: PaddingConfig {
+                padding_threshold: 0,
+                padding_range: [0, 0],
+            },
+            stages: vec![],
+            encoding_type: EncodingType::Binary,
+            max_download_bytes: None,
+        };
+        Arc::new(ResolvedShaperConfig::resolve(&cfg))
+    }
+
+    fn new_rotating_actor(
+        rx: mpsc::Receiver<TunnelCmd>,
+        download_tx: mpsc::Sender<std::io::Result<Bytes>>,
+    ) -> TunnelActor {
+        TunnelActor::new(
+            rx,
+            Some(download_tx),
+            Uuid::new_v4(),
+            Arc::new(StreamRegistry::new()),
+            Some(1000),
+            Arc::new(AtomicU64::new(crate::now_secs())),
+        )
+    }
+
+    #[tokio::test]
+    async fn continue_in_rotating_restarts_download() {
+        let (read_half, client_write, mut upstream_write) = tcp_pair().await;
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
+        let (dl_tx, mut dl_rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        let mut actor = new_rotating_actor(cmd_rx, dl_tx);
+        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        upstream_write.write_all(&[0u8; 2000]).await.unwrap();
+        assert!(dl_rx.recv().await.is_some());
+        assert!(dl_rx.recv().await.is_none());
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TunnelCmd::Continue { reply: reply_tx })
+            .await
+            .unwrap();
+        let mut new_rx = reply_rx
+            .await
+            .unwrap()
+            .expect("rotating continue must restart");
+        upstream_write.write_all(&[0u8; 500]).await.unwrap();
+        assert!(new_rx.recv().await.is_some());
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continue_during_active_segment_is_queued_and_served() {
+        let (read_half, client_write, mut upstream_write) = tcp_pair().await;
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
+        let (dl_tx, mut dl_rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        let mut actor = new_rotating_actor(cmd_rx, dl_tx);
+        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TunnelCmd::Continue { reply: reply_tx })
+            .await
+            .unwrap();
+        upstream_write.write_all(&[0u8; 2000]).await.unwrap();
+        let mut new_rx = reply_rx
+            .await
+            .unwrap()
+            .expect("queued continue must be served");
+        assert!(dl_rx.recv().await.is_some());
+        assert!(dl_rx.recv().await.is_none());
+        upstream_write.write_all(&[0u8; 500]).await.unwrap();
+        assert!(new_rx.recv().await.is_some());
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continue_in_direct_mode_returns_none() {
+        let (read_half, client_write, _upstream_write) = tcp_pair().await;
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
+        let mut actor = TunnelActor::new(
+            cmd_rx,
+            None,
+            Uuid::new_v4(),
+            Arc::new(StreamRegistry::new()),
+            None,
+            Arc::new(AtomicU64::new(crate::now_secs())),
+        );
+        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TunnelCmd::Continue { reply: reply_tx })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap().is_none());
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_continue_skips_segment_restart() {
+        let (read_half, client_write, mut upstream_write) = tcp_pair().await;
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
+        let (dl_tx, mut dl_rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        let mut actor = new_rotating_actor(cmd_rx, dl_tx);
+        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        cmd_tx
+            .send(TunnelCmd::Continue { reply: reply_tx })
+            .await
+            .unwrap();
+        drop(reply_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        upstream_write.write_all(&[0u8; 2000]).await.unwrap();
+
+        let (reply2_tx, reply2_rx) = oneshot::channel();
+        cmd_tx
+            .send(TunnelCmd::Continue { reply: reply2_tx })
+            .await
+            .unwrap();
+        let mut new_rx = reply2_rx
+            .await
+            .unwrap()
+            .expect("fresh continue must restart");
+        upstream_write.write_all(&[0u8; 500]).await.unwrap();
+        assert!(new_rx.recv().await.is_some());
+        assert!(dl_rx.recv().await.is_some());
+        assert!(dl_rx.recv().await.is_none());
+
+        drop(cmd_tx);
+        handle.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use crate::server::constants::ROTATION_STALENESS;
+    use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf, OwnedWriteHalf) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_stream = server.await.unwrap();
+        let (client_read, client_write) = client.into_split();
+        let (_server_read, server_write) = server_stream.into_split();
+        (client_read, client_write, server_write)
+    }
+
+    #[tokio::test]
+    async fn rotation_staleness_timeout_closes_tunnel() {
+        let (read_half, client_write, mut upstream_write) = tcp_pair().await;
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
+        let (dl_tx, mut dl_rx) = mpsc::channel::<std::io::Result<Bytes>>(2);
+        let cfg = TrafficConfig {
+            global: PaddingConfig {
+                padding_threshold: 0,
+                padding_range: [0, 0],
+            },
+            stages: vec![],
+            encoding_type: EncodingType::Binary,
+            max_download_bytes: None,
+        };
+        let mut actor = TunnelActor::new(
+            cmd_rx,
+            Some(dl_tx),
+            Uuid::new_v4(),
+            Arc::new(StreamRegistry::new()),
+            Some(1000),
+            Arc::new(AtomicU64::new(crate::now_secs())),
+        );
+        actor.on_upstream_connected(
+            read_half,
+            Some(client_write),
+            &Arc::new(ResolvedShaperConfig::resolve(&cfg)),
+            None,
+            0,
+        );
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        upstream_write.write_all(&[0u8; 2000]).await.unwrap();
+        assert!(dl_rx.recv().await.is_some());
+        assert!(dl_rx.recv().await.is_none());
+
+        tokio::time::pause();
+        tokio::time::advance(ROTATION_STALENESS + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+
+        let _ = cmd_tx.send(TunnelCmd::Shutdown).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("tunnel must close after rotation staleness")
+            .unwrap();
     }
 }

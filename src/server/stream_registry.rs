@@ -135,7 +135,7 @@ mod tests {
         reg.mark_consumed(s1);
         reg.register(s2, 200);
         let removed = reg.remove_consumed_before(150);
-        assert!(removed >= 1);
+        assert_eq!(removed, 1);
         assert_eq!(reg.check(s1), StreamQueryResult::Fresh);
         assert_eq!(reg.check(s2), StreamQueryResult::Active);
     }

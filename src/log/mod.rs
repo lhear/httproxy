@@ -95,3 +95,28 @@ fn build_file_writer(
         .buffered_lines_limit(NON_BLOCKING_BUFFER_LINES)
         .finish(file_appender)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_writer_creates_rotating_file() {
+        let dir = std::env::temp_dir().join(format!("httproxy_log_test_{}", std::process::id()));
+        let path = dir.join("app.log");
+        let (_, guard) = build_file_writer(path.to_str().unwrap(), 3);
+        assert!(dir.exists());
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_writer_without_stem_uses_fallback_name() {
+        let dir = std::env::temp_dir().join(format!("httproxy_log_nostem_{}", std::process::id()));
+        let path = dir.join("noext");
+        let (_, guard) = build_file_writer(path.to_str().unwrap(), 3);
+        assert!(dir.exists());
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

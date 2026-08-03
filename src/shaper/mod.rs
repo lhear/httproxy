@@ -1231,4 +1231,224 @@ mod tests {
         }
         assert_eq!(decoded, data);
     }
+
+    #[test]
+    fn encode_frame_rejects_oversized_payload() {
+        let big = vec![0u8; MAX_RAW_PAYLOAD + 1];
+        let r = encode_frame(&big, 0, None, 0, [0, 0], EncodingType::Binary);
+        assert!(r.is_err());
+        let r = encode_frame(&big, 0, None, 0, [0, 0], EncodingType::Json);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn encode_frame_json_padding_stays_within_line_limit() {
+        let raw = vec![0x42u8; 1000];
+        let frame = encode_frame(&raw, 0, None, 100_000, [0, 100_000], EncodingType::Json).unwrap();
+        let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
+        assert!(line_len <= MAX_JSON_LINE_LEN);
+    }
+
+    #[test]
+    fn encode_frame_json_cipher_padding_stays_within_line_limit() {
+        let raw = vec![0x42u8; 1000];
+        let key = zeroize::Zeroizing::new([0u8; 32]);
+        let cipher = crate::crypto::AesFrameCipher::new(&key);
+        let frame = encode_frame(
+            &raw,
+            0,
+            Some(&cipher),
+            100_000,
+            [0, 100_000],
+            EncodingType::Json,
+        )
+        .unwrap();
+        let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
+        assert!(line_len <= MAX_JSON_LINE_LEN);
+    }
+
+    #[tokio::test]
+    async fn poll_seal_into_eof_returns_none() {
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let cfg = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 0));
+        let mut out = BytesMut::new();
+        let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn poll_seal_into_respects_start_seq() {
+        let data = vec![0x55u8; 1000];
+        let reader = std::io::Cursor::new(data);
+        let cfg = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 42));
+        let mut out = BytesMut::new();
+        let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
+        assert!(matches!(result, Ok(Some(42))));
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let frame = decode_frame(
+            &mut out,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .expect("frame");
+        match frame {
+            DecodedFrame::Owned { seq, .. } => assert_eq!(seq, 42),
+            DecodedFrame::InScratch { seq, .. } => assert_eq!(seq, 42),
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_seal_into_pending_then_data() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
+        let cfg = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 0));
+        let mut out = BytesMut::new();
+
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(
+            matches!(
+                shaper.as_mut().poll_seal_into(&mut cx, &mut out),
+                Poll::Pending
+            ),
+            "empty duplex must yield Pending"
+        );
+
+        writer.write_all(&[0x33u8; READ_HIGH_WATER]).await.unwrap();
+        assert!(
+            matches!(
+                shaper.as_mut().poll_seal_into(&mut cx, &mut out),
+                Poll::Ready(Ok(Some(_)))
+            ),
+            "data arrival must produce a frame"
+        );
+        assert!(!out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stages_progress_and_fall_back_to_global() {
+        let cfg = TrafficConfig {
+            global: PaddingConfig {
+                padding_threshold: 10_000,
+                padding_range: [0, 0],
+            },
+            stages: vec![
+                StageConfig {
+                    count: Some(1),
+                    count_range: None,
+                    padding_threshold: 10_000,
+                    padding_range: [100, 100],
+                },
+                StageConfig {
+                    count: None,
+                    count_range: Some([2, 3]),
+                    padding_threshold: 10_000,
+                    padding_range: [200, 200],
+                },
+            ],
+            encoding_type: EncodingType::Binary,
+            max_download_bytes: None,
+        };
+        use tokio::io::AsyncWriteExt;
+        let resolved = ResolvedShaperConfig::resolve(&cfg);
+        let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
+        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &resolved, None, 0));
+        let mut out = BytesMut::new();
+        let mut sizes = Vec::new();
+        for _ in 0..4 {
+            writer.write_all(&[0x44u8; 1000]).await.unwrap();
+            std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+                .await
+                .unwrap();
+            sizes.push(out.len());
+            out.clear();
+        }
+        assert_eq!(sizes[0], 2 + 10 + 1000 + 100);
+        assert_eq!(sizes[1], 2 + 10 + 1000 + 200);
+        assert_eq!(sizes[2], 2 + 10 + 1000 + 200);
+        assert_eq!(sizes[3], 2 + 10 + 1000);
+    }
+
+    #[test]
+    fn decode_frame_json_rejects_malformed_lines() {
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut src = BytesMut::new();
+
+        src.extend_from_slice(
+            b"
+",
+        );
+        assert!(
+            decode_frame(
+                &mut src,
+                &mut scratch,
+                &mut json_scratch,
+                None,
+                EncodingType::Json
+            )
+            .is_err()
+        );
+
+        let mut long = BytesMut::new();
+        long.extend_from_slice(b"{\"data\":\"");
+        long.resize(MAX_JSON_LINE_LEN + 2, b'x');
+        assert!(
+            decode_frame(
+                &mut long,
+                &mut scratch,
+                &mut json_scratch,
+                None,
+                EncodingType::Json
+            )
+            .is_err()
+        );
+
+        let mut unclosed = BytesMut::new();
+        unclosed.extend_from_slice(b"{\"data\":\"abc");
+        unclosed.extend_from_slice(
+            b"
+",
+        );
+        assert!(
+            decode_frame(
+                &mut unclosed,
+                &mut scratch,
+                &mut json_scratch,
+                None,
+                EncodingType::Json
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_frame_json_rejects_invalid_utf8() {
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut src = BytesMut::new();
+        src.extend_from_slice(b"{\"data\":\"");
+        src.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        src.extend_from_slice(
+            b"\"}
+",
+        );
+        assert!(
+            decode_frame(
+                &mut src,
+                &mut scratch,
+                &mut json_scratch,
+                None,
+                EncodingType::Json
+            )
+            .is_err()
+        );
+    }
 }

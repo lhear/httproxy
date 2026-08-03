@@ -83,3 +83,60 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         upload_concurrency,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::constants::{MAX_IN_FLIGHT_BYTES, UPLOAD_CONCURRENCY};
+
+    fn minimal_client_cfg() -> crate::config::ClientTopConfig {
+        toml::from_str(
+            r#"
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://example.com/secret"
+
+[auth]
+token = "tok"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn build_state_rejects_tiny_in_flight() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.max_in_flight_bytes = Some(1024);
+        assert!(build_state(&cfg).is_err());
+    }
+
+    #[test]
+    fn build_state_rejects_zero_concurrency() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.upload_concurrency = Some(0);
+        assert!(build_state(&cfg).is_err());
+    }
+
+    #[test]
+    fn build_state_accepts_defaults() {
+        let cfg = minimal_client_cfg();
+        let state = build_state(&cfg).unwrap();
+        assert_eq!(state.max_in_flight_bytes, MAX_IN_FLIGHT_BYTES);
+        assert_eq!(state.upload_concurrency, UPLOAD_CONCURRENCY);
+        assert_eq!(state.max_connections, MAX_LOCAL_CONNECTIONS);
+    }
+
+    #[test]
+    fn build_state_accepts_bounded_config() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.max_in_flight_bytes = Some(256 * 1024);
+        cfg.client.upload_concurrency = Some(4);
+        let state = build_state(&cfg).unwrap();
+        assert_eq!(state.max_in_flight_bytes, 256 * 1024);
+        assert_eq!(state.upload_concurrency, 4);
+    }
+}

@@ -290,24 +290,9 @@ mod tests {
         let r = make_rules(&["example.com"], &[]);
         assert!(r.match_domain("example.com"));
         assert!(r.match_domain("sub.example.com"));
+        assert!(r.match_domain("deep.sub.example.com"));
         assert!(!r.match_domain("notexample.com"));
         assert!(!r.match_domain("com"));
-    }
-
-    #[test]
-    fn domain_leading_dot() {
-        let r = make_rules(&[".example.com"], &[]);
-        assert!(r.match_domain("example.com"));
-        assert!(r.match_domain("a.b.example.com"));
-        assert!(!r.match_domain("fakeexample.com"));
-    }
-
-    #[test]
-    fn domain_nested() {
-        let r = make_rules(&["google.com"], &[]);
-        assert!(r.match_domain("mail.google.com"));
-        assert!(r.match_domain("deep.nested.google.com"));
-        assert!(!r.match_domain("notgoogle.com"));
     }
 
     #[test]

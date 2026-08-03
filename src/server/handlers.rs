@@ -683,3 +683,144 @@ pub fn validate_jwt_if_needed(
             ServerError::unauthorized("invalid token")
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::http::StatusCode;
+
+    async fn test_state() -> Arc<AppState> {
+        let mut cfg = crate::config::ServerTopConfig {
+            server: crate::config::ServerSection {
+                listen: "127.0.0.1:0".to_string(),
+                path: "/secret".to_string(),
+                private_key: None,
+                max_tunnels: None,
+            },
+            auth: crate::config::AuthSection {
+                secret: "test-secret".to_string(),
+            },
+            proxy: None,
+            log: None,
+            dns: None,
+            traffic_shaping: crate::shaper::TrafficConfig {
+                global: crate::shaper::PaddingConfig {
+                    padding_threshold: 0,
+                    padding_range: [0, 0],
+                },
+                stages: vec![],
+                encoding_type: crate::shaper::EncodingType::Binary,
+                max_download_bytes: None,
+            },
+        };
+        crate::server::build_state(&mut cfg).await.unwrap()
+    }
+
+    fn valid_token() -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &crate::server::Claims {
+                sub: "user".to_string(),
+                exp: 4_102_444_800,
+            },
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_without_cookies_or_target() {
+        let state = test_state().await;
+        let err = dispatch(State(state), HeaderMap::new(), Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_malformed_stream_cookie() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", "stream=not-a-uuid".parse().unwrap());
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_unknown_stream() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("stream={}", Uuid::new_v4()).parse().unwrap(),
+        );
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_bad_jwt_with_target() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
+        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dispatch_bad_gateway_on_unreachable_target_with_valid_jwt() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", valid_token()).parse().unwrap(),
+        );
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_malformed_session_cookie() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", "session=abc".parse().unwrap());
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_expired_jwt_to_handshake_cookie_path() {
+        let state = test_state().await;
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &crate::server::Claims {
+                sub: "user".to_string(),
+                exp: 1,
+            },
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+}
