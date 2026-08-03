@@ -250,9 +250,9 @@ impl DnsClient {
         let ttl = if ips.is_empty() {
             Duration::from_secs(self.config.options.empty_ttl)
         } else {
-            Duration::from_secs(
-                (min_ttl as u64).clamp(self.config.options.min_ttl, self.config.options.max_ttl),
-            )
+            let lo = self.config.options.min_ttl.min(self.config.options.max_ttl);
+            let hi = self.config.options.min_ttl.max(self.config.options.max_ttl);
+            Duration::from_secs((min_ttl as u64).clamp(lo, hi))
         };
         Ok((ips, ttl))
     }
@@ -412,6 +412,13 @@ pub async fn init_dns(config: &mut DnsConfig) -> Result<Arc<DnsClient>> {
     if config.options.protocol == Protocol::Dot && config.tls_domain.is_none() {
         config.tls_domain = Some(config.upstream.ip().to_string());
     }
+    if config.options.min_ttl > config.options.max_ttl {
+        return Err(anyhow!(
+            "dns.options.min_ttl ({}) must not exceed max_ttl ({})",
+            config.options.min_ttl,
+            config.options.max_ttl
+        ));
+    }
     Ok(Arc::new(DnsClient::new(config).await?))
 }
 
@@ -504,6 +511,41 @@ mod tests {
         );
         let (_, ttl) = c.parse_response(&bytes, 7, Rtype::A).unwrap();
         assert_eq!(ttl.as_secs(), c.config.options.max_ttl);
+    }
+
+    #[tokio::test]
+    async fn parse_response_safe_when_ttl_bounds_inverted() {
+        let cfg = DnsConfig {
+            upstream: "127.0.0.1:1".parse().unwrap(),
+            tls_domain: None,
+            options: DnsOptions {
+                min_ttl: 5000,
+                max_ttl: 100,
+                ..DnsOptions::default()
+            },
+        };
+        let c = DnsClient::new(&cfg).await.unwrap();
+        let bytes = make_response(8, false, Rcode::NOERROR, 60, &[Ipv4Addr::new(9, 9, 9, 9)]);
+        let (_, ttl) = c.parse_response(&bytes, 8, Rtype::A).unwrap();
+        assert_eq!(
+            ttl.as_secs(),
+            100,
+            "inverted bounds must not panic and clamp to max"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_dns_rejects_inverted_ttl_bounds() {
+        let mut cfg = DnsConfig {
+            upstream: "127.0.0.1:1".parse().unwrap(),
+            tls_domain: None,
+            options: DnsOptions {
+                min_ttl: 5000,
+                max_ttl: 100,
+                ..DnsOptions::default()
+            },
+        };
+        assert!(init_dns(&mut cfg).await.is_err());
     }
 
     #[tokio::test]
