@@ -183,3 +183,210 @@ async fn handle_bypass_direct(
     info!(target = %target, "bypass connection closed");
     Ok(ClientConnState::Closed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bypass::{BypassRules, BypassRulesBuilder};
+    use crate::shaper::{EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Mutex;
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = TcpStream::connect(addr).await.unwrap();
+        (server.await.unwrap(), client)
+    }
+
+    fn test_state(
+        proxy_auth: Option<(String, String)>,
+        bypass: Option<Arc<BypassRules>>,
+    ) -> Arc<SharedState> {
+        let traffic = TrafficConfig {
+            global: PaddingConfig {
+                padding_threshold: 0,
+                padding_range: [0, 0],
+            },
+            stages: vec![],
+            encoding_type: EncodingType::Binary,
+            max_download_bytes: None,
+        };
+        Arc::new(SharedState {
+            remote_str: "http://127.0.0.1:1/".to_string(),
+            auth_header: "Bearer test".to_string(),
+            traffic_config: traffic.clone(),
+            resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
+            bypass,
+            server_public_key: None,
+            proxy_auth,
+            initial_master: Mutex::new(None),
+            handshake_lock: Mutex::new(()),
+            max_download_bytes: None,
+            max_connections: 8,
+            max_in_flight_bytes: 1024 * 1024,
+            upload_concurrency: 4,
+        })
+    }
+
+    fn bypass_loopback() -> Arc<BypassRules> {
+        let mut b = BypassRulesBuilder::new();
+        b.add_cidr("127.0.0.1/32").unwrap();
+        Arc::new(b.build().unwrap())
+    }
+
+    async fn spawn_echo() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn test_client() -> Arc<wreq::Client> {
+        Arc::new(wreq::Client::builder().no_proxy().build().unwrap())
+    }
+
+    #[tokio::test]
+    async fn auth_retry_on_same_connection() {
+        let echo = spawn_echo().await;
+        let (server_side, mut client) = tcp_pair().await;
+        let state = test_state(
+            Some(("Basic dXNlcjpwYXNz".to_string(), "user".to_string())),
+            Some(bypass_loopback()),
+        );
+        let http_client = test_client();
+        let actor = tokio::spawn(async move {
+            let mut actor = ClientConnectionActor::new(server_side, http_client, state);
+            actor.run().await
+        });
+
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{}/ HTTP/1.1\r\nHost: x\r\n\r\n",
+                    echo.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            head.starts_with("HTTP/1.1 407"),
+            "expected 407, got: {head}"
+        );
+
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{}/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+                    echo.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.unwrap();
+        let echoed_str = String::from_utf8_lossy(&echoed);
+        assert!(
+            echoed_str.contains("GET / "),
+            "expected rewritten request echoed, got: {echoed_str}"
+        );
+        assert!(echoed_str.contains("Host: x"));
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    }
+
+    #[tokio::test]
+    async fn connect_early_data_buffered_and_forwarded() {
+        let echo = spawn_echo().await;
+        let (server_side, mut client) = tcp_pair().await;
+        let state = test_state(None, Some(bypass_loopback()));
+        let http_client = test_client();
+        let actor = tokio::spawn(async move {
+            let mut actor = ClientConnectionActor::new(server_side, http_client, state);
+            actor.run().await
+        });
+
+        let req = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: x\r\n\r\n",
+            echo.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+            "expected 200"
+        );
+
+        client.write_all(b"early-data-bytes").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client.write_all(b"post-window-bytes").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.unwrap();
+        let echoed_str = String::from_utf8_lossy(&echoed);
+        assert!(
+            echoed_str.contains("early-data-bytes"),
+            "early data must be forwarded, got: {echoed_str}"
+        );
+        assert!(echoed_str.contains("post-window-bytes"));
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    }
+
+    #[tokio::test]
+    async fn request_parse_timeout_errors() {
+        tokio::time::pause();
+        let (server_side, mut client) = tcp_pair().await;
+        let state = test_state(None, None);
+        let http_client = test_client();
+        let actor = tokio::spawn(async move {
+            let mut actor = ClientConnectionActor::new(server_side, http_client, state);
+            actor.run().await
+        });
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(PROXY_REQUEST_PARSE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+
+        let res = tokio::time::timeout(Duration::from_secs(5), actor).await;
+        let joined = res
+            .expect("actor must finish after parse timeout")
+            .expect("actor task must not panic");
+        let err = joined.unwrap_err();
+        assert!(err.to_string().contains("parse timeout"), "got: {err}");
+    }
+}

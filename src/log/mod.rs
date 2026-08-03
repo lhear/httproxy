@@ -111,8 +111,8 @@ mod tests {
     }
 
     #[test]
-    fn file_writer_without_stem_uses_fallback_name() {
-        let dir = std::env::temp_dir().join(format!("httproxy_log_nostem_{}", std::process::id()));
+    fn file_writer_without_extension_uses_fallback_suffix() {
+        let dir = std::env::temp_dir().join(format!("httproxy_log_noext_{}", std::process::id()));
         let path = dir.join("noext");
         let (_, guard) = build_file_writer(path.to_str().unwrap(), 3);
         assert!(dir.exists());
