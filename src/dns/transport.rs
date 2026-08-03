@@ -16,7 +16,7 @@ use tokio_rustls::{
     client::TlsStream,
     rustls::{self, RootCertStore, pki_types::ServerName},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use super::config::DnsConfig;
 
@@ -42,70 +42,25 @@ async fn assign_id_and_register(
 }
 
 pub(super) struct UdpTransport {
-    socket: Arc<UdpSocket>,
-    pending: PendingMap,
-    recv_handle: tokio::task::AbortHandle,
-}
-
-impl Drop for UdpTransport {
-    fn drop(&mut self) {
-        self.recv_handle.abort();
-    }
+    upstream: SocketAddr,
 }
 
 impl UdpTransport {
-    pub(super) async fn new(upstream: SocketAddr) -> Result<Self> {
-        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-        socket.connect(upstream).await?;
-        let pending: PendingMap = Default::default();
-        let (rs, rp) = (socket.clone(), pending.clone());
-        let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            let mut consecutive_errors = 0u32;
-            loop {
-                match rs.recv(&mut buf).await {
-                    Ok(len) if len >= 2 => {
-                        consecutive_errors = 0;
-                        let id = u16::from_be_bytes([buf[0], buf[1]]);
-                        if let Some(tx) = rp.lock().await.remove(&id) {
-                            let _ = tx.send(Ok(buf[..len].to_vec()));
-                        }
-                    }
-                    Ok(_) => {
-                        consecutive_errors = 0;
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        error!(error = %e, consecutive_errors, "UDP recv error");
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
-                }
-            }
-        });
-        Ok(Self {
-            socket,
-            pending,
-            recv_handle: handle.abort_handle(),
-        })
+    pub(super) fn new(upstream: SocketAddr) -> Self {
+        Self { upstream }
     }
 
     pub(super) async fn send(&self, data: &mut [u8]) -> Result<(Vec<u8>, u16)> {
-        let (tx, rx) = oneshot::channel();
-        let id = assign_id_and_register(&self.pending, data, tx).await;
-
-        if let Err(e) = self.socket.send(data).await {
-            self.pending.lock().await.remove(&id);
-            return Err(anyhow!("UDP send failed: {}", e));
-        }
-
-        match timeout(Duration::from_secs(2), rx).await {
-            Ok(Ok(res)) => Ok((res?, id)),
-            Ok(Err(_)) => Err(anyhow!("UDP channel closed")),
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                Err(anyhow!("UDP upstream timeout"))
-            }
-        }
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect(self.upstream).await?;
+        let id: u16 = rand::random();
+        data[0..2].copy_from_slice(&id.to_be_bytes());
+        socket.send(data).await?;
+        let mut buf = vec![0u8; 65535];
+        let len = timeout(Duration::from_secs(2), socket.recv(&mut buf))
+            .await
+            .context("UDP upstream timeout")??;
+        Ok((buf[..len].to_vec(), id))
     }
 }
 
@@ -298,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn udp_transport_roundtrip() {
         let server_addr = spawn_udp_echo_server().await;
-        let t = UdpTransport::new(server_addr).await.unwrap();
+        let t = UdpTransport::new(server_addr);
         let mut query = [0u8; 12];
         query[12 - 12] = 0;
         let (resp, id) = t.send(&mut query).await.unwrap();
@@ -308,10 +263,9 @@ mod tests {
 
     #[tokio::test]
     async fn udp_transport_times_out_when_no_reply() {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap();
-        drop(sock);
-        let t = UdpTransport::new(addr).await.unwrap();
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = UdpTransport::new(addr);
         let mut query = [0u8; 12];
         let start = std::time::Instant::now();
         let r = t.send(&mut query).await;
