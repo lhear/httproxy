@@ -414,3 +414,188 @@ pub async fn init_dns(config: &mut DnsConfig) -> Result<Arc<DnsClient>> {
     }
     Ok(Arc::new(DnsClient::new(config).await?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::config::DnsOptions;
+    use std::net::Ipv4Addr;
+
+    fn make_response(id: u16, tc: bool, rcode: Rcode, ttl: u32, a_ips: &[Ipv4Addr]) -> Vec<u8> {
+        let mut builder = MessageBuilder::new_vec();
+        builder.header_mut().set_id(id);
+        builder.header_mut().set_rcode(rcode);
+        if tc {
+            builder.header_mut().set_tc(true);
+        }
+        let mut answer = builder.answer();
+        for ip in a_ips {
+            let rec = Record::new(
+                Name::<Vec<u8>>::from_str("example.com").unwrap(),
+                Class::IN,
+                Ttl::from_secs(ttl),
+                A::new(*ip),
+            );
+            answer.push(rec).unwrap();
+        }
+        answer.into_message().into_octets()
+    }
+
+    async fn test_client() -> DnsClient {
+        let cfg = DnsConfig {
+            upstream: "127.0.0.1:1".parse().unwrap(),
+            tls_domain: None,
+            options: DnsOptions::default(),
+        };
+        DnsClient::new(&cfg).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn parse_response_accepts_valid_a_record() {
+        let c = test_client().await;
+        let bytes = make_response(1, false, Rcode::NOERROR, 120, &[Ipv4Addr::new(1, 2, 3, 4)]);
+        let (ips, ttl) = c.parse_response(&bytes, 1, Rtype::A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        assert_eq!(ttl.as_secs(), 120);
+    }
+
+    #[tokio::test]
+    async fn parse_response_rejects_truncated() {
+        let c = test_client().await;
+        let bytes = make_response(2, true, Rcode::NOERROR, 120, &[]);
+        assert!(c.parse_response(&bytes, 2, Rtype::A).is_err());
+    }
+
+    #[tokio::test]
+    async fn parse_response_rejects_id_mismatch() {
+        let c = test_client().await;
+        let bytes = make_response(3, false, Rcode::NOERROR, 120, &[]);
+        assert!(c.parse_response(&bytes, 99, Rtype::A).is_err());
+    }
+
+    #[tokio::test]
+    async fn parse_response_nxdomain_returns_empty_with_empty_ttl() {
+        let c = test_client().await;
+        let bytes = make_response(4, false, Rcode::NXDOMAIN, 120, &[]);
+        let (ips, ttl) = c.parse_response(&bytes, 4, Rtype::A).unwrap();
+        assert!(ips.is_empty());
+        assert_eq!(ttl.as_secs(), c.config.options.empty_ttl);
+    }
+
+    #[tokio::test]
+    async fn parse_response_rejects_error_rcode() {
+        let c = test_client().await;
+        let bytes = make_response(5, false, Rcode::SERVFAIL, 120, &[]);
+        assert!(c.parse_response(&bytes, 5, Rtype::A).is_err());
+    }
+
+    #[tokio::test]
+    async fn parse_response_clamps_ttl() {
+        let c = test_client().await;
+        let bytes = make_response(6, false, Rcode::NOERROR, 10, &[Ipv4Addr::new(9, 9, 9, 9)]);
+        let (_, ttl) = c.parse_response(&bytes, 6, Rtype::A).unwrap();
+        assert_eq!(ttl.as_secs(), c.config.options.min_ttl);
+        let bytes = make_response(
+            7,
+            false,
+            Rcode::NOERROR,
+            999_999,
+            &[Ipv4Addr::new(9, 9, 9, 9)],
+        );
+        let (_, ttl) = c.parse_response(&bytes, 7, Rtype::A).unwrap();
+        assert_eq!(ttl.as_secs(), c.config.options.max_ttl);
+    }
+
+    #[tokio::test]
+    async fn build_query_writes_id_and_domain() {
+        let c = test_client().await;
+        let q = c
+            .build_query("example.com", Rtype::A, None, 0x1234)
+            .unwrap();
+        assert_eq!(q[0], 0x12);
+        assert_eq!(q[1], 0x34);
+        assert!(q.windows(7).any(|w| w == b"example"));
+        assert_eq!(q[2] & 0x01, 0x01, "RD flag must be set");
+    }
+
+    #[tokio::test]
+    async fn build_query_with_ecs_includes_opt_record() {
+        let c = test_client().await;
+        let plain = c.build_query("example.com", Rtype::A, None, 1).unwrap();
+        let with_ecs = c
+            .build_query(
+                "example.com",
+                Rtype::A,
+                Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+                1,
+            )
+            .unwrap();
+        assert!(with_ecs.len() > plain.len());
+    }
+
+    #[tokio::test]
+    async fn parse_response_extracts_aaaa_records() {
+        let c = test_client().await;
+        let mut builder = MessageBuilder::new_vec();
+        builder.header_mut().set_id(10);
+        builder.header_mut().set_rcode(Rcode::NOERROR);
+        let mut answer = builder.answer();
+        let v6 = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let rec = Record::new(
+            Name::<Vec<u8>>::from_str("example.com").unwrap(),
+            Class::IN,
+            Ttl::from_secs(300),
+            domain::rdata::Aaaa::new(v6),
+        );
+        answer.push(rec).unwrap();
+        let bytes = answer.into_message().into_octets();
+        let (ips, ttl) = c.parse_response(&bytes, 10, Rtype::AAAA).unwrap();
+        assert_eq!(ips, vec![IpAddr::V6(v6)]);
+        assert_eq!(ttl.as_secs(), 300);
+    }
+
+    #[tokio::test]
+    async fn interleave_prefers_ipv4_by_default() {
+        let c = test_client().await;
+        let v4 = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+        ];
+        let v6 = vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)];
+        let r = c.interleave_ips(v4.clone(), v6.clone());
+        assert_eq!(r, vec![v4[0], v6[0], v4[1]]);
+    }
+
+    #[tokio::test]
+    async fn interleave_prefers_ipv6_when_configured() {
+        let cfg = DnsConfig {
+            upstream: "127.0.0.1:1".parse().unwrap(),
+            tls_domain: None,
+            options: DnsOptions {
+                prefer_ipv6: true,
+                ..DnsOptions::default()
+            },
+        };
+        let c = DnsClient::new(&cfg).await.unwrap();
+        let v4 = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
+        let v6 = vec![
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ];
+        let r = c.interleave_ips(v4, v6.clone());
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0], v6[0]);
+    }
+
+    #[tokio::test]
+    async fn interleave_exhausts_one_side() {
+        let c = test_client().await;
+        let v4 = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
+        let v6 = vec![
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ];
+        let r = c.interleave_ips(v4, v6);
+        assert_eq!(r.len(), 3);
+    }
+}

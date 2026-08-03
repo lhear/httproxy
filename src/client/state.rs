@@ -200,10 +200,14 @@ impl ClientPqFsm {
     }
 }
 
+fn ticket_is_valid(created: u64, now: u64) -> bool {
+    now.saturating_sub(created) < MASTER_RESUME_WINDOW_SECS
+}
+
 async fn load_and_validate_ticket(state: &Arc<SharedState>) -> Option<PqSessionTicket> {
     let mut guard = state.initial_master.lock().await;
     let (session_id, master, created) = guard.as_ref()?;
-    if crate::now_secs().saturating_sub(*created) >= MASTER_RESUME_WINDOW_SECS {
+    if !ticket_is_valid(*created, crate::now_secs()) {
         *guard = None;
         return None;
     }
@@ -220,5 +224,85 @@ pub(super) async fn invalidate_stale_master(state: &Arc<SharedState>, rejected_s
     {
         warn!(session_id = %sid, "invalidating stale master key after 428");
         *guard = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+
+    fn shared_state() -> Arc<SharedState> {
+        let traffic = TrafficConfig {
+            global: PaddingConfig {
+                padding_threshold: 0,
+                padding_range: [0, 0],
+            },
+            stages: vec![],
+            encoding_type: EncodingType::Binary,
+            max_download_bytes: None,
+        };
+        Arc::new(SharedState {
+            remote_str: "http://x/".to_string(),
+            auth_header: "Bearer x".to_string(),
+            traffic_config: traffic.clone(),
+            resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
+            bypass: None,
+            server_public_key: None,
+            proxy_auth: None,
+            initial_master: Mutex::new(None),
+            handshake_lock: Mutex::new(()),
+            max_download_bytes: None,
+            max_connections: 10,
+            max_in_flight_bytes: 1024 * 1024,
+            upload_concurrency: 4,
+        })
+    }
+
+    #[tokio::test]
+    async fn load_ticket_returns_none_when_empty() {
+        let state = shared_state();
+        assert!(load_and_validate_ticket(&state).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_ticket_returns_some_when_fresh() {
+        let state = shared_state();
+        let master = zeroize::Zeroizing::new([7u8; 32]);
+        *state.initial_master.lock().await = Some(("sid-1".to_string(), master, crate::now_secs()));
+        let ticket = load_and_validate_ticket(&state)
+            .await
+            .expect("fresh ticket");
+        assert_eq!(ticket.session_id, "sid-1");
+        assert_eq!(*ticket.master, [7u8; 32]);
+    }
+
+    #[test]
+    fn ticket_is_valid_boundary() {
+        let now = 10_000u64;
+        assert!(ticket_is_valid(now, now));
+        assert!(ticket_is_valid(now - 1, now));
+        assert!(ticket_is_valid(now - MASTER_RESUME_WINDOW_SECS + 1, now));
+        assert!(!ticket_is_valid(now - MASTER_RESUME_WINDOW_SECS, now));
+        assert!(!ticket_is_valid(0, now));
+        assert!(ticket_is_valid(now + 100, now));
+    }
+
+    #[tokio::test]
+    async fn invalidate_matching_session_clears() {
+        let state = shared_state();
+        let master = zeroize::Zeroizing::new([7u8; 32]);
+        *state.initial_master.lock().await = Some(("sid-2".to_string(), master, crate::now_secs()));
+        invalidate_stale_master(&state, "sid-2").await;
+        assert!(state.initial_master.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidate_non_matching_session_keeps() {
+        let state = shared_state();
+        let master = zeroize::Zeroizing::new([7u8; 32]);
+        *state.initial_master.lock().await = Some(("sid-3".to_string(), master, crate::now_secs()));
+        invalidate_stale_master(&state, "other-sid").await;
+        assert!(state.initial_master.lock().await.is_some());
     }
 }

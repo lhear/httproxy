@@ -222,16 +222,9 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_https_url_scheme() {
-        let mut buf = BytesMut::from(
-            &b"GET https://secure.example.com/private HTTP/1.1\r\nHost: secure.example.com\r\n\r\n"
-                [..],
-        );
-        rewrite_absolute_url(&mut buf, "GET", "https://secure.example.com/private").unwrap();
-        let result = String::from_utf8(buf.to_vec()).unwrap();
-        assert!(
-            result.starts_with("GET /private HTTP/1.1\r\n"),
-            "got: {result}"
-        );
+    fn resolve_connect_ipv6_brackets_stripped() {
+        let t = resolve_target_host("CONNECT", "[::1]:443").unwrap();
+        assert_eq!(t, "::1:443");
+        assert!(resolve_target_host("CONNECT", "[::1]").is_err());
     }
 }

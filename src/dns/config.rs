@@ -55,3 +55,42 @@ pub enum Protocol {
     Udp,
     Dot,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_parsed_from_string() {
+        let cfg: DnsConfig = toml::from_str("upstream = \"8.8.8.8:53\"\n").unwrap();
+        assert_eq!(cfg.upstream, "8.8.8.8:53".parse::<SocketAddr>().unwrap());
+        assert!(cfg.tls_domain.is_none());
+    }
+
+    #[test]
+    fn defaults_applied() {
+        let cfg: DnsConfig = toml::from_str("upstream = \"8.8.8.8:53\"\n").unwrap();
+        assert_eq!(cfg.options.protocol, Protocol::Udp);
+        assert!(!cfg.options.prefer_ipv6);
+        assert_eq!(cfg.options.cache_size, 1024);
+        assert_eq!(cfg.options.min_ttl, 30);
+        assert_eq!(cfg.options.max_ttl, 3600);
+        assert_eq!(cfg.options.empty_ttl, 300);
+        assert_eq!(cfg.options.max_concurrent_queries, 1024);
+    }
+
+    #[test]
+    fn explicit_fields_override_defaults() {
+        let cfg: DnsConfig =
+            toml::from_str("upstream = \"1.1.1.1:853\"\nprotocol = \"dot\"\ncache_size = 64\n")
+                .unwrap();
+        assert_eq!(cfg.options.protocol, Protocol::Dot);
+        assert_eq!(cfg.options.cache_size, 64);
+    }
+
+    #[test]
+    fn invalid_upstream_rejected() {
+        let r: Result<DnsConfig, _> = toml::from_str("upstream = \"not-an-address\"\n");
+        assert!(r.is_err());
+    }
+}

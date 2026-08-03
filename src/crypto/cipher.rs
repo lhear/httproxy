@@ -201,4 +201,25 @@ mod tests {
         let key = random_key();
         assert!(decrypt_bytes(&key, b"too-short").is_err());
     }
+
+    #[test]
+    fn tampered_ciphertext_fails_decryption() {
+        let key = random_key();
+        let cipher = AesFrameCipher::new(&key);
+        let ct = cipher.encrypt(b"authenticated data").unwrap();
+        let mut tampered = ct.clone();
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0xFF;
+        assert!(cipher.decrypt(&tampered).is_err());
+    }
+
+    #[test]
+    fn wrong_key_fails_decryption() {
+        let key1 = random_key();
+        let key2 = random_key();
+        let c1 = AesFrameCipher::new(&key1);
+        let c2 = AesFrameCipher::new(&key2);
+        let ct = c1.encrypt(b"secret data").unwrap();
+        assert!(c2.decrypt(&ct).is_err());
+    }
 }

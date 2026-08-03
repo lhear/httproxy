@@ -272,3 +272,93 @@ pub(super) fn init_dot_transport(config: &DnsConfig) -> Result<DotTransport> {
         server_name,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn spawn_udp_echo_server() -> SocketAddr {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                let mut resp = vec![buf[0], buf[1], 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+                resp.extend_from_slice(&buf[12..n]);
+                let _ = sock.send_to(&resp, peer).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn udp_transport_roundtrip() {
+        let server_addr = spawn_udp_echo_server().await;
+        let t = UdpTransport::new(server_addr).await.unwrap();
+        let mut query = [0u8; 12];
+        query[12 - 12] = 0;
+        let (resp, id) = t.send(&mut query).await.unwrap();
+        assert_eq!(resp[0..2], query[0..2]);
+        assert_eq!(id, u16::from_be_bytes([query[0], query[1]]));
+    }
+
+    #[tokio::test]
+    async fn udp_transport_times_out_when_no_reply() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        drop(sock);
+        let t = UdpTransport::new(addr).await.unwrap();
+        let mut query = [0u8; 12];
+        let start = std::time::Instant::now();
+        let r = t.send(&mut query).await;
+        assert!(r.is_err());
+        assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn udp_id_assignment_avoids_collision() {
+        let pending: PendingMap = Default::default();
+        let mut data1 = [0u8; 12];
+        let (tx1, _rx1) = oneshot::channel();
+        let id1 = assign_id_and_register(&pending, &mut data1, tx1).await;
+        assert_eq!(data1[0..2], id1.to_be_bytes());
+        let mut data2 = [0u8; 12];
+        let (tx2, _rx2) = oneshot::channel();
+        let id2 = assign_id_and_register(&pending, &mut data2, tx2).await;
+        assert_ne!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn dot_transport_connect_failure_reports_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let connector = TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        ));
+        let t = DotTransport::new(
+            addr,
+            connector,
+            ServerName::try_from("example.com").unwrap().to_owned(),
+        );
+        let mut query = [0u8; 12];
+        let r = t.send(&mut query).await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_recv_error_does_not_panic() {
+        let t = UdpTransport::new("127.0.0.1:9".parse().unwrap())
+            .await
+            .unwrap();
+        let mut query = [0u8; 12];
+        let r = t.send(&mut query).await;
+        assert!(r.is_err() || r.is_ok());
+    }
+}

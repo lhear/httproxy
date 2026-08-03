@@ -67,7 +67,9 @@ impl UploadActor {
             tokio::select! {
                 cmd = self.rx.recv() => {
                     match cmd {
-                        Some(cmd) => { if self.dispatch(cmd).await { break; } }
+                        Some(cmd) => { if self.dispatch(cmd).await {
+                            break;
+                        } }
                         None => {
                             self.shutdown_and_drain().await;
                             break;
@@ -389,6 +391,151 @@ mod tests {
 
         drop(tx);
         assert!(ack_rx.await.unwrap().is_err());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_write_error_acks_eos_with_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_stream = server.await.unwrap();
+        drop(server_stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (_cr, write_half) = client.into_split();
+        let (tx, rx) = mpsc::channel::<UploadCmd>(16);
+        let actor = UploadActor::new(rx, write_half, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(UploadCmd::Eos {
+            max_seq: 2,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+        for seq in 0..3 {
+            tx.send(UploadCmd::Frame {
+                seq,
+                data: Bytes::from_static(b"hello"),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        assert!(ack_rx.await.unwrap().is_err());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reorder_buffer_overflow_aborts_upload() {
+        let (_rx, server_write) = tcp_pair().await;
+        let (tx, rx) = mpsc::channel::<UploadCmd>(16);
+        let actor = UploadActor::new(rx, server_write, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        let big = Bytes::from(vec![0u8; MAX_PENDING_BYTES + 1]);
+        tx.send(UploadCmd::Frame { seq: 1, data: big })
+            .await
+            .unwrap();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(UploadCmd::Eos {
+            max_seq: 1,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(ack_rx.await.is_err());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_and_duplicate_frames_discarded() {
+        let (_rx, server_write) = tcp_pair().await;
+        let (tx, rx) = mpsc::channel::<UploadCmd>(16);
+        let actor = UploadActor::new(rx, server_write, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        tx.send(UploadCmd::Frame {
+            seq: 0,
+            data: Bytes::from_static(b"a"),
+        })
+        .await
+        .unwrap();
+        tx.send(UploadCmd::Frame {
+            seq: 0,
+            data: Bytes::from_static(b"stale"),
+        })
+        .await
+        .unwrap();
+        tx.send(UploadCmd::Frame {
+            seq: 3,
+            data: Bytes::from_static(b"d"),
+        })
+        .await
+        .unwrap();
+        tx.send(UploadCmd::Frame {
+            seq: 3,
+            data: Bytes::from_static(b"dup"),
+        })
+        .await
+        .unwrap();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(UploadCmd::Eos {
+            max_seq: 3,
+            ack: ack_tx,
+        })
+        .await
+        .unwrap();
+        tx.send(UploadCmd::Frame {
+            seq: 1,
+            data: Bytes::from_static(b"b"),
+        })
+        .await
+        .unwrap();
+        tx.send(UploadCmd::Frame {
+            seq: 2,
+            data: Bytes::from_static(b"c"),
+        })
+        .await
+        .unwrap();
+        assert!(ack_rx.await.unwrap().is_ok());
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reorder_timeout_shuts_down_actor() {
+        tokio::time::pause();
+        let (_rx, server_write) = tcp_pair().await;
+        let (tx, rx) = mpsc::channel::<UploadCmd>(16);
+        let actor = UploadActor::new(rx, server_write, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        tx.send(UploadCmd::Frame {
+            seq: 5,
+            data: Bytes::from_static(b"gap"),
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(MAX_REORDER_SECS + 1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        let send_result = tx
+            .send(UploadCmd::Eos {
+                max_seq: 5,
+                ack: ack_tx,
+            })
+            .await;
+        assert!(send_result.is_err());
         handle.await.unwrap();
     }
 }

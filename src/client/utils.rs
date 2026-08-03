@@ -115,7 +115,19 @@ pub async fn race_upload_download<F: Future<Output = Result<()>>>(
 pub fn is_silent_error(root: &(dyn std::error::Error + 'static)) -> bool {
     use std::io::ErrorKind::*;
     if let Some(e) = root.downcast_ref::<h2::Error>() {
-        return e.is_reset() || e.is_library();
+        return e.is_reset()
+            || e.is_library()
+            || matches!(
+                e.reason(),
+                Some(
+                    h2::Reason::CANCEL
+                        | h2::Reason::REFUSED_STREAM
+                        | h2::Reason::ENHANCE_YOUR_CALM
+                        | h2::Reason::FLOW_CONTROL_ERROR
+                        | h2::Reason::STREAM_CLOSED
+                        | h2::Reason::INTERNAL_ERROR
+                )
+            );
     }
     if let Some(e) = root.downcast_ref::<std::io::Error>() {
         return matches!(
@@ -179,5 +191,57 @@ mod tests {
     fn is_not_silent_other() {
         let e = std::io::Error::other("other");
         assert!(!is_silent_error(&e));
+    }
+
+    #[test]
+    fn encode_initial_payload_json_chunks_roundtrip() {
+        use crate::shaper::{
+            DecodedFrame, EncodingType, PaddingConfig, TrafficConfig, decode_frame,
+        };
+        use bytes::BytesMut;
+        let cfg = TrafficConfig {
+            global: PaddingConfig {
+                padding_threshold: 0,
+                padding_range: [0, 0],
+            },
+            stages: vec![],
+            encoding_type: EncodingType::Json,
+            max_download_bytes: None,
+        };
+        let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+        let (body, remaining, seq) = encode_initial_payload(&data, usize::MAX, None, &cfg).unwrap();
+        assert!(remaining.is_empty());
+        let mut src = BytesMut::from(&body[..]);
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut decoded = Vec::new();
+        let mut count = 0u64;
+        while let Some(frame) = decode_frame(
+            &mut src,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Json,
+        )
+        .unwrap()
+        {
+            match frame {
+                DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
+                DecodedFrame::InScratch { start, end, .. } => {
+                    decoded.extend_from_slice(&scratch[start..end])
+                }
+            }
+            count += 1;
+        }
+        assert_eq!(count, seq);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn h2_reset_error_is_silent() {
+        let e = h2::Error::from(h2::Reason::CANCEL);
+        assert!(is_silent_error(&e));
+        let other = h2::Error::from(h2::Reason::CONNECT_ERROR);
+        assert!(!is_silent_error(&other));
     }
 }

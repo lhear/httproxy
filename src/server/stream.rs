@@ -256,4 +256,44 @@ mod tests {
         assert_eq!(seq, 0);
         assert_eq!(&data[..], b"encrypted hello");
     }
+
+    #[tokio::test]
+    async fn json_encoded_frames_decoded() {
+        let data = b"json payload data";
+        let frame =
+            shaper::encode_frame(data, 7, None, 16384, [0, 0], shaper::EncodingType::Json).unwrap();
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(frame))]);
+        let mut decoder = FrameDecoder::new(byte_stream, None, shaper::EncodingType::Json, 18_781);
+        let (seq, decoded) = decoder.next().await.unwrap().unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(&decoded[..], data);
+        assert!(decoder.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn trailing_partial_frame_after_eos_errors() {
+        let frame = make_frame(b"complete", 0);
+        let mut full = frame.to_vec();
+        full.extend_from_slice(&[0x01, 0x02]);
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(full))]);
+        let mut decoder =
+            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let (seq, data) = decoder.next().await.unwrap().unwrap();
+        assert_eq!(seq, 0);
+        assert_eq!(&data[..], b"complete");
+        let err = decoder.next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn inner_stream_error_propagates() {
+        let byte_stream = stream::iter(vec![Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "upstream read failed",
+        ))]);
+        let mut decoder =
+            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let err = decoder.next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
 }

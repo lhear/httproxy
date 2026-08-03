@@ -412,3 +412,52 @@ fn spawn_prefetch_continuation(
     );
     (trigger_tx, result_rx)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn handle_frame_accepts_in_order() {
+        let mut write_buf = BytesMut::new();
+        let mut scratch = BytesMut::new();
+        let mut expected_seq = 0u64;
+
+        scratch.extend_from_slice(b"abc");
+        let f = DecodedFrame::InScratch {
+            seq: 0,
+            start: 0,
+            end: 3,
+        };
+        DownloadLoopActor::handle_frame(f, &mut write_buf, &scratch, &mut expected_seq).unwrap();
+        assert_eq!(&write_buf[..], b"abc");
+        assert_eq!(expected_seq, 1);
+
+        let f = DecodedFrame::Owned {
+            seq: 1,
+            data: Bytes::from_static(b"de"),
+        };
+        DownloadLoopActor::handle_frame(f, &mut write_buf, &scratch, &mut expected_seq).unwrap();
+        assert_eq!(&write_buf[..], b"abcde");
+        assert_eq!(expected_seq, 2);
+    }
+
+    #[test]
+    fn handle_frame_rejects_out_of_order() {
+        let mut write_buf = BytesMut::new();
+        let scratch = BytesMut::new();
+        let mut expected_seq = 0u64;
+
+        let f = DecodedFrame::Owned {
+            seq: 5,
+            data: Bytes::from_static(b"x"),
+        };
+        assert!(
+            DownloadLoopActor::handle_frame(f, &mut write_buf, &scratch, &mut expected_seq)
+                .is_err()
+        );
+        assert!(write_buf.is_empty());
+        assert_eq!(expected_seq, 0);
+    }
+}
