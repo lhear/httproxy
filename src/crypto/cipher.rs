@@ -181,19 +181,15 @@ mod tests {
     fn encrypt_decrypt_roundtrip() {
         let key = random_key();
         let plain = b"hello world test frame data";
+
         let ct = encrypt_bytes(&key, plain).unwrap();
         let pt = decrypt_bytes(&key, &ct).unwrap();
         assert_eq!(pt, plain);
-    }
 
-    #[test]
-    fn frame_cipher_roundtrip() {
-        let key = random_key();
         let cipher = AesFrameCipher::new(&key);
-        let data = b"frame data for cipher test";
-        let ct = cipher.encrypt(data).unwrap();
-        let pt = cipher.decrypt(&ct).unwrap();
-        assert_eq!(pt, data);
+        let frame_ct = cipher.encrypt(plain).unwrap();
+        let frame_pt = cipher.decrypt(&frame_ct).unwrap();
+        assert_eq!(frame_pt, plain);
     }
 
     #[test]

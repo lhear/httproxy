@@ -228,3 +228,277 @@ async fn send_upload_post(
     response.bytes().await.context("drain upload response")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shaper::{
+        DecodedFrame, EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig,
+        decode_frame,
+    };
+    use std::net::SocketAddr;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Mutex;
+
+    fn test_state(remote: &str, max_in_flight: usize) -> Arc<SharedState> {
+        let traffic = TrafficConfig {
+            global: PaddingConfig {
+                padding_threshold: 0,
+                padding_range: [0, 0],
+            },
+            stages: vec![],
+            encoding_type: EncodingType::Binary,
+            max_download_bytes: None,
+        };
+        Arc::new(SharedState {
+            remote_str: remote.to_string(),
+            auth_header: "Bearer test-token".to_string(),
+            traffic_config: traffic.clone(),
+            resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
+            bypass: None,
+            server_public_key: None,
+            proxy_auth: None,
+            initial_master: Mutex::new(None),
+            handshake_lock: Mutex::new(()),
+            max_download_bytes: None,
+            max_connections: 8,
+            max_in_flight_bytes: max_in_flight,
+            upload_concurrency: 4,
+        })
+    }
+
+    async fn spawn_collector() -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Vec<u8>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let mut collected = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    r = listener.accept() => {
+                        let Ok((mut sock, _)) = r else { break };
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 8192];
+                        let header_end = loop {
+                            let n = match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => break None,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break Some(p + 4);
+                            }
+                        };
+                        let Some(header_end) = header_end else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let mut body = buf[header_end..].to_vec();
+                        while body.len() < content_length {
+                            let n = match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            body.extend_from_slice(&tmp[..n]);
+                        }
+                        body.truncate(content_length);
+                        collected.extend_from_slice(&body);
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                }
+            }
+            collected
+        });
+        (addr, stop_tx, handle)
+    }
+
+    fn decode_all(received: &[u8]) -> Vec<u8> {
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut src = BytesMut::from(received);
+        let mut decoded = Vec::new();
+        while let Some(frame) = decode_frame(
+            &mut src,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Binary,
+        )
+        .unwrap()
+        {
+            match frame {
+                DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
+                DecodedFrame::InScratch { .. } => panic!("unexpected InScratch frame"),
+            }
+        }
+        decoded
+    }
+
+    fn test_client() -> Arc<wreq::Client> {
+        Arc::new(wreq::Client::builder().no_proxy().build().unwrap())
+    }
+
+    async fn tcp_pair() -> (tokio::net::tcp::OwnedReadHalf, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server_stream = server.await.unwrap();
+        let (read_half, _write_half) = server_stream.into_split();
+        (read_half, client)
+    }
+
+    #[tokio::test]
+    async fn run_uploads_all_data_with_contiguous_seqs() {
+        let (addr, stop_tx, collector) = spawn_collector().await;
+        let state = test_state(&format!("http://{addr}/"), 64 * 1024);
+        let client = test_client();
+        let (read_half, mut writer) = tcp_pair().await;
+
+        let initial: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let extra: Vec<u8> = (0..20_000u32).map(|i| (i % 253) as u8).collect();
+        let mut all = initial.clone();
+        all.extend_from_slice(&extra);
+
+        let actor = UploadLoopActor::new(
+            client,
+            state,
+            Bytes::from(initial),
+            read_half,
+            None,
+            Uuid::new_v4(),
+            0,
+        );
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        writer.write_all(&extra).await.unwrap();
+        drop(writer);
+        handle
+            .await
+            .unwrap()
+            .expect("upload loop must finish cleanly");
+
+        let _ = stop_tx.send(());
+        let received = collector.await.unwrap();
+        assert!(!received.is_empty(), "server must receive upload frames");
+        assert_eq!(decode_all(&received), all);
+    }
+
+    #[tokio::test]
+    async fn run_starts_seq_from_configured_value() {
+        let (addr, stop_tx, collector) = spawn_collector().await;
+        let state = test_state(&format!("http://{addr}/"), 64 * 1024);
+        let client = test_client();
+        let (read_half, writer) = tcp_pair().await;
+        drop(writer);
+
+        let initial = vec![0xABu8; 40_000];
+        let actor = UploadLoopActor::new(
+            client,
+            state,
+            Bytes::from(initial),
+            read_half,
+            None,
+            Uuid::new_v4(),
+            7,
+        );
+        let handle = tokio::spawn(async move { actor.run().await });
+        handle.await.unwrap().unwrap();
+
+        let _ = stop_tx.send(());
+        let received = collector.await.unwrap();
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut src = BytesMut::from(&received[..]);
+        let mut seqs = Vec::new();
+        while let Some(frame) = decode_frame(
+            &mut src,
+            &mut scratch,
+            &mut json_scratch,
+            None,
+            EncodingType::Binary,
+        )
+        .unwrap()
+        {
+            match frame {
+                DecodedFrame::Owned { seq, .. } => seqs.push(seq),
+                DecodedFrame::InScratch { .. } => panic!("unexpected InScratch frame"),
+            }
+        }
+        assert_eq!(seqs.first(), Some(&7));
+        for w in seqs.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "seqs must be contiguous");
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_failure_propagates_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = listener.local_addr().unwrap();
+        drop(listener);
+
+        let state = test_state(&format!("http://{dead}/"), 64 * 1024);
+        let client = test_client();
+        let (read_half, writer) = tcp_pair().await;
+        drop(writer);
+
+        let initial = vec![0xCDu8; 30_000];
+        let actor = UploadLoopActor::new(
+            client,
+            state,
+            Bytes::from(initial),
+            read_half,
+            None,
+            Uuid::new_v4(),
+            0,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), actor.run()).await;
+        let err = result.expect("upload loop must fail fast").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("upload POST failed") || msg.contains("http post failed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_input_sends_no_requests() {
+        let (addr, stop_tx, collector) = spawn_collector().await;
+        let state = test_state(&format!("http://{addr}/"), 64 * 1024);
+        let client = test_client();
+        let (read_half, writer) = tcp_pair().await;
+        drop(writer);
+
+        let actor = UploadLoopActor::new(
+            client,
+            state,
+            Bytes::new(),
+            read_half,
+            None,
+            Uuid::new_v4(),
+            5,
+        );
+        let handle = tokio::spawn(async move { actor.run().await });
+        handle.await.unwrap().unwrap();
+
+        let _ = stop_tx.send(());
+        let received = collector.await.unwrap();
+        assert!(received.is_empty(), "empty input must not send any POST");
+    }
+}

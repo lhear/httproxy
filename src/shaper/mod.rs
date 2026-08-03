@@ -1244,27 +1244,13 @@ mod tests {
     #[test]
     fn encode_frame_json_padding_stays_within_line_limit() {
         let raw = vec![0x42u8; 1000];
-        let frame = encode_frame(&raw, 0, None, 100_000, [0, 100_000], EncodingType::Json).unwrap();
-        let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
-        assert!(line_len <= MAX_JSON_LINE_LEN);
-    }
-
-    #[test]
-    fn encode_frame_json_cipher_padding_stays_within_line_limit() {
-        let raw = vec![0x42u8; 1000];
-        let key = zeroize::Zeroizing::new([0u8; 32]);
-        let cipher = crate::crypto::AesFrameCipher::new(&key);
-        let frame = encode_frame(
-            &raw,
-            0,
-            Some(&cipher),
-            100_000,
-            [0, 100_000],
-            EncodingType::Json,
-        )
-        .unwrap();
-        let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
-        assert!(line_len <= MAX_JSON_LINE_LEN);
+        let aes = crate::crypto::AesFrameCipher::new(&zeroize::Zeroizing::new([0u8; 32]));
+        for cipher in [None, Some(&aes as &dyn FrameCipher)] {
+            let frame =
+                encode_frame(&raw, 0, cipher, 100_000, [0, 100_000], EncodingType::Json).unwrap();
+            let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
+            assert!(line_len <= MAX_JSON_LINE_LEN);
+        }
     }
 
     #[tokio::test]

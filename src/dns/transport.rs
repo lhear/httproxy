@@ -351,14 +351,4 @@ mod tests {
         let r = t.send(&mut query).await;
         assert!(r.is_err());
     }
-
-    #[tokio::test]
-    async fn udp_recv_error_does_not_panic() {
-        let t = UdpTransport::new("127.0.0.1:9".parse().unwrap())
-            .await
-            .unwrap();
-        let mut query = [0u8; 12];
-        let r = t.send(&mut query).await;
-        assert!(r.is_err() || r.is_ok());
-    }
 }
