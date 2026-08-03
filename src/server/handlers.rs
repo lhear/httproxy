@@ -622,7 +622,6 @@ async fn handle_fresh_handshake(
     let (server_eph_sk, server_eph_pk) = crypto::generate_keypair();
 
     let master = {
-        let server_eph_sk = Zeroizing::new(server_eph_sk);
         let ss_x25519 = crypto::diffie_hellman(&server_eph_sk, &client_eph_pk_b);
         crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
     };

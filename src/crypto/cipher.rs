@@ -1,6 +1,6 @@
 use aes_gcm::{
     Aes256Gcm, Nonce, Tag,
-    aead::{AeadInPlace, KeyInit},
+    aead::{AeadInOut, KeyInit},
 };
 use anyhow::{Result, anyhow};
 use rand::Rng;
@@ -28,10 +28,10 @@ fn encrypt_with_cipher(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>> 
     out.extend_from_slice(plaintext);
 
     let tag = cipher
-        .encrypt_in_place_detached(
-            Nonce::from_slice(&nonce_bytes),
+        .encrypt_inout_detached(
+            &Nonce::from(nonce_bytes),
             EMPTY_AAD,
-            &mut out[NONCE_LEN..],
+            (&mut out[NONCE_LEN..]).into(),
         )
         .map_err(|e| anyhow!("encryption error: {e}"))?;
     out.extend_from_slice(tag.as_ref());
@@ -45,14 +45,11 @@ fn decrypt_with_cipher(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>> {
     }
     let ct_end = data.len() - TAG_LEN;
     let mut plaintext = data[NONCE_LEN..ct_end].to_vec();
+    let nonce = Nonce::try_from(&data[..NONCE_LEN]).map_err(|_| anyhow!("invalid nonce length"))?;
+    let tag = Tag::try_from(&data[ct_end..]).map_err(|_| anyhow!("invalid tag length"))?;
 
     cipher
-        .decrypt_in_place_detached(
-            Nonce::from_slice(&data[..NONCE_LEN]),
-            EMPTY_AAD,
-            &mut plaintext,
-            Tag::from_slice(&data[ct_end..]),
-        )
+        .decrypt_inout_detached(&nonce, EMPTY_AAD, (&mut plaintext[..]).into(), &tag)
         .map_err(|e| anyhow!("decryption error: {e}"))?;
     Ok(plaintext)
 }
@@ -110,10 +107,10 @@ impl FrameCipher for AesFrameCipher {
         out.extend_from_slice(data);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(
-                Nonce::from_slice(&nonce_bytes),
+            .encrypt_inout_detached(
+                &Nonce::from(nonce_bytes),
                 EMPTY_AAD,
-                &mut out[ct_start..],
+                (&mut out[ct_start..]).into(),
             )
             .map_err(|e| io::Error::other(anyhow!("encryption error: {e}")))?;
         out.extend_from_slice(tag.as_ref());
@@ -133,13 +130,10 @@ impl FrameCipher for AesFrameCipher {
         out.reserve(ct_len);
         let pt_start = out.len();
         out.extend_from_slice(&data[NONCE_LEN..ct_end]);
+        let nonce = Nonce::try_from(&data[..NONCE_LEN]).map_err(io::Error::other)?;
+        let tag = Tag::try_from(&data[ct_end..]).map_err(io::Error::other)?;
         self.cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&data[..NONCE_LEN]),
-                EMPTY_AAD,
-                &mut out[pt_start..],
-                Tag::from_slice(&data[ct_end..]),
-            )
+            .decrypt_inout_detached(&nonce, EMPTY_AAD, (&mut out[pt_start..]).into(), &tag)
             .map_err(|e| io::Error::other(anyhow!("decryption error: {e}")))?;
         Ok(())
     }
@@ -155,10 +149,10 @@ impl FrameCipher for AesFrameCipher {
         out[nonce_start..ct_start].copy_from_slice(&nonce_bytes);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(
-                Nonce::from_slice(&nonce_bytes),
+            .encrypt_inout_detached(
+                &Nonce::from(nonce_bytes),
                 EMPTY_AAD,
-                &mut out[ct_start..],
+                (&mut out[ct_start..]).into(),
             )
             .map_err(|e| io::Error::other(anyhow!("encryption error: {e}")))?;
         out.extend_from_slice(tag.as_ref());
