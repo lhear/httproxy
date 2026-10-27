@@ -22,6 +22,9 @@ use super::config::DnsConfig;
 
 static ROOT_CERT_STORE: OnceLock<Arc<RootCertStore>> = OnceLock::new();
 
+/// 查询里声明的 EDNS UDP 载荷为 1232 字节，接收缓冲取 2 KiB 足够。
+const UDP_RECV_BUF: usize = 2048;
+
 type PendingMap = Arc<Mutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>>>>>>;
 
 async fn assign_id_and_register(
@@ -56,7 +59,8 @@ impl UdpTransport {
         let id: u16 = rand::random();
         data[0..2].copy_from_slice(&id.to_be_bytes());
         socket.send(data).await?;
-        let mut buf = vec![0u8; 65535];
+        // OPT 记录里声明的 UDP 载荷是 1232 字节，2 KiB 缓冲足够且不必每次清 64 KiB
+        let mut buf = [0u8; UDP_RECV_BUF];
         let len = timeout(Duration::from_secs(2), socket.recv(&mut buf))
             .await
             .context("UDP upstream timeout")??;
