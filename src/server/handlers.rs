@@ -1,6 +1,6 @@
 use axum::{body::Body, extract::State, http::HeaderMap, response::Response};
 use base64::Engine;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures::StreamExt;
 use jsonwebtoken::{DecodingKey, Validation};
 use std::io;
@@ -15,8 +15,8 @@ use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
 use crate::server::connection::connect_upstream;
 use crate::server::constants::{
-    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, DOWNLOAD_CHANNEL_CAPACITY, JWT_CACHE_TTL, MASTER_EXPIRY,
-    MAX_FRAME_BUF_SIZE, TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
+    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, JWT_CACHE_TTL, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE,
+    TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream::FrameDecoder;
 use crate::server::stream_registry::StreamQueryResult;
@@ -117,13 +117,6 @@ async fn setup_tunnel_response(
     let direct = max_download_bytes.is_none();
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(crate::now_secs()));
 
-    let (download_tx, download_rx) = if direct {
-        (None, None)
-    } else {
-        let (tx, rx) =
-            tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(DOWNLOAD_CHANNEL_CAPACITY);
-        (Some(tx), Some(rx))
-    };
     let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
 
     let upstream = tokio::time::timeout(
@@ -173,7 +166,6 @@ async fn setup_tunnel_response(
 
     let mut actor = crate::server::actor::tunnel::TunnelActor::new(
         actor_rx,
-        download_tx,
         stream_id,
         Arc::clone(&state.stream_registry),
         max_download_bytes,
@@ -203,9 +195,12 @@ async fn setup_tunnel_response(
             download_cipher,
             0,
         );
-        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
-            download_rx.expect("download channel must exist when rotation is enabled"),
-        ))
+        // 响应体直接从 shaper 拉取，不再经过"额外任务 + 每帧 mpsc"
+        Body::from_stream(
+            actor
+                .take_segment()
+                .ok_or_else(|| ServerError::internal("download segment unavailable"))?,
+        )
     };
 
     let handle = SessionHandle {
@@ -372,14 +367,12 @@ async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response
             .map_err(|_| ServerError::bad_gateway("actor closed"))?;
 
         match tokio::time::timeout(crate::server::constants::UPLOAD_DONE_TIMEOUT, reply_rx).await {
-            Ok(Ok(Some(new_download_rx))) => {
+            Ok(Ok(Some(segment))) => {
                 let padding = utils::random_padding();
                 return Response::builder()
                     .header("Cache-Control", "no-store")
                     .header("Set-Cookie", padding)
-                    .body(Body::from_stream(
-                        tokio_stream::wrappers::ReceiverStream::new(new_download_rx),
-                    ))
+                    .body(Body::from_stream(segment))
                     .map_err(|e| ServerError::internal(e.to_string()));
             }
             Ok(Ok(None)) | Ok(Err(_)) => {
