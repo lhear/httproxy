@@ -78,6 +78,6 @@ pub async fn handle_connection_actor(
     state: Arc<SharedState>,
 ) -> Result<()> {
     use crate::client::actor::connection::ClientConnectionActor;
-    let mut actor = ClientConnectionActor::new(socket, http_client, state);
+    let actor = ClientConnectionActor::new(socket, http_client, state);
     actor.run().await
 }

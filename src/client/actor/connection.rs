@@ -2,112 +2,63 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::info;
 
 use crate::client::constants::{
-    CONNECT_RESPONSE, EARLY_READ_WINDOW, PROXY_AUTH_REQUIRED_RESPONSE, PROXY_REQUEST_PARSE_TIMEOUT,
+    AUTH_REJECT_DRAIN_WINDOW, CONNECT_RESPONSE, EARLY_READ_CHUNK, EARLY_READ_WINDOW,
+    PROXY_AUTH_REQUIRED_RESPONSE, PROXY_BUF_INITIAL_CAPACITY, PROXY_REQUEST_PARSE_TIMEOUT,
 };
 use crate::client::proxy;
 use crate::client::state::ClientPqFsm;
 use crate::client::state::SharedState;
 
-pub enum ClientConnState {
-    Parsing {
-        socket: TcpStream,
-        buf: BytesMut,
-        http_client: Arc<wreq::Client>,
-        state: Arc<SharedState>,
-    },
-    Active,
-    Closed,
-}
-
 pub struct ClientConnectionActor {
-    state: ClientConnState,
+    socket: Option<TcpStream>,
+    http_client: Arc<wreq::Client>,
+    state: Arc<SharedState>,
 }
 
 impl ClientConnectionActor {
     pub fn new(socket: TcpStream, http_client: Arc<wreq::Client>, state: Arc<SharedState>) -> Self {
         socket.set_nodelay(true).ok();
         Self {
-            state: ClientConnState::Parsing {
-                socket,
-                buf: BytesMut::with_capacity(16 * 1024),
-                http_client,
-                state,
-            },
+            socket: Some(socket),
+            http_client,
+            state,
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        loop {
-            self.state = match std::mem::replace(&mut self.state, ClientConnState::Closed) {
-                ClientConnState::Parsing {
-                    socket,
-                    mut buf,
-                    http_client,
-                    state,
-                } => {
-                    self.do_parsing(socket, &mut buf, http_client, state)
-                        .await?
-                }
-                ClientConnState::Active => return Ok(()),
-                ClientConnState::Closed => return Ok(()),
-            };
-        }
-    }
-
-    async fn do_parsing(
-        &mut self,
-        socket: TcpStream,
-        buf: &mut BytesMut,
-        http_client: Arc<wreq::Client>,
-        state: Arc<SharedState>,
-    ) -> anyhow::Result<ClientConnState> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let socket = self
+            .socket
+            .take()
+            .expect("connection actor can only run once");
+        let http_client = Arc::clone(&self.http_client);
+        let state = Arc::clone(&self.state);
         let (mut read_half, mut write_half) = socket.into_split();
+        // 浏览器 CONNECT 头通常只有几百字节，先给小缓冲，按需增长
+        let mut buf = BytesMut::with_capacity(PROXY_BUF_INITIAL_CAPACITY);
 
-        let (method, header_len, url) = loop {
-            let (method, header_len, url, proxy_auth_header) = tokio::time::timeout(
-                PROXY_REQUEST_PARSE_TIMEOUT,
-                proxy::parse_proxy_request(&mut read_half, buf, state.proxy_auth.is_some()),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("proxy request parse timeout"))??;
-
-            if let Some((ref expected_auth, _)) = state.proxy_auth
-                && proxy_auth_header
-                    .as_ref()
-                    .is_none_or(|h| h.trim() != expected_auth.as_str())
-            {
-                write_half.write_all(PROXY_AUTH_REQUIRED_RESPONSE).await?;
-                write_half.flush().await?;
-                buf.advance(header_len);
-                continue;
-            }
-            break (method, header_len, url);
+        let Some((method, header_len, url)) =
+            read_request_head(&mut read_half, &mut write_half, &mut buf, &state).await?
+        else {
+            // 已回过 407 并关闭连接，等客户端带认证头重连
+            return Ok(());
         };
 
         if method == "CONNECT" {
             buf.advance(header_len);
             write_half.write_all(CONNECT_RESPONSE).await?;
-            let deadline = tokio::time::Instant::now() + EARLY_READ_WINDOW;
-            loop {
-                let remaining = crate::shaper::MAX_RAW_PAYLOAD.saturating_sub(buf.len());
-                if remaining == 0 {
-                    break;
-                }
-                match tokio::time::timeout_at(deadline, read_half.read_buf(buf)).await {
-                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                    Ok(Ok(_)) => {}
-                }
-            }
+            read_early_data(&mut read_half, &mut buf).await;
         }
 
-        let target_host = proxy::resolve_target_host(&method, &url)?;
+        // 只解析一次请求目标：同时得到上游地址和需要写回请求行的 origin-form
+        let (target_host, origin_form) = proxy::resolve_request(&method, &url)?;
         tracing::Span::current().record("target", target_host.as_str());
 
-        if method != "CONNECT" {
-            proxy::rewrite_absolute_url(buf, &method, &url)?;
+        if let Some(origin_path) = origin_form {
+            proxy::rewrite_request_line(&mut buf, header_len, &method, &origin_path)?;
         }
 
         if let Some(ref bypass) = state.bypass
@@ -131,7 +82,7 @@ impl ClientConnectionActor {
                 &state,
             )
             .await;
-            fsm.run(http_client, state).await?;
+            fsm.run(http_client, state).await
         } else {
             crate::client::connection::handle_plain_proxy(
                 read_half,
@@ -141,21 +92,91 @@ impl ClientConnectionActor {
                 payload,
                 &target_host,
             )
-            .await?;
+            .await
         }
+    }
+}
 
-        Ok(ClientConnState::Active)
+/// 读取并校验代理请求头。
+///
+/// 入站代理连接不做 keep-alive：认证失败时回一个 `Connection: close` 的 407 并
+/// 关闭连接，客户端自然会带认证头重开一条，因此这里不需要在同一条 TCP 上循环
+/// 等待下一个请求。返回 `Ok(None)` 表示已经拒绝并关闭。
+async fn read_request_head(
+    read_half: &mut OwnedReadHalf,
+    write_half: &mut OwnedWriteHalf,
+    buf: &mut BytesMut,
+    state: &Arc<SharedState>,
+) -> anyhow::Result<Option<(String, usize, String)>> {
+    let expected_auth = state
+        .proxy_auth
+        .as_ref()
+        .map(|(expected, _)| expected.as_str());
+
+    let request = tokio::time::timeout(
+        PROXY_REQUEST_PARSE_TIMEOUT,
+        proxy::parse_proxy_request(read_half, buf, expected_auth),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("proxy request parse timeout"))??;
+
+    if !request.authorized {
+        reject_unauthorized(read_half, write_half).await?;
+        return Ok(None);
+    }
+
+    Ok(Some((request.method, request.header_len, request.target)))
+}
+
+/// 回 407 并优雅关闭连接。
+async fn reject_unauthorized(
+    read_half: &mut OwnedReadHalf,
+    write_half: &mut OwnedWriteHalf,
+) -> anyhow::Result<()> {
+    write_half.write_all(PROXY_AUTH_REQUIRED_RESPONSE).await?;
+    let _ = write_half.shutdown().await;
+
+    // 先发 FIN，再把对端已经在途的数据读掉：直接 close 往往触发 RST，
+    // 客户端可能还没读到 407 就收到连接重置。
+    let _ = tokio::time::timeout(AUTH_REJECT_DRAIN_WINDOW, async {
+        let mut sink = [0u8; 512];
+        loop {
+            match read_half.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    Ok(())
+}
+
+/// CONNECT 之后浏览器往往已经把 TLS ClientHello 发过来了，先尽力读一段，
+/// 让上游建连与首包发送重叠。
+async fn read_early_data(read_half: &mut OwnedReadHalf, buf: &mut BytesMut) {
+    let deadline = tokio::time::Instant::now() + EARLY_READ_WINDOW;
+    loop {
+        let remaining = crate::shaper::MAX_RAW_PAYLOAD.saturating_sub(buf.len());
+        if remaining == 0 {
+            break;
+        }
+        // read_buf 在空闲容量为 0 时会返回 0（伪 EOF），必须显式预留；
+        // 分块预留，避免为一个只发了几字节的连接一次性吃掉 16 KiB。
+        buf.reserve(remaining.min(EARLY_READ_CHUNK));
+        match tokio::time::timeout_at(deadline, read_half.read_buf(buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) => {}
+        }
     }
 }
 
 async fn handle_bypass_direct(
-    mut read_half: tokio::net::tcp::OwnedReadHalf,
-    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    mut read_half: OwnedReadHalf,
+    mut write_half: OwnedWriteHalf,
     target: &str,
     initial_payload: Bytes,
-) -> anyhow::Result<ClientConnState> {
+) -> anyhow::Result<()> {
     use anyhow::Context;
-    use tokio::io::AsyncWriteExt;
     let mut remote = TcpStream::connect(target)
         .await
         .with_context(|| format!("bypass connect to {target} failed"))?;
@@ -166,6 +187,7 @@ async fn handle_bypass_direct(
     if !initial_payload.is_empty() {
         remote.write_all(&initial_payload).await?;
     }
+    drop(initial_payload);
     let (mut remote_read, mut remote_write) = remote.into_split();
     let up = async {
         let res = tokio::io::copy(&mut read_half, &mut remote_write).await;
@@ -181,7 +203,7 @@ async fn handle_bypass_direct(
     up_res.context("bypass client->remote")?;
     down_res.context("bypass remote->client")?;
     info!(target = %target, "bypass connection closed");
-    Ok(ClientConnState::Closed)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -191,8 +213,8 @@ mod tests {
     use crate::shaper::{EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig};
     use std::net::SocketAddr;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
@@ -266,17 +288,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_retry_on_same_connection() {
+    async fn auth_challenge_closes_connection_then_reconnect_succeeds() {
         let echo = spawn_echo().await;
-        let (server_side, mut client) = tcp_pair().await;
         let state = test_state(
             Some(("Basic dXNlcjpwYXNz".to_string(), "user".to_string())),
             Some(bypass_loopback()),
         );
+
+        // 第一次：不带认证头，应该只收到 407 + Connection: close，然后连接被关闭
+        let (server_side, mut client) = tcp_pair().await;
         let http_client = test_client();
+        let state1 = Arc::clone(&state);
         let actor = tokio::spawn(async move {
-            let mut actor = ClientConnectionActor::new(server_side, http_client, state);
-            actor.run().await
+            ClientConnectionActor::new(server_side, http_client, state1)
+                .run()
+                .await
         });
 
         client
@@ -289,6 +315,7 @@ mod tests {
             )
             .await
             .unwrap();
+
         let mut buf = [0u8; 4096];
         let n = client.read(&mut buf).await.unwrap();
         let head = String::from_utf8_lossy(&buf[..n]);
@@ -296,6 +323,29 @@ mod tests {
             head.starts_with("HTTP/1.1 407"),
             "expected 407, got: {head}"
         );
+        assert!(
+            head.to_ascii_lowercase().contains("connection: close"),
+            "got: {head}"
+        );
+
+        let mut tail = [0u8; 64];
+        let n = client.read(&mut tail).await.unwrap();
+        assert_eq!(n, 0, "407 之后必须关闭连接，不能在同一条连接上等待");
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), actor)
+            .await
+            .expect("actor must finish after 407")
+            .expect("actor task must not panic");
+        assert!(joined.is_ok(), "407 是正常流程，不应上报错误");
+
+        // 第二次：新连接带上认证头，请求应被正常转发
+        let (server_side, mut client) = tcp_pair().await;
+        let http_client = test_client();
+        let actor = tokio::spawn(async move {
+            ClientConnectionActor::new(server_side, http_client, state)
+                .run()
+                .await
+        });
 
         client
             .write_all(
@@ -327,7 +377,7 @@ mod tests {
         let state = test_state(None, Some(bypass_loopback()));
         let http_client = test_client();
         let actor = tokio::spawn(async move {
-            let mut actor = ClientConnectionActor::new(server_side, http_client, state);
+            let actor = ClientConnectionActor::new(server_side, http_client, state);
             actor.run().await
         });
 
@@ -368,7 +418,7 @@ mod tests {
         let state = test_state(None, None);
         let http_client = test_client();
         let actor = tokio::spawn(async move {
-            let mut actor = ClientConnectionActor::new(server_side, http_client, state);
+            let actor = ClientConnectionActor::new(server_side, http_client, state);
             actor.run().await
         });
 
@@ -388,5 +438,40 @@ mod tests {
             .expect("actor task must not panic");
         let err = joined.unwrap_err();
         assert!(err.to_string().contains("parse timeout"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_connections_do_not_linger() {
+        let state = test_state(
+            Some(("Basic dXNlcjpwYXNz".to_string(), "user".to_string())),
+            None,
+        );
+        let req = b"GET http://example.com/ HTTP/1.1\r\nHost: x\r\n\r\n";
+
+        // 连续多条未认证连接都应该被立刻关闭，不会被留在这里反复占用
+        for _ in 0..3 {
+            let (server_side, mut client) = tcp_pair().await;
+            let http_client = test_client();
+            let state = Arc::clone(&state);
+            let actor = tokio::spawn(async move {
+                ClientConnectionActor::new(server_side, http_client, state)
+                    .run()
+                    .await
+            });
+
+            client.write_all(req).await.unwrap();
+            let mut sink = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut sink))
+                .await
+                .expect("server must close after 407")
+                .unwrap();
+            assert!(sink.starts_with(b"HTTP/1.1 407"));
+
+            let result = tokio::time::timeout(Duration::from_secs(5), actor)
+                .await
+                .expect("actor must stop after 407")
+                .expect("actor task must not panic");
+            assert!(result.is_ok());
+        }
     }
 }
