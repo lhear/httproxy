@@ -12,10 +12,11 @@ use zeroize::Zeroizing;
 use crate::crypto::{self, AesFrameCipher};
 use crate::error::ServerError;
 use crate::server::actor::tunnel::TunnelCmd;
+use crate::server::actor::upload::UploadCmd;
 use crate::server::connection::connect_upstream;
 use crate::server::constants::{
     BODY_READ_TIMEOUT, CONNECT_TIMEOUT, DOWNLOAD_CHANNEL_CAPACITY, MASTER_EXPIRY,
-    MAX_FRAME_BUF_SIZE, TUNNEL_CMD_CHANNEL_CAPACITY,
+    MAX_FRAME_BUF_SIZE, TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream::FrameDecoder;
 use crate::server::stream_registry::StreamQueryResult;
@@ -141,9 +142,8 @@ async fn setup_tunnel_response(
 
     let (upstream_read, upstream_write) = upstream.into_split();
 
-    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<
-        crate::server::actor::upload::UploadCmd,
-    >(crate::server::constants::UPLOAD_CMD_CHANNEL_CAPACITY);
+    let (upload_tx, upload_rx) =
+        tokio::sync::mpsc::channel::<UploadCmd>(UPLOAD_CMD_CHANNEL_CAPACITY);
     let upload_actor = crate::server::actor::upload::UploadActor::new(upload_rx, upstream_write, 0);
     let upload_handle =
         tokio::spawn(async move { upload_actor.run().await }.instrument(tracing::Span::current()));
@@ -164,7 +164,7 @@ async fn setup_tunnel_response(
         let (seq, data) =
             result.map_err(|e| ServerError::bad_request(format!("decode error: {e}")))?;
         upload_tx
-            .send(crate::server::actor::upload::UploadCmd::Frame { seq, data })
+            .send(UploadCmd::Frame { seq, data })
             .await
             .map_err(|_| ServerError::bad_gateway("upload actor closed during initial stream"))?;
     }
@@ -210,6 +210,7 @@ async fn setup_tunnel_response(
 
     let handle = SessionHandle {
         cmd_tx: actor_tx.clone(),
+        upload_tx: upload_tx.clone(),
         upload_cipher,
         encoding,
     };
@@ -355,10 +356,10 @@ async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response
             result.map_err(|e| ServerError::bad_request(format!("frame decode error: {e}")))?;
         max_seq = max_seq.max(seq);
         handle
-            .cmd_tx
-            .send(TunnelCmd::UploadFrame { seq, data })
+            .upload_tx
+            .send(UploadCmd::Frame { seq, data })
             .await
-            .map_err(|_| ServerError::bad_gateway("actor closed"))?;
+            .map_err(|_| ServerError::bad_gateway("upload actor closed"))?;
         frame_count += 1;
     }
 
@@ -398,13 +399,13 @@ async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response
 
     let (ack_tx, ack_rx) = oneshot::channel();
     handle
-        .cmd_tx
-        .send(TunnelCmd::UploadEos {
+        .upload_tx
+        .send(UploadCmd::Eos {
             max_seq,
             ack: ack_tx,
         })
         .await
-        .map_err(|_| ServerError::bad_gateway("actor closed"))?;
+        .map_err(|_| ServerError::bad_gateway("upload actor closed"))?;
 
     match tokio::time::timeout(crate::server::constants::UPLOAD_DONE_TIMEOUT, ack_rx).await {
         Ok(Ok(Ok(()))) => {}

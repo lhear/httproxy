@@ -34,6 +34,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::server::actor::tunnel::TunnelCmd;
+use crate::server::actor::upload::UploadCmd;
 use crate::server::constants::MAX_TUNNELS;
 
 pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
@@ -46,7 +47,10 @@ pub struct Claims {
 
 #[derive(Clone)]
 pub struct SessionHandle {
+    /// 控制面：`Continue` / `Shutdown`
     pub cmd_tx: mpsc::Sender<TunnelCmd>,
+    /// 数据面：请求帧与 EOS 直接投递给上传 actor，不必再经隧道 actor 中转
+    pub upload_tx: mpsc::Sender<UploadCmd>,
     pub upload_cipher: Option<Arc<dyn FrameCipher>>,
     pub encoding: EncodingType,
 }

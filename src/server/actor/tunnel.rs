@@ -18,15 +18,12 @@ use crate::server::constants::{
 use crate::server::stream_registry::StreamRegistry;
 use crate::shaper::{FrameCipher, ResolvedShaperConfig, TrafficShaper};
 
+/// 隧道控制面命令。
+///
+/// 上传数据帧不从这里过：请求处理器拿着 `SessionHandle::upload_tx` 直接投递给
+/// `UploadActor`，少一次 channel 跳转和一次任务唤醒，也避免隧道 actor 成为
+/// 同一条流上所有并发上传 POST 的串行瓶颈。
 pub enum TunnelCmd {
-    UploadFrame {
-        seq: u64,
-        data: Bytes,
-    },
-    UploadEos {
-        max_seq: u64,
-        ack: oneshot::Sender<Result<(), crate::error::ServerError>>,
-    },
     Continue {
         reply: oneshot::Sender<Option<mpsc::Receiver<std::io::Result<Bytes>>>>,
     },
@@ -242,7 +239,7 @@ impl TunnelActor {
                             break;
                         }
                         Some(cmd) => {
-                            self.dispatch_cmd(cmd).await;
+                            self.dispatch_cmd(cmd);
                         }
                     }
                 }
@@ -278,29 +275,8 @@ impl TunnelActor {
         self.cleanup().await;
     }
 
-    async fn dispatch_cmd(&mut self, cmd: TunnelCmd) {
-        let upload_tx = self.upload_tx.as_ref().expect("upload_tx not initialized");
-
+    fn dispatch_cmd(&mut self, cmd: TunnelCmd) {
         match cmd {
-            TunnelCmd::UploadFrame { seq, data } => {
-                if upload_tx
-                    .send(UploadCmd::Frame { seq, data })
-                    .await
-                    .is_err()
-                {
-                    warn!("upload actor channel closed during frame send");
-                    self.phase = Phase::Draining;
-                }
-            }
-            TunnelCmd::UploadEos { max_seq, ack } => {
-                if upload_tx
-                    .send(UploadCmd::Eos { max_seq, ack })
-                    .await
-                    .is_err()
-                {
-                    warn!("upload actor closed before EOS");
-                }
-            }
             TunnelCmd::Continue { reply } => match self.phase {
                 Phase::Rotating => {
                     let (new_tx, new_rx) =

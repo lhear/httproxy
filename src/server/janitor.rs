@@ -89,9 +89,12 @@ mod tests {
 
     fn handle_pair() -> (SessionHandle, tokio::sync::mpsc::Receiver<TunnelCmd>) {
         let (tx, rx) = tokio::sync::mpsc::channel::<TunnelCmd>(4);
+        let (upload_tx, _upload_rx) =
+            tokio::sync::mpsc::channel::<crate::server::actor::upload::UploadCmd>(4);
         (
             SessionHandle {
                 cmd_tx: tx,
+                upload_tx,
                 upload_cipher: None,
                 encoding: EncodingType::Binary,
             },
