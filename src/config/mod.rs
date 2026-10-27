@@ -65,6 +65,10 @@ pub struct ClientSection {
     pub max_in_flight_bytes: Option<usize>,
     #[serde(default)]
     pub upload_concurrency: Option<usize>,
+    /// 上传侧合并窗口（毫秒）。默认 0，表示一凑够就发；设成 1~2 可以把
+    /// 先后到达的几个小帧并进同一个 POST，代价是每批最多多等这么久。
+    #[serde(default)]
+    pub upload_coalesce_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -121,5 +125,25 @@ padding_threshold = 50
         let cfg: ClientTopConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.client.listen, "127.0.0.1:8080");
         assert_eq!(cfg.auth.token, "mytoken");
+        assert_eq!(cfg.client.upload_coalesce_ms, None);
+    }
+
+    #[test]
+    fn parse_client_upload_coalesce() {
+        let toml_str = r#"
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://example.com/secret"
+upload_coalesce_ms = 2
+
+[auth]
+token = "mytoken"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+"#;
+        let cfg: ClientTopConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.client.upload_coalesce_ms, Some(2));
     }
 }

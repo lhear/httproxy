@@ -51,6 +51,8 @@ pub struct SharedState {
     pub max_connections: usize,
     pub max_in_flight_bytes: usize,
     pub upload_concurrency: usize,
+    /// 上传批次的合并窗口；`None` 表示不等待
+    pub upload_coalesce: Option<std::time::Duration>,
 }
 
 pub struct Resuming {
@@ -256,6 +258,7 @@ mod tests {
             max_connections: 10,
             max_in_flight_bytes: 1024 * 1024,
             upload_concurrency: 4,
+            upload_coalesce: None,
         })
     }
 
