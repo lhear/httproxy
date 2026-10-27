@@ -116,7 +116,7 @@ impl TunnelActor {
         download_cipher: Option<Arc<dyn FrameCipher>>,
         initial_seq: u64,
     ) {
-        let shaper = TrafficShaper::with_seq(read_half, config, download_cipher, 0);
+        let shaper = TrafficShaper::with_seq(read_half, config, download_cipher, initial_seq);
         self.shaper = Some(Box::pin(shaper));
 
         if let Some(wh) = write_half {

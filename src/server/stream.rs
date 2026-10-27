@@ -34,7 +34,8 @@ where
     ) -> Self {
         Self {
             inner,
-            buf: BytesMut::with_capacity(max_buf_size),
+            // 不再预分配 max_buf_size：首个分块通常能整块接管，扩容交给 BytesMut
+            buf: BytesMut::new(),
             scratch: BytesMut::new(),
             json_scratch: Vec::new(),
             cipher,
@@ -100,7 +101,15 @@ where
 
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    this.buf.extend_from_slice(&chunk);
+                    // 缓冲为空时直接接管分块的内存，省掉整个上传体的一次拷贝
+                    if this.buf.is_empty() {
+                        *this.buf = match chunk.try_into_mut() {
+                            Ok(chunk_mut) => chunk_mut,
+                            Err(chunk) => BytesMut::from(&chunk[..]),
+                        };
+                    } else {
+                        this.buf.extend_from_slice(&chunk);
+                    }
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(e)));

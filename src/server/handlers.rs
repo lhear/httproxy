@@ -248,13 +248,16 @@ async fn spawn_encrypted_tunnel(
     body: Body,
     span: tracing::Span,
 ) -> Result<Response, ServerError> {
-    let parts: Vec<&str> = session_cookie_val.splitn(3, ':').collect();
-    if parts.len() != 3 {
+    let Some((session_id, rest)) = session_cookie_val.split_once(':') else {
         return Err(ServerError::precondition_required(
             "invalid session cookie format",
         ));
-    }
-    let (session_id, enc_target_b64, enc_stream_id_b64) = (parts[0], parts[1], parts[2]);
+    };
+    let Some((enc_target_b64, enc_stream_id_b64)) = rest.split_once(':') else {
+        return Err(ServerError::precondition_required(
+            "invalid session cookie format",
+        ));
+    };
 
     utils::validate_uuid(session_id)?;
 
@@ -634,13 +637,11 @@ async fn handle_fresh_handshake(
 
     info!(session_id = %session_id, "handshake: master key derived");
 
-    let ct_bytes: &[u8] = &ct;
-    let ct_bytes = ct_bytes.to_vec();
     let sid_bytes = session_id.as_bytes();
-    let mut server_hello = Vec::with_capacity(2 + sid_bytes.len() + ct_bytes.len() + 32);
+    let mut server_hello = Vec::with_capacity(2 + sid_bytes.len() + ct.len() + 32);
     server_hello.extend_from_slice(&(sid_bytes.len() as u16).to_be_bytes());
     server_hello.extend_from_slice(sid_bytes);
-    server_hello.extend_from_slice(&ct_bytes);
+    server_hello.extend_from_slice(&ct);
     server_hello.extend_from_slice(server_eph_pk.as_bytes());
 
     let server_hello_frame = shaper::encode_frame(
