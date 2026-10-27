@@ -19,7 +19,8 @@ pub const PROXY_BUF_INITIAL_CAPACITY: usize = 2048;
 pub const EARLY_READ_CHUNK: usize = 2048;
 
 pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
-pub const BATCH_BUF_INITIAL_CAPACITY: usize = 8192;
+/// 批处理缓冲的初始容量约等于一个最大帧，避免从 8 KiB 起反复翻倍扩容拷贝。
+pub const BATCH_BUF_INITIAL_CAPACITY: usize = 32 * 1024;
 pub const MAX_IN_FLIGHT_BYTES: usize = 2 * 1024 * 1024;
 pub const UPLOAD_CONCURRENCY: usize = 128;
 pub const MIN_IN_FLIGHT_BYTES: usize = 20 * 1024;

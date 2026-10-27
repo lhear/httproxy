@@ -34,6 +34,7 @@ pub struct UploadLoopActor {
     request_sem: Arc<Semaphore>,
     bytes_sem: Arc<Semaphore>,
     max_batch_bytes: usize,
+    max_in_flight_bytes: usize,
     tasks: JoinSet<Result<(), anyhow::Error>>,
     phase: Phase,
 }
@@ -59,6 +60,12 @@ impl UploadLoopActor {
         ));
         let upload_concurrency = state.upload_concurrency;
         let max_in_flight_bytes = state.max_in_flight_bytes;
+        // 一帧最多可以超出批处理上限一个整帧，必须把这段余量从 in-flight 预算里
+        // 扣掉，否则单批可能申请到超过信号量总量的许可（直接失败/卡死）。
+        let frame_headroom = shaper::max_encoded_frame_len(state.traffic_config.encoding_type);
+        let max_batch_bytes = MAX_BATCH_BYTES
+            .min(max_in_flight_bytes.saturating_sub(frame_headroom))
+            .max(1);
         Self {
             http_client,
             state,
@@ -66,10 +73,11 @@ impl UploadLoopActor {
             shaped,
             request_sem: Arc::new(Semaphore::new(upload_concurrency)),
             bytes_sem: Arc::new(Semaphore::new(max_in_flight_bytes)),
-            max_batch_bytes: MAX_BATCH_BYTES.min(max_in_flight_bytes),
+            max_batch_bytes,
+            max_in_flight_bytes,
             tasks: JoinSet::new(),
             phase: Phase::Batching {
-                batch_buf: BytesMut::with_capacity(BATCH_BUF_INITIAL_CAPACITY),
+                batch_buf: BytesMut::with_capacity(BATCH_BUF_INITIAL_CAPACITY.min(max_batch_bytes)),
             },
         }
     }
@@ -147,10 +155,14 @@ impl UploadLoopActor {
             .acquire_owned()
             .await
             .map_err(|_| anyhow!("request semaphore closed"))?;
+        // 单批长度受 max_batch_bytes 限制，正常情况下不会超过总预算；这里再夹一层，
+        // 保证极端配置（in-flight 预算小于两帧）下也不会申请到非法数量的许可。
+        let batch_len = batch_buf.len();
+        let permit_bytes = batch_len.min(self.max_in_flight_bytes).max(1) as u32;
         let bytes_permit: OwnedSemaphorePermit = self
             .bytes_sem
             .clone()
-            .acquire_many_owned(batch_buf.len() as u32)
+            .acquire_many_owned(permit_bytes)
             .await
             .map_err(|_| anyhow!("bytes semaphore closed"))?;
         let body = batch_buf.freeze();
@@ -178,7 +190,9 @@ impl UploadLoopActor {
             })
         } else {
             Ok(Phase::Batching {
-                batch_buf: BytesMut::with_capacity(BATCH_BUF_INITIAL_CAPACITY),
+                batch_buf: BytesMut::with_capacity(
+                    BATCH_BUF_INITIAL_CAPACITY.min(self.max_batch_bytes),
+                ),
             })
         }
     }
