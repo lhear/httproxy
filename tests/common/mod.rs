@@ -95,6 +95,7 @@ pub fn client_config(
         log: None,
         traffic_shaping: traffic,
         bypass: BypassConfig { bypass_files },
+        redirect: Vec::new(),
     }
 }
 
@@ -135,7 +136,15 @@ pub async fn spawn_server(cfg: ServerTopConfig) -> SocketAddr {
     addr
 }
 
-pub async fn spawn_client(mut cfg: ClientTopConfig, server_addr: SocketAddr) -> SocketAddr {
+pub async fn spawn_client(cfg: ClientTopConfig, server_addr: SocketAddr) -> SocketAddr {
+    spawn_client_with_redirects(cfg, server_addr).await.0
+}
+
+/// 启动客户端，同时返回 `[[redirect]]` 实际绑定的端口。
+pub async fn spawn_client_with_redirects(
+    mut cfg: ClientTopConfig,
+    server_addr: SocketAddr,
+) -> (SocketAddr, Vec<SocketAddr>) {
     cfg.client.remote = format!("http://127.0.0.1:{}{}", server_addr.port(), PATH);
     let state = httproxy::client::build_state(&cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -152,6 +161,20 @@ pub async fn spawn_client(mut cfg: ClientTopConfig, server_addr: SocketAddr) -> 
             .unwrap(),
     );
     let sem = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
+
+    let mut redirect_addrs = Vec::new();
+    for rule in httproxy::client::redirect::RedirectRule::parse_all(&cfg.redirect).unwrap() {
+        let addr = httproxy::client::redirect::spawn(
+            rule,
+            http_client.clone(),
+            state.clone(),
+            sem.clone(),
+        )
+        .await
+        .unwrap();
+        redirect_addrs.push(addr);
+    }
+
     tokio::spawn(async move {
         loop {
             let Ok((socket, _)) = listener.accept().await else {
@@ -174,7 +197,7 @@ pub async fn spawn_client(mut cfg: ClientTopConfig, server_addr: SocketAddr) -> 
             });
         }
     });
-    proxy_addr
+    (proxy_addr, redirect_addrs)
 }
 
 pub async fn raw_exchange(proxy: SocketAddr, request: &[u8]) -> (u16, Vec<u8>) {

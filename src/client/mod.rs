@@ -3,6 +3,7 @@ pub mod connection;
 pub mod constants;
 pub mod handshake;
 pub mod proxy;
+pub mod redirect;
 pub mod state;
 pub mod utils;
 

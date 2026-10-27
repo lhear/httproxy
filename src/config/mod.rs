@@ -25,6 +25,18 @@ pub struct ClientTopConfig {
     pub traffic_shaping: TrafficConfig,
     #[serde(default)]
     pub bypass: BypassConfig,
+    /// `[[redirect]]` 本地端口转发（等价于 ssh -L）
+    #[serde(default)]
+    pub redirect: Vec<RedirectSection>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectSection {
+    /// 本地监听地址，必须是 `ip:port`
+    pub listen: String,
+    /// 隧道另一端的 `host:port`
+    pub target: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -121,5 +133,34 @@ padding_threshold = 50
         let cfg: ClientTopConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.client.listen, "127.0.0.1:8080");
         assert_eq!(cfg.auth.token, "mytoken");
+    }
+
+    #[test]
+    fn parse_client_redirect_rules() {
+        let toml_str = r#"
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://example.com/secret"
+
+[auth]
+token = "mytoken"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+
+[[redirect]]
+listen = "127.0.0.1:2222"
+target = "172.16.0.207:22"
+
+[[redirect]]
+listen = "127.0.0.1:2223"
+target = "example.com:443"
+"#;
+        let cfg: ClientTopConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.redirect.len(), 2);
+        assert_eq!(cfg.redirect[0].listen, "127.0.0.1:2222");
+        assert_eq!(cfg.redirect[0].target, "172.16.0.207:22");
+        assert_eq!(cfg.redirect[1].target, "example.com:443");
     }
 }

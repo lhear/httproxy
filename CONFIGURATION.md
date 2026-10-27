@@ -86,6 +86,11 @@ bypass_files = [
   "./bypass.json",
 ]
 
+# Local port forwarding (ssh -L style); repeatable
+[[redirect]]
+listen = "127.0.0.1:2222"
+target = "172.16.0.207:22"
+
 # [log]
 # file_path = "client.log"
 # level = "info"
@@ -129,13 +134,48 @@ its own clients (username/password basic auth).
 | `username` | string | yes      | Proxy username.              |
 | `password` | string | yes      | Proxy password.              |
 
-### 2.3 `[auth]` — Server Authentication
+### 2.3 `[[redirect]]` — Local Port Forwarding
+
+Optional, repeatable. Each entry listens on a local TCP port and forwards the
+raw byte stream into the tunnel towards `target` — the same thing `ssh -L` does,
+and the reason it exists: you do not need a browser or HTTP proxy support, any
+TCP client works.
+
+```toml
+[[redirect]]
+listen = "127.0.0.1:2222"    # local address, must be ip:port
+target = "172.16.0.207:22"   # host:port on the far side of the tunnel
+```
+
+| Field    | Type   | Required | Description |
+| -------- | ------ | -------- | ----------- |
+| `listen` | string | yes      | Local `ip:port`; use `127.0.0.1:0` to let the OS pick a port (logged at startup). |
+| `target` | string | yes      | `host:port` on the far side of the tunnel. Domain names are resolved by the **server**, exactly like a proxied request. |
+
+Notes:
+
+- Redirects share the same `[client] max_connections` budget as the HTTP proxy
+  listener, and the same `[[bypass]]` rules (a matching target is connected
+  directly, outside the tunnel).
+- A bad `listen` / `target` (or a duplicated `listen`) fails startup instead of
+  being silently ignored.
+- The local port speaks no protocol at all: no HTTP, no auth handshake. Do not
+  expose it on a public interface unless the tunnel itself is the security
+  boundary you want.
+
+Example — reach an internal SSH box through the tunnel:
+
+```bash
+ssh -p 2222 your-user@127.0.0.1
+```
+
+### 2.4 `[auth]` — Server Authentication
 
 | Field   | Type   | Required | Description                                        |
 | ------- | ------ | -------- | -------------------------------------------------- |
 | `token` | string | yes      | Bearer token presented to the server on every tunnel request (a JWT issued with `gen-token`). |
 
-### 2.4 `[bypass]`
+### 2.5 `[bypass]`
 
 Optional. Routes traffic matching the rules in the referenced JSON files
 directly, outside the tunnel (§6).

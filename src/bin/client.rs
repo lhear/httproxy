@@ -60,6 +60,17 @@ async fn main() -> anyhow::Result<()> {
 
     let conn_sem = Arc::new(Semaphore::new(state.max_connections));
 
+    // [[redirect]]：本地端口转发，与 HTTP 代理入站共用同一个连接数上限
+    for rule in httproxy::client::redirect::RedirectRule::parse_all(&config.redirect)? {
+        httproxy::client::redirect::spawn(
+            rule,
+            Arc::clone(&http_client),
+            Arc::clone(&state),
+            Arc::clone(&conn_sem),
+        )
+        .await?;
+    }
+
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(conn) => conn,

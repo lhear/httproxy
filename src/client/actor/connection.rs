@@ -1,16 +1,14 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tracing::info;
 
 use crate::client::constants::{
     AUTH_REJECT_DRAIN_WINDOW, CONNECT_RESPONSE, EARLY_READ_CHUNK, EARLY_READ_WINDOW,
     PROXY_AUTH_REQUIRED_RESPONSE, PROXY_BUF_INITIAL_CAPACITY, PROXY_REQUEST_PARSE_TIMEOUT,
 };
 use crate::client::proxy;
-use crate::client::state::ClientPqFsm;
 use crate::client::state::SharedState;
 
 pub struct ClientConnectionActor {
@@ -61,39 +59,16 @@ impl ClientConnectionActor {
             proxy::rewrite_request_line(&mut buf, header_len, &method, &origin_path)?;
         }
 
-        if let Some(ref bypass) = state.bypass
-            && bypass.should_bypass(&target_host)
-        {
-            info!(mode = "bypass", "direct connect");
-            let payload = buf.split().freeze();
-            return handle_bypass_direct(read_half, write_half, &target_host, payload).await;
-        }
-
         let payload = buf.split().freeze();
-        info!(mode = "proxy", "connecting");
-
-        if let Some(ref server_pk) = state.server_public_key {
-            let fsm = ClientPqFsm::new(
-                target_host,
-                payload,
-                read_half,
-                write_half,
-                *server_pk,
-                &state,
-            )
-            .await;
-            fsm.run(http_client, state).await
-        } else {
-            crate::client::connection::handle_plain_proxy(
-                read_half,
-                write_half,
-                http_client,
-                state,
-                payload,
-                &target_host,
-            )
-            .await
-        }
+        crate::client::connection::open_tunnel(
+            read_half,
+            write_half,
+            http_client,
+            state,
+            payload,
+            &target_host,
+        )
+        .await
     }
 }
 
@@ -168,42 +143,6 @@ async fn read_early_data(read_half: &mut OwnedReadHalf, buf: &mut BytesMut) {
             Ok(Ok(_)) => {}
         }
     }
-}
-
-async fn handle_bypass_direct(
-    mut read_half: OwnedReadHalf,
-    mut write_half: OwnedWriteHalf,
-    target: &str,
-    initial_payload: Bytes,
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-    let mut remote = TcpStream::connect(target)
-        .await
-        .with_context(|| format!("bypass connect to {target} failed"))?;
-    remote.set_nodelay(true)?;
-
-    info!(target = %target, initial_bytes = %initial_payload.len(), "bypass connected");
-
-    if !initial_payload.is_empty() {
-        remote.write_all(&initial_payload).await?;
-    }
-    drop(initial_payload);
-    let (mut remote_read, mut remote_write) = remote.into_split();
-    let up = async {
-        let res = tokio::io::copy(&mut read_half, &mut remote_write).await;
-        let _ = remote_write.shutdown().await;
-        res
-    };
-    let down = async {
-        let res = tokio::io::copy(&mut remote_read, &mut write_half).await;
-        let _ = write_half.shutdown().await;
-        res
-    };
-    let (up_res, down_res) = tokio::join!(up, down);
-    up_res.context("bypass client->remote")?;
-    down_res.context("bypass remote->client")?;
-    info!(target = %target, "bypass connection closed");
-    Ok(())
 }
 
 #[cfg(test)]

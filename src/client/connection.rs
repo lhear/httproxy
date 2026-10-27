@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::{Instrument, info};
 
+use crate::client::state::ClientPqFsm;
 use crate::client::{
     actor::{download_loop::DownloadLoopActor, upload_loop::UploadLoopActor},
     constants::DOWNLOAD_CONNECT_TIMEOUT,
@@ -11,9 +14,57 @@ use crate::client::{
     utils,
 };
 
+/// 建立一条到 `target_host` 的隧道，并把 `payload`（可能为空）作为首包发出去。
+///
+/// HTTP 代理入站（解析出 CONNECT/绝对 URI 之后）和 `[[redirect]]` 端口转发
+/// 共用这一条路径：差別只在于前者带着已读到的请求字节，后者什么都不带。
+pub(crate) async fn open_tunnel(
+    read_half: OwnedReadHalf,
+    write_half: OwnedWriteHalf,
+    http_client: Arc<wreq::Client>,
+    state: Arc<SharedState>,
+    payload: Bytes,
+    target_host: &str,
+) -> Result<()> {
+    if let Some(ref bypass) = state.bypass
+        && bypass.should_bypass(target_host)
+    {
+        info!(mode = "bypass", "direct connect");
+        return handle_bypass_direct(read_half, write_half, target_host, payload).await;
+    }
+
+    info!(mode = "proxy", "connecting");
+    let server_pk = state.server_public_key;
+    match server_pk {
+        Some(pk) => {
+            let fsm = ClientPqFsm::new(
+                target_host.to_owned(),
+                payload,
+                read_half,
+                write_half,
+                pk,
+                &state,
+            )
+            .await;
+            fsm.run(http_client, state).await
+        }
+        None => {
+            handle_plain_proxy(
+                read_half,
+                write_half,
+                http_client,
+                state,
+                payload,
+                target_host,
+            )
+            .await
+        }
+    }
+}
+
 pub(crate) async fn handle_plain_proxy(
-    read_half: tokio::net::tcp::OwnedReadHalf,
-    write_half: tokio::net::tcp::OwnedWriteHalf,
+    read_half: OwnedReadHalf,
+    write_half: OwnedWriteHalf,
     http_client: Arc<wreq::Client>,
     state: Arc<SharedState>,
     payload: Bytes,
@@ -80,4 +131,40 @@ pub async fn handle_connection_actor(
     use crate::client::actor::connection::ClientConnectionActor;
     let actor = ClientConnectionActor::new(socket, http_client, state);
     actor.run().await
+}
+
+/// 直接连目标（bypass 命中时），双向原样搬运。
+async fn handle_bypass_direct(
+    mut read_half: OwnedReadHalf,
+    mut write_half: OwnedWriteHalf,
+    target: &str,
+    initial_payload: Bytes,
+) -> Result<()> {
+    let mut remote = TcpStream::connect(target)
+        .await
+        .with_context(|| format!("bypass connect to {target} failed"))?;
+    remote.set_nodelay(true)?;
+
+    info!(target = %target, initial_bytes = %initial_payload.len(), "bypass connected");
+
+    if !initial_payload.is_empty() {
+        remote.write_all(&initial_payload).await?;
+    }
+    drop(initial_payload);
+    let (mut remote_read, mut remote_write) = remote.into_split();
+    let up = async {
+        let res = tokio::io::copy(&mut read_half, &mut remote_write).await;
+        let _ = remote_write.shutdown().await;
+        res
+    };
+    let down = async {
+        let res = tokio::io::copy(&mut remote_read, &mut write_half).await;
+        let _ = write_half.shutdown().await;
+        res
+    };
+    let (up_res, down_res) = tokio::join!(up, down);
+    up_res.context("bypass client->remote")?;
+    down_res.context("bypass remote->client")?;
+    info!(target = %target, "bypass connection closed");
+    Ok(())
 }
