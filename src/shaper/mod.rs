@@ -33,6 +33,17 @@ const MAX_BINARY_FRAME_LEN: usize = MAX_RAW_PAYLOAD + 38;
 const MAX_JSON_LINE_LEN: usize = MAX_RAW_PAYLOAD + 2396;
 const HEADER_LEN: usize = 10;
 
+/// 单帧编码后的最大字节数（含二进制长度前缀 / JSON 行尾换行）。
+///
+/// 用它一次性预分配编码缓冲区，避免 `BytesMut` 从 0 开始反复扩容拷贝。
+#[inline]
+pub fn max_encoded_frame_len(encoding: EncodingType) -> usize {
+    match encoding {
+        EncodingType::Binary => MAX_BINARY_FRAME_LEN + 2,
+        EncodingType::Json => MAX_JSON_LINE_LEN + 1,
+    }
+}
+
 static JITTER_TABLE: OnceLock<Box<[u64; TABLE_SIZE]>> = OnceLock::new();
 
 fn generate_jitter_table(mut rng: impl Rng) -> Box<[u64; TABLE_SIZE]> {
@@ -259,19 +270,106 @@ fn parse_json_payload_into(json: &[u8], out: &mut Vec<u8>) -> Result<usize, Erro
 }
 
 #[inline]
-fn write_encoded_frame(buf: &mut BytesMut, data: &[u8], encoding: EncodingType) {
-    match encoding {
-        EncodingType::Binary => {
-            buf.put_u16(data.len() as u16);
-            buf.put_slice(data);
+fn frame_raw_limit(cipher: Option<&dyn FrameCipher>, encoding: EncodingType) -> usize {
+    match (cipher.is_some(), encoding) {
+        (true, EncodingType::Json) => JSON_PAYLOAD_CAP_CIPHER,
+        (false, EncodingType::Json) => JSON_PAYLOAD_CAP_PLAIN,
+        _ => MAX_RAW_PAYLOAD,
+    }
+}
+
+#[inline]
+fn resolve_frame_padding(
+    raw_len: usize,
+    padding_threshold: usize,
+    padding_range: [usize; 2],
+    raw_limit: usize,
+) -> usize {
+    if raw_len < padding_threshold {
+        let max_pad = raw_limit - raw_len;
+        let wanted = rand::rng().random_range(padding_range[0]..=padding_range[1]);
+        wanted.min(max_pad)
+    } else {
+        0
+    }
+}
+
+/// 把一帧直接编码进调用方提供的缓冲区。
+///
+/// 与 [`encode_frame`] 相比省掉了“临时 `Vec` + `BytesMut` + `to_vec`”三次
+/// 分配与两次整帧拷贝；二进制编码下复用同一个 `BytesMut` 即零额外分配
+/// （JSON 编码因为要过 Base122，仍需一个临时缓冲）。
+pub fn encode_frame_into(
+    data: &[u8],
+    seq: u64,
+    cipher: Option<&dyn FrameCipher>,
+    padding_threshold: usize,
+    padding_range: [usize; 2],
+    encoding: EncodingType,
+    out: &mut BytesMut,
+) -> std::io::Result<()> {
+    let raw_len = data.len();
+    let raw_limit = frame_raw_limit(cipher, encoding);
+    if raw_len > raw_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("frame payload too large: {raw_len} > {raw_limit}"),
+        ));
+    }
+
+    let padding_len = resolve_frame_padding(raw_len, padding_threshold, padding_range, raw_limit);
+    let payload_len = HEADER_LEN + raw_len + padding_len;
+
+    match (cipher, encoding) {
+        (Some(cipher), EncodingType::Binary) => {
+            let enc_len = NONCE_LEN + payload_len + TAG_LEN;
+            out.reserve(2 + enc_len);
+            out.put_u16(enc_len as u16);
+            let nonce_start = out.len();
+            out.put_bytes(0u8, NONCE_LEN);
+            let ct_start = out.len();
+            out.put_u64(seq);
+            out.put_u16(raw_len as u16);
+            out.put_slice(data);
+            if padding_len > 0 {
+                out.put_bytes(0u8, padding_len);
+            }
+            cipher.seal_in_place(out, nonce_start, ct_start)?;
         }
-        EncodingType::Json => {
-            let enc_str = base122_fast::encode(data);
-            buf.put_slice(b"{\"data\":\"");
-            buf.put_slice(enc_str.as_bytes());
-            buf.put_slice(b"\"}\n");
+        (None, EncodingType::Binary) => {
+            out.reserve(2 + payload_len);
+            out.put_u16(payload_len as u16);
+            out.put_u64(seq);
+            out.put_u16(raw_len as u16);
+            out.put_slice(data);
+            if padding_len > 0 {
+                out.put_bytes(0u8, padding_len);
+            }
+        }
+        (_, EncodingType::Json) => {
+            let mut payload = BytesMut::with_capacity(payload_len);
+            payload.put_u64(seq);
+            payload.put_u16(raw_len as u16);
+            payload.put_slice(data);
+            if padding_len > 0 {
+                payload.resize(payload_len, 0u8);
+            }
+            let mut encoded = Vec::with_capacity(payload_len + payload_len / 6 + 16);
+            if let Some(cipher) = cipher {
+                let mut sealed = BytesMut::with_capacity(payload_len + NONCE_LEN + TAG_LEN);
+                cipher.encrypt_into(&payload, &mut sealed)?;
+                base122_fast::encode_into(&sealed, &mut encoded);
+            } else {
+                base122_fast::encode_into(&payload, &mut encoded);
+            }
+            out.reserve(9 + encoded.len() + 3);
+            out.put_slice(b"{\"data\":\"");
+            out.put_slice(&encoded);
+            out.put_slice(b"\"}\n");
         }
     }
+
+    Ok(())
 }
 
 pub fn encode_frame(
@@ -282,42 +380,16 @@ pub fn encode_frame(
     padding_range: [usize; 2],
     encoding: EncodingType,
 ) -> std::io::Result<Vec<u8>> {
-    let raw_len = data.len();
-    let frame_raw_limit = match (cipher.is_some(), encoding) {
-        (true, EncodingType::Json) => JSON_PAYLOAD_CAP_CIPHER,
-        (false, EncodingType::Json) => JSON_PAYLOAD_CAP_PLAIN,
-        _ => MAX_RAW_PAYLOAD,
-    };
-    if raw_len > frame_raw_limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("frame payload too large: {raw_len} > {frame_raw_limit}"),
-        ));
-    }
-
-    let padding_len = if raw_len < padding_threshold {
-        let max_pad = frame_raw_limit - raw_len;
-        let wanted = rand::rng().random_range(padding_range[0]..=padding_range[1]);
-        wanted.min(max_pad)
-    } else {
-        0
-    };
-
-    let payload_len = HEADER_LEN + raw_len + padding_len;
-    let mut payload = Vec::with_capacity(payload_len);
-    payload.put_u64(seq);
-    payload.put_u16(raw_len as u16);
-    payload.extend_from_slice(data);
-    if padding_len > 0 {
-        payload.resize(payload_len, 0u8);
-    }
-
-    if let Some(cipher) = cipher {
-        payload = cipher.encrypt(&payload)?;
-    }
-
-    let mut frame = BytesMut::new();
-    write_encoded_frame(&mut frame, &payload, encoding);
+    let mut frame = BytesMut::with_capacity(max_encoded_frame_len(encoding));
+    encode_frame_into(
+        data,
+        seq,
+        cipher,
+        padding_threshold,
+        padding_range,
+        encoding,
+        &mut frame,
+    )?;
     Ok(frame.to_vec())
 }
 
@@ -392,11 +464,16 @@ pub fn decode_frame(
                         let (seq, start, end) = extract_frame_range(scratch)?;
                         Ok(Some(DecodedFrame::InScratch { seq, start, end }))
                     } else {
-                        let data = Bytes::from(std::mem::take(json_scratch));
-                        let (seq, start, end) = extract_frame_range(&data)?;
-                        Ok(Some(DecodedFrame::Owned {
+                        // 拷贝进可复用的 scratch，而不是把 json_scratch 的分配交出去：
+                        // 后者会让每帧都重新 malloc + free 一次
+                        let (seq, start, end) = extract_frame_range(json_scratch)?;
+                        let len = end - start;
+                        scratch.clear();
+                        scratch.extend_from_slice(&json_scratch[start..end]);
+                        Ok(Some(DecodedFrame::InScratch {
                             seq,
-                            data: data.slice(start..end),
+                            start: 0,
+                            end: len,
                         }))
                     }
                 }
@@ -463,6 +540,7 @@ pin_project! {
         cipher: Option<Arc<dyn FrameCipher>>,
         encoding: EncodingType,
         seal_threshold: usize,
+        frame_capacity: usize,
         seq: u64,
     }
 }
@@ -477,10 +555,7 @@ impl<R> TrafficShaper<R> {
         let mut base_rng = rand::rng();
         let cursor = (base_rng.next_u64() as usize) & TABLE_MASK;
 
-        let out_capacity = match config.encoding {
-            EncodingType::Binary => MAX_BINARY_FRAME_LEN + 2,
-            EncodingType::Json => MAX_JSON_LINE_LEN + 1,
-        };
+        let out_capacity = max_encoded_frame_len(config.encoding);
 
         let seal_threshold = match (cipher.is_some(), config.encoding) {
             (true, EncodingType::Binary) => {
@@ -509,6 +584,7 @@ impl<R> TrafficShaper<R> {
             cipher,
             encoding: config.encoding,
             seal_threshold,
+            frame_capacity: out_capacity,
             seq: start_seq,
         }
     }
@@ -591,13 +667,15 @@ impl<R> TrafficShaper<R> {
                 if padding_len > 0 {
                     this.out_buf.put_bytes(0u8, padding_len);
                 }
-                let payload = this.out_buf.split();
+                // 只借用切片而不是 split()：split() 会把 out_buf 的分配整体移走，
+                // 导致下一帧又要重新 malloc 一次。
                 if let Some(cipher) = this.cipher.as_deref() {
                     this.enc_buf.clear();
-                    cipher.encrypt_into(&payload[..payload_len], this.enc_buf)?;
-                    base122_fast::encode_into(this.enc_buf, this.json_buf);
+                    this.enc_buf.reserve(payload_len + NONCE_LEN + TAG_LEN);
+                    cipher.encrypt_into(&this.out_buf[..payload_len], this.enc_buf)?;
+                    base122_fast::encode_into(&this.enc_buf[..], this.json_buf);
                 } else {
-                    base122_fast::encode_into(&payload[..payload_len], this.json_buf);
+                    base122_fast::encode_into(&this.out_buf[..payload_len], this.json_buf);
                 }
                 out.reserve(9 + this.json_buf.len() + 3);
                 out.put_slice(b"{\"data\":\"");
@@ -689,7 +767,9 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
     type Item = Result<(u64, Bytes), Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut frame = BytesMut::new();
+        let capacity = self.as_ref().get_ref().frame_capacity;
+        // 预分配整帧容量，避免从 0 开始按倍增反复 realloc + memcpy
+        let mut frame = BytesMut::with_capacity(capacity);
         match self.poll_fill_and_seal(cx, &mut frame) {
             Poll::Ready(Ok(Some(seq))) => Poll::Ready(Some(Ok((seq, frame.freeze())))),
             Poll::Ready(Ok(None)) => Poll::Ready(None),
@@ -962,13 +1042,55 @@ mod tests {
         .unwrap()
         .unwrap()
         {
-            DecodedFrame::Owned { seq, data } => {
+            DecodedFrame::InScratch { seq, start, end } => {
                 assert_eq!(seq, 3);
-                assert_eq!(&data[..], b"json payload");
+                assert_eq!(&scratch[start..end], b"json payload");
             }
-            _ => panic!("expected Owned frame"),
+            _ => panic!("expected InScratch frame"),
         }
         assert!(src.is_empty());
+    }
+
+    #[test]
+    fn decode_frame_json_plain_keeps_scratch_allocation() {
+        let mut src = BytesMut::new();
+        for (i, msg) in [b"aaaa".as_slice(), b"bbbb".as_slice()].iter().enumerate() {
+            let frame =
+                encode_frame(msg, i as u64, None, 16384, [0, 0], EncodingType::Json).unwrap();
+            src.extend_from_slice(&frame);
+        }
+        let mut scratch = BytesMut::new();
+        let mut json_scratch = Vec::new();
+        let mut decoded = Vec::new();
+        let mut cap_after_first = 0usize;
+        for i in 0..2u64 {
+            match decode_frame(
+                &mut src,
+                &mut scratch,
+                &mut json_scratch,
+                None,
+                EncodingType::Json,
+            )
+            .unwrap()
+            .unwrap()
+            {
+                DecodedFrame::InScratch { seq, start, end } => {
+                    assert_eq!(seq, i);
+                    decoded.extend_from_slice(&scratch[start..end]);
+                }
+                _ => panic!("expected InScratch frame"),
+            }
+            if i == 0 {
+                cap_after_first = json_scratch.capacity();
+                assert!(cap_after_first > 0, "json_scratch 容量被复用，而不是被取走");
+            }
+        }
+        assert_eq!(decoded, b"aaaabbbb");
+        assert_eq!(
+            json_scratch.capacity(),
+            cap_after_first,
+            "第二帧不能重新分配 json_scratch"
+        );
     }
 
     #[test]

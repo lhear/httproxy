@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rand::RngExt;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -34,15 +34,16 @@ pub fn build_stream_cookie(buf: &mut String, stream_id: Uuid) {
 }
 
 pub fn encode_initial_payload(
-    initial_payload: &[u8],
+    initial_payload: &Bytes,
     max_bytes: usize,
     cipher: Option<&dyn FrameCipher>,
     config: &shaper::TrafficConfig,
-) -> Result<(Vec<u8>, Bytes, u64)> {
+) -> Result<(Bytes, Bytes, u64)> {
     let take_len = initial_payload.len().min(max_bytes);
     let data_to_send = &initial_payload[..take_len];
+    // 剩余部分直接切片复用原分配，不做整块拷贝
     let remaining = if take_len < initial_payload.len() {
-        Bytes::copy_from_slice(&initial_payload[take_len..])
+        initial_payload.slice(take_len..)
     } else {
         Bytes::new()
     };
@@ -52,28 +53,30 @@ pub fn encode_initial_payload(
         (false, shaper::EncodingType::Json) => shaper::JSON_PAYLOAD_CAP_PLAIN,
         _ => shaper::MAX_RAW_PAYLOAD,
     };
-    let mut body = Vec::new();
+    let frame_count = data_to_send.len().div_ceil(raw_payload_limit.max(1));
+    let mut body =
+        BytesMut::with_capacity(frame_count * shaper::max_encoded_frame_len(config.encoding_type));
     let mut offset = 0;
     let mut seq: u64 = 0;
 
     while offset < data_to_send.len() {
         let chunk_end = (offset + raw_payload_limit).min(data_to_send.len());
         let chunk = &data_to_send[offset..chunk_end];
-        let frame = shaper::encode_frame(
+        shaper::encode_frame_into(
             chunk,
             seq,
             cipher,
             config.global.padding_threshold,
             config.global.padding_range,
             config.encoding_type,
+            &mut body,
         )
         .context("encode_frame failed on initial payload")?;
-        body.extend_from_slice(&frame);
         offset = chunk_end;
         seq += 1;
     }
 
-    Ok((body, remaining, seq))
+    Ok((body.freeze(), remaining, seq))
 }
 
 pub async fn race_upload_download<F: Future<Output = Result<()>>>(
@@ -175,7 +178,7 @@ mod tests {
             max_download_bytes: None,
         };
         let (body, remaining, seq) =
-            encode_initial_payload(b"", shaper::MAX_RAW_PAYLOAD, None, &config).unwrap();
+            encode_initial_payload(&Bytes::new(), shaper::MAX_RAW_PAYLOAD, None, &config).unwrap();
         assert!(body.is_empty());
         assert!(remaining.is_empty());
         assert_eq!(seq, 0);
@@ -209,7 +212,8 @@ mod tests {
             max_download_bytes: None,
         };
         let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
-        let (body, remaining, seq) = encode_initial_payload(&data, usize::MAX, None, &cfg).unwrap();
+        let (body, remaining, seq) =
+            encode_initial_payload(&Bytes::from(data.clone()), usize::MAX, None, &cfg).unwrap();
         assert!(remaining.is_empty());
         let mut src = BytesMut::from(&body[..]);
         let mut scratch = BytesMut::new();
