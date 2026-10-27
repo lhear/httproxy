@@ -10,6 +10,9 @@ use tracing::{Instrument, debug, error_span, info, warn};
 
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
+/// accept 出现非瞬态错误（如 fd 耗尽）后的退避时间，避免 CPU 空转。
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -61,7 +64,20 @@ async fn main() -> anyhow::Result<()> {
         let (socket, peer) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                warn!(reason = %e, "accept failed");
+                // EMFILE / ENFILE 这类资源耗尽会让 accept 立刻再次失败，
+                // 无条件 continue 会变成 100% CPU 的忙等，必须退让一下。
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                ) {
+                    debug!(reason = %e, "accept interrupted, retrying");
+                } else {
+                    warn!(reason = %e, "accept failed, backing off");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                }
                 continue;
             }
         };
