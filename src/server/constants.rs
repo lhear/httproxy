@@ -18,6 +18,8 @@ pub const MASTER_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 一次向量写最多带多少帧（补齐空档时把连续帧合并成少数几次系统调用）
+pub const MAX_WRITE_IOV: usize = 64;
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 每个下载段结束时通知隧道 actor 的通道容量（每段一条消息）

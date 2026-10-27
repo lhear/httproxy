@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use std::collections::BTreeMap;
+use std::io::IoSlice;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
@@ -8,7 +9,8 @@ use tracing::warn;
 
 use crate::error::ServerError;
 use crate::server::constants::{
-    MAX_EOS_WAITERS, MAX_PENDING_BYTES, MAX_PENDING_FRAMES, MAX_REORDER_SECS, WRITE_TIMEOUT,
+    MAX_EOS_WAITERS, MAX_PENDING_BYTES, MAX_PENDING_FRAMES, MAX_REORDER_SECS, MAX_WRITE_IOV,
+    WRITE_TIMEOUT,
 };
 
 pub enum UploadCmd {
@@ -41,6 +43,8 @@ pub struct UploadActor {
     phase: UploadPhase,
     upstream: Option<OwnedWriteHalf>,
     last_activity: Instant,
+    /// 复用的一次性写批次，避免每次补齐空档都分配
+    run_buf: Vec<Bytes>,
 }
 
 impl UploadActor {
@@ -55,6 +59,7 @@ impl UploadActor {
             },
             upstream: Some(upstream),
             last_activity: Instant::now(),
+            run_buf: Vec::with_capacity(MAX_WRITE_IOV),
         }
     }
 
@@ -111,32 +116,32 @@ impl UploadActor {
                     return false;
                 }
                 if seq == *next_seq {
-                    if let Some(ref mut upstream) = self.upstream
-                        && !matches!(
-                            tokio::time::timeout(WRITE_TIMEOUT, upstream.write_all(&data)).await,
-                            Ok(Ok(()))
-                        )
-                    {
-                        self.shutdown_and_drain().await;
-                        return true;
-                    }
-                    *next_seq += 1;
-                    while let Some(pending_data) = pending.remove(next_seq) {
-                        *pending_bytes -= pending_data.len();
-                        if let Some(ref mut upstream) = self.upstream
-                            && !matches!(
-                                tokio::time::timeout(
-                                    WRITE_TIMEOUT,
-                                    upstream.write_all(&pending_data),
-                                )
-                                .await,
-                                Ok(Ok(()))
-                            )
-                        {
+                    // 「刚到的这一帧 + 重排序缓冲里紧随其后的连续帧」合成一段，
+                    // 用向量写一次吐出去：补齐空档时原来是每帧一次系统调用。
+                    let mut head = data;
+                    loop {
+                        self.run_buf.clear();
+                        self.run_buf.push(head);
+                        *next_seq += 1;
+                        while self.run_buf.len() < MAX_WRITE_IOV {
+                            let Some(next_data) = pending.remove(next_seq) else {
+                                break;
+                            };
+                            *pending_bytes -= next_data.len();
+                            self.run_buf.push(next_data);
+                            *next_seq += 1;
+                        }
+                        if !write_run(&mut self.upstream, &self.run_buf).await {
                             self.shutdown_and_drain().await;
                             return true;
                         }
-                        *next_seq += 1;
+                        match pending.remove(next_seq) {
+                            Some(next_data) => {
+                                *pending_bytes -= next_data.len();
+                                head = next_data;
+                            }
+                            None => break,
+                        }
                     }
                     let mut i = 0;
                     while i < eos_waiters.len() {
@@ -240,9 +245,62 @@ impl UploadActor {
     }
 }
 
+/// 把一段连续帧写进上游。返回 `false` 表示写失败/超时，调用方需要收尾。
+async fn write_run(upstream: &mut Option<OwnedWriteHalf>, frames: &[Bytes]) -> bool {
+    let Some(upstream) = upstream.as_mut() else {
+        return false;
+    };
+    let written = if frames.len() == 1 {
+        // 单帧是常态，走普通 write，省掉 iov 装配
+        tokio::time::timeout(WRITE_TIMEOUT, upstream.write_all(&frames[0])).await
+    } else {
+        tokio::time::timeout(WRITE_TIMEOUT, write_vectored_all(upstream, frames)).await
+    };
+    matches!(written, Ok(Ok(())))
+}
+
+/// 一段连续帧一次系统调用写出去；部分写时按帧/帧内偏移推进。
+async fn write_vectored_all(
+    upstream: &mut OwnedWriteHalf,
+    frames: &[Bytes],
+) -> std::io::Result<()> {
+    let mut first = 0usize;
+    let mut skip = 0usize;
+    while first < frames.len() {
+        let written = {
+            let mut slices: [IoSlice<'_>; MAX_WRITE_IOV] =
+                std::array::from_fn(|_| IoSlice::new(&[]));
+            let mut count = 0;
+            for (i, frame) in frames[first..].iter().enumerate().take(MAX_WRITE_IOV) {
+                let slice: &[u8] = if i == 0 { &frame[skip..] } else { &frame[..] };
+                slices[count] = IoSlice::new(slice);
+                count += 1;
+            }
+            upstream.write_vectored(&slices[..count]).await?
+        };
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        let mut left = written;
+        while left > 0 && first < frames.len() {
+            let remain = frames[first].len() - skip;
+            if left >= remain {
+                left -= remain;
+                first += 1;
+                skip = 0;
+            } else {
+                skip += left;
+                left = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::net::tcp::OwnedReadHalf;
 
@@ -450,6 +508,45 @@ mod tests {
         .unwrap();
         drop(tx);
         assert!(ack_rx.await.is_err());
+        handle.await.unwrap();
+    }
+
+    /// 一次补齐跨越多次向量写的大空档：帧顺序必须完全保持。
+    #[tokio::test]
+    async fn large_gap_fill_keeps_order_across_write_runs() {
+        let (mut client_read, server_write) = tcp_pair().await;
+        let total = MAX_WRITE_IOV * 3 + 5;
+        let (tx, rx) = mpsc::channel::<UploadCmd>(total + 16);
+        let actor = UploadActor::new(rx, server_write, 0);
+        let handle = tokio::spawn(async move { actor.run().await });
+
+        // 先发 1..total，最后补上 0：一次补齐整段，超过单次向量写上限
+        for seq in 1..total as u64 {
+            tx.send(UploadCmd::Frame {
+                seq,
+                data: Bytes::from(vec![seq as u8; 64]),
+            })
+            .await
+            .unwrap();
+        }
+        tx.send(UploadCmd::Frame {
+            seq: 0,
+            data: Bytes::from(vec![0u8; 64]),
+        })
+        .await
+        .unwrap();
+
+        let mut got = vec![0u8; total * 64];
+        client_read.read_exact(&mut got).await.unwrap();
+        for seq in 0..total {
+            assert_eq!(
+                got[seq * 64],
+                seq as u8,
+                "frame {seq} arrived out of order after a multi-run drain"
+            );
+        }
+
+        drop(tx);
         handle.await.unwrap();
     }
 
