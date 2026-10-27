@@ -88,7 +88,6 @@ pub fn client_config(
             max_connections: None,
             max_in_flight_bytes: None,
             upload_concurrency: None,
-            upload_coalesce_ms: None,
         },
         auth: ClientAuthSection {
             token: token.unwrap_or_else(valid_token),

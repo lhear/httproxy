@@ -81,11 +81,6 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         max_connections: cfg.client.max_connections.unwrap_or(MAX_LOCAL_CONNECTIONS),
         max_in_flight_bytes,
         upload_concurrency,
-        upload_coalesce: cfg
-            .client
-            .upload_coalesce_ms
-            .filter(|ms| *ms > 0)
-            .map(std::time::Duration::from_millis),
     }))
 }
 

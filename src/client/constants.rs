@@ -19,8 +19,6 @@ pub const PROXY_BUF_INITIAL_CAPACITY: usize = 2048;
 pub const EARLY_READ_CHUNK: usize = 2048;
 
 pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
-/// 合并窗口只作用于小批：超过这个大小说明已经是批量流量，再等就是白加延迟。
-pub const UPLOAD_COALESCE_MAX_BATCH: usize = 64 * 1024;
 /// 批处理缓冲的初始容量约等于一个最大帧，避免从 8 KiB 起反复翻倍扩容拷贝。
 pub const BATCH_BUF_INITIAL_CAPACITY: usize = 32 * 1024;
 pub const MAX_IN_FLIGHT_BYTES: usize = 2 * 1024 * 1024;

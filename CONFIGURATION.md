@@ -73,7 +73,6 @@ remote = "https://your-server-domain/YOUR_SECRET_PATH"
 # max_connections = 1024
 # max_in_flight_bytes = 2097152
 # upload_concurrency = 128
-# upload_coalesce_ms = 0
 
 # [client.auth]
 # username = "proxyuser"
@@ -119,7 +118,6 @@ padding_threshold = 2000
 | `max_connections`     | integer | no       | `1024`      | Cap on concurrent local connections; excess connections are refused. Bounds client-side memory under load. |
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Cap on upload bytes in flight per tunnel. Trade-off between throughput and memory. **Must not exceed the server's reorder buffer (§9).** |
 | `upload_concurrency`  | integer | no       | `128`       | Cap on concurrent upload POSTs per tunnel. |
-| `upload_coalesce_ms`  | integer | no       | `0`         | Wait up to this many ms (only for batches below 64 KiB) to fold frames that arrive back to back into one upload POST. Trades that latency for fewer requests; `1`–`2` is the useful range, `0` disables it. |
 
 ### 2.2 `[client.auth]` — Local Proxy Authentication
 
@@ -392,7 +390,6 @@ newline-delimited JSON (ANSI color when writing to a terminal).
 | `[client] max_connections` | `1024` | —    | Concurrent local connections; excess are refused. |
 | `[client] upload_concurrency` | `128` | —  | Concurrent upload POSTs per tunnel. |
 | `[client] max_in_flight_bytes` | `2097152` (2 MiB) | ≤ server reorder buffer | Upload bytes in flight per tunnel; the throughput/memory trade-off knob. |
-| `[client] upload_coalesce_ms` | `0` | — | Optional batching window for small uploads; fewer POSTs vs. up to that much latency. |
 
 **Important:** the server maintains a 2 MiB per-tunnel reorder buffer.
 `max_in_flight_bytes` **must not exceed 2 MiB**; a larger value causes hard

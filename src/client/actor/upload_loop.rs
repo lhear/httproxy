@@ -4,7 +4,6 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, Waker};
-use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -13,7 +12,7 @@ use uuid::Uuid;
 
 use super::super::state::SharedState;
 use crate::client::constants::{
-    BATCH_BUF_INITIAL_CAPACITY, MAX_BATCH_BYTES, UPLOAD_COALESCE_MAX_BATCH, UPLOAD_REQUEST_TIMEOUT,
+    BATCH_BUF_INITIAL_CAPACITY, MAX_BATCH_BYTES, UPLOAD_REQUEST_TIMEOUT,
 };
 use crate::client::utils;
 use crate::crypto::AesFrameCipher;
@@ -36,7 +35,6 @@ pub struct UploadLoopActor {
     bytes_sem: Arc<Semaphore>,
     max_batch_bytes: usize,
     max_in_flight_bytes: usize,
-    coalesce_window: Option<Duration>,
     tasks: JoinSet<Result<(), anyhow::Error>>,
     phase: Phase,
 }
@@ -62,7 +60,6 @@ impl UploadLoopActor {
         ));
         let upload_concurrency = state.upload_concurrency;
         let max_in_flight_bytes = state.max_in_flight_bytes;
-        let coalesce_window = state.upload_coalesce;
         // 一帧最多可以超出批处理上限一个整帧，必须把这段余量从 in-flight 预算里
         // 扣掉，否则单批可能申请到超过信号量总量的许可（直接失败/卡死）。
         let frame_headroom = shaper::max_encoded_frame_len(state.traffic_config.encoding_type);
@@ -78,7 +75,6 @@ impl UploadLoopActor {
             bytes_sem: Arc::new(Semaphore::new(max_in_flight_bytes)),
             max_batch_bytes,
             max_in_flight_bytes,
-            coalesce_window,
             tasks: JoinSet::new(),
             phase: Phase::Batching {
                 batch_buf: BytesMut::with_capacity(BATCH_BUF_INITIAL_CAPACITY.min(max_batch_bytes)),
@@ -107,63 +103,6 @@ impl UploadLoopActor {
         self.shaped.as_mut().poll_seal_into(cx, batch_buf)
     }
 
-    /// 非阻塞地把源上已经可读的数据都封进这一批。
-    ///
-    /// 这里刻意用 noop waker：只想知道"现在还有没有"，不想被唤醒，也不该
-    /// 让这一轮把一次额外的 read 系统调用挂上去。
-    fn drain_ready(&mut self, batch_buf: &mut BytesMut, stream_ended: &mut bool) -> Result<()> {
-        let waker = Waker::noop();
-        let mut cx = TaskContext::from_waker(waker);
-        while batch_buf.len() < self.max_batch_bytes {
-            match self.poll_seal(&mut cx, batch_buf) {
-                Poll::Ready(Ok(Some(_))) => {}
-                Poll::Ready(Ok(None)) => {
-                    *stream_ended = true;
-                    break;
-                }
-                Poll::Ready(Err(e)) => return Err(e.into()),
-                Poll::Pending => break,
-            }
-        }
-        Ok(())
-    }
-
-    /// 在合并窗口内再等等：只有"批还很小"时才等，避免给大流量凭空加延迟。
-    ///
-    /// 返回 `true` 表示流已经结束。
-    async fn coalesce(&mut self, batch_buf: &mut BytesMut) -> Result<bool> {
-        let Some(window) = self.coalesce_window else {
-            return Ok(false);
-        };
-        if batch_buf.len() >= UPLOAD_COALESCE_MAX_BATCH {
-            return Ok(false);
-        }
-
-        let sleep = tokio::time::sleep(window);
-        tokio::pin!(sleep);
-        loop {
-            let seal =
-                std::future::poll_fn(|cx| self.shaped.as_mut().poll_seal_into(cx, batch_buf));
-            tokio::select! {
-                biased;
-                r = seal => match r {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ok(true),
-                    Err(e) => return Err(e.into()),
-                },
-                result = self.tasks.join_next(), if !self.tasks.is_empty() => match result {
-                    Some(Ok(Ok(()))) | None => {}
-                    Some(Ok(Err(e))) => return Err(e.context("upload POST failed")),
-                    Some(Err(e)) => return Err(anyhow!("upload task panicked: {e}")),
-                },
-                _ = &mut sleep => return Ok(false),
-            }
-            if batch_buf.len() >= self.max_batch_bytes {
-                return Ok(false);
-            }
-        }
-    }
-
     async fn do_batching(&mut self, mut batch_buf: BytesMut) -> Result<Phase> {
         let mut stream_ended = false;
 
@@ -185,9 +124,18 @@ impl UploadLoopActor {
         }
 
         if !stream_ended {
-            self.drain_ready(&mut batch_buf, &mut stream_ended)?;
-            if !stream_ended {
-                stream_ended = self.coalesce(&mut batch_buf).await?;
+            let waker = Waker::noop();
+            let mut cx = TaskContext::from_waker(waker);
+            while batch_buf.len() < self.max_batch_bytes {
+                match self.poll_seal(&mut cx, &mut batch_buf) {
+                    Poll::Ready(Ok(Some(_))) => {}
+                    Poll::Ready(Ok(None)) => {
+                        stream_ended = true;
+                        break;
+                    }
+                    Poll::Ready(Err(e)) => return Err(e.into()),
+                    Poll::Pending => break,
+                }
             }
         }
 
@@ -308,14 +256,6 @@ mod tests {
     use tokio::sync::Mutex;
 
     fn test_state(remote: &str, max_in_flight: usize) -> Arc<SharedState> {
-        test_state_with(remote, max_in_flight, None)
-    }
-
-    fn test_state_with(
-        remote: &str,
-        max_in_flight: usize,
-        coalesce: Option<Duration>,
-    ) -> Arc<SharedState> {
         let traffic = TrafficConfig {
             global: PaddingConfig {
                 padding_threshold: 0,
@@ -339,27 +279,24 @@ mod tests {
             max_connections: 8,
             max_in_flight_bytes: max_in_flight,
             upload_concurrency: 4,
-            upload_coalesce: coalesce,
         })
     }
 
     async fn spawn_collector() -> (
         SocketAddr,
         tokio::sync::oneshot::Sender<()>,
-        tokio::task::JoinHandle<(Vec<u8>, usize)>,
+        tokio::task::JoinHandle<Vec<u8>>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             let mut collected = Vec::new();
-            let mut requests = 0usize;
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     r = listener.accept() => {
                         let Ok((mut sock, _)) = r else { break };
-                        requests += 1;
                         let mut buf = Vec::new();
                         let mut tmp = [0u8; 8192];
                         let header_end = loop {
@@ -400,7 +337,7 @@ mod tests {
                     }
                 }
             }
-            (collected, requests)
+            collected
         });
         (addr, stop_tx, handle)
     }
@@ -472,7 +409,7 @@ mod tests {
             .expect("upload loop must finish cleanly");
 
         let _ = stop_tx.send(());
-        let (received, _requests) = collector.await.unwrap();
+        let received = collector.await.unwrap();
         assert!(!received.is_empty(), "server must receive upload frames");
         assert_eq!(decode_all(&received), all);
     }
@@ -499,7 +436,7 @@ mod tests {
         handle.await.unwrap().unwrap();
 
         let _ = stop_tx.send(());
-        let (received, _requests) = collector.await.unwrap();
+        let received = collector.await.unwrap();
         let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::from(&received[..]);
@@ -554,53 +491,6 @@ mod tests {
         );
     }
 
-    /// 两段数据隔 2ms 写入：开合并窗口时应并成 1 个 POST，关掉时应是 2 个。
-    async fn posts_for_two_writes(coalesce: Option<Duration>) -> usize {
-        let (addr, stop_tx, collector) = spawn_collector().await;
-        let state = test_state_with(&format!("http://{addr}/"), 64 * 1024, coalesce);
-        let client = test_client();
-        let (read_half, mut writer) = tcp_pair().await;
-
-        let actor = UploadLoopActor::new(
-            client,
-            state,
-            Bytes::new(),
-            read_half,
-            None,
-            Uuid::new_v4(),
-            0,
-        );
-        let handle = tokio::spawn(async move { actor.run().await });
-
-        // 每段都超过 seal 阈值，各自能封出一帧；两段之间的间隔要足够大，
-        // 让上行循环肯定已经把第一批发出去了
-        writer.write_all(&vec![0x11u8; 20_000]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        writer.write_all(&vec![0x22u8; 20_000]).await.unwrap();
-        drop(writer);
-
-        handle.await.unwrap().expect("upload loop must finish");
-        let _ = stop_tx.send(());
-        let (received, requests) = collector.await.unwrap();
-        assert_eq!(decode_all(&received).len(), 40_000);
-        requests
-    }
-
-    #[tokio::test]
-    async fn coalesce_window_merges_back_to_back_frames() {
-        // 不开窗口时，shaper 每封出一帧就是一个 POST（残留的半帧还会额外触发一次）
-        let without = posts_for_two_writes(None).await;
-        assert!(
-            without >= 2,
-            "expected several POSTs without window, got {without}"
-        );
-
-        // 开窗口后，2 段数据（合计 ~40 KiB < 64 KiB）应该只发一个 POST
-        let with = posts_for_two_writes(Some(Duration::from_millis(200))).await;
-        assert_eq!(with, 1, "coalescing must merge everything into one POST");
-        assert!(with < without);
-    }
-
     #[tokio::test]
     async fn empty_input_sends_no_requests() {
         let (addr, stop_tx, collector) = spawn_collector().await;
@@ -622,8 +512,7 @@ mod tests {
         handle.await.unwrap().unwrap();
 
         let _ = stop_tx.send(());
-        let (received, requests) = collector.await.unwrap();
+        let received = collector.await.unwrap();
         assert!(received.is_empty(), "empty input must not send any POST");
-        assert_eq!(requests, 0);
     }
 }
