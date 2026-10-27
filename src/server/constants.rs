@@ -28,6 +28,11 @@ pub const MAX_TUNNELS: usize = 1024;
 
 pub const MASTER_EXPIRY: Duration = Duration::from_secs(1200);
 
+/// 已校验通过的 JWT 缓存时长。只在 `exp` 还够远时才写入缓存，因此缓存
+/// 永远不会让过期 token 通过校验。
+pub const JWT_CACHE_TTL: Duration = Duration::from_secs(60);
+pub const JWT_CACHE_CAPACITY: u64 = 2048;
+
 pub const PADDING_POOL: &[u8] = b"padding=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 
 pub use crate::now_secs;

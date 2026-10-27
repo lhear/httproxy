@@ -35,7 +35,7 @@ use zeroize::Zeroizing;
 
 use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
-use crate::server::constants::MAX_TUNNELS;
+use crate::server::constants::{JWT_CACHE_CAPACITY, JWT_CACHE_TTL, MAX_TUNNELS};
 
 pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
 
@@ -70,6 +70,9 @@ pub struct AppState {
     pub actors: Arc<DashMap<Uuid, SessionHandle>>,
     pub tunnel_semaphore: Arc<Semaphore>,
     pub stream_id_counter: Arc<AtomicU64>,
+    /// 已校验 JWT 的短时缓存：明文模式下每个上传 POST 都要查一次，没必要每次
+    /// 都重做一遍 HMAC 校验和 JSON 解析
+    pub jwt_cache: moka::future::Cache<Box<str>, Arc<str>>,
 }
 
 pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<AppState>> {
@@ -118,6 +121,10 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         actors: Arc::new(DashMap::new()),
         tunnel_semaphore: Arc::new(Semaphore::new(max_tunnels)),
         stream_id_counter: Arc::new(AtomicU64::new(1)),
+        jwt_cache: moka::future::Cache::builder()
+            .max_capacity(JWT_CACHE_CAPACITY)
+            .time_to_live(JWT_CACHE_TTL)
+            .build(),
     }))
 }
 

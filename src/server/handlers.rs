@@ -15,7 +15,7 @@ use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
 use crate::server::connection::connect_upstream;
 use crate::server::constants::{
-    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, DOWNLOAD_CHANNEL_CAPACITY, MASTER_EXPIRY,
+    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, DOWNLOAD_CHANNEL_CAPACITY, JWT_CACHE_TTL, MASTER_EXPIRY,
     MAX_FRAME_BUF_SIZE, TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream::FrameDecoder;
@@ -505,8 +505,14 @@ async fn handle_plaintext_tunnel(
     span: tracing::Span,
     stream_id_opt: Option<Uuid>,
 ) -> Result<Response, ServerError> {
-    let user = validate_jwt_if_needed(&headers, &state.decoding_key, &state.jwt_validation)?;
-    span.record("user", &user);
+    let user = validate_jwt_if_needed(
+        &headers,
+        &state.decoding_key,
+        &state.jwt_validation,
+        &state.jwt_cache,
+    )
+    .await?;
+    span.record("user", &*user);
 
     let target = headers
         .get("X-Target")
@@ -547,8 +553,14 @@ async fn handle_fresh_handshake(
     body: Body,
     span: tracing::Span,
 ) -> Result<Response, ServerError> {
-    let user = validate_jwt_if_needed(&headers, &state.decoding_key, &state.jwt_validation)?;
-    span.record("user", &user);
+    let user = validate_jwt_if_needed(
+        &headers,
+        &state.decoding_key,
+        &state.jwt_validation,
+        &state.jwt_cache,
+    )
+    .await?;
+    span.record("user", &*user);
 
     info!("handshake: received ClientHello");
 
@@ -631,10 +643,9 @@ async fn handle_fresh_handshake(
     };
 
     let session_id = Uuid::new_v4().to_string();
-    state.master_store.insert(
-        session_id.clone(),
-        (Arc::from(user.as_str()), master, crate::now_secs()),
-    );
+    state
+        .master_store
+        .insert(session_id.clone(), (user, master, crate::now_secs()));
 
     info!(session_id = %session_id, "handshake: master key derived");
 
@@ -669,11 +680,12 @@ async fn handle_fresh_handshake(
     Ok(resp)
 }
 
-pub fn validate_jwt_if_needed(
+pub async fn validate_jwt_if_needed(
     headers: &HeaderMap,
     key: &DecodingKey,
     validation: &Validation,
-) -> Result<String, ServerError> {
+    cache: &moka::future::Cache<Box<str>, Arc<str>>,
+) -> Result<Arc<str>, ServerError> {
     let auth_header = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -689,12 +701,26 @@ pub fn validate_jwt_if_needed(
 
     let token = &auth_header[7..];
 
-    jsonwebtoken::decode::<super::Claims>(token, key, validation)
-        .map(|td| td.claims.sub)
+    if let Some(user) = cache.get(token).await {
+        return Ok(user);
+    }
+
+    let claims = jsonwebtoken::decode::<super::Claims>(token, key, validation)
+        .map(|td| td.claims)
         .map_err(|e| {
             warn!("rejected: invalid token - {:?}", e);
             ServerError::unauthorized("invalid token")
-        })
+        })?;
+
+    let user: Arc<str> = Arc::from(claims.sub);
+    // 只在 token 剩余寿命明显长于缓存 TTL 时才缓存，避免缓存把过期时间往后拖
+    let now = crate::unix_now_secs();
+    if claims.exp > now.saturating_add(JWT_CACHE_TTL.as_secs()) {
+        cache
+            .insert(token.to_owned().into_boxed_str(), Arc::clone(&user))
+            .await;
+    }
+    Ok(user)
 }
 
 #[cfg(test)]
@@ -742,6 +768,98 @@ mod tests {
             &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
         )
         .unwrap()
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    fn token_with_exp(exp: u64) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &crate::server::Claims {
+                sub: "user".to_string(),
+                exp,
+            },
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_token_is_cached_and_reused() {
+        let state = test_state().await;
+        let token = valid_token();
+        let headers = bearer(&token);
+
+        let first = validate_jwt_if_needed(
+            &headers,
+            &state.decoding_key,
+            &state.jwt_validation,
+            &state.jwt_cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(&*first, "user");
+        let cached = state
+            .jwt_cache
+            .get(token.as_str())
+            .await
+            .expect("valid token must be cached");
+        assert_eq!(&*cached, "user");
+
+        // 第二次命中缓存，返回同一个 Arc，不再做一次签名校验
+        let second = validate_jwt_if_needed(
+            &headers,
+            &state.decoding_key,
+            &state.jwt_validation,
+            &state.jwt_cache,
+        )
+        .await
+        .unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hit must reuse the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tokens_are_never_cached() {
+        let state = test_state().await;
+        let headers = bearer("not-a-jwt");
+        assert!(
+            validate_jwt_if_needed(
+                &headers,
+                &state.decoding_key,
+                &state.jwt_validation,
+                &state.jwt_cache
+            )
+            .await
+            .is_err()
+        );
+        assert!(state.jwt_cache.get("not-a-jwt").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn token_close_to_expiry_is_not_cached() {
+        let state = test_state().await;
+        // 5 秒后过期：仍能通过校验（默认 60s leeway），但不能进缓存，
+        // 否则缓存 TTL 会把过期时间往后拖。
+        let token = token_with_exp(crate::unix_now_secs() + 5);
+        let headers = bearer(&token);
+        assert!(
+            validate_jwt_if_needed(
+                &headers,
+                &state.decoding_key,
+                &state.jwt_validation,
+                &state.jwt_cache
+            )
+            .await
+            .is_ok()
+        );
+        assert!(state.jwt_cache.get(token.as_str()).await.is_none());
     }
 
     #[tokio::test]
