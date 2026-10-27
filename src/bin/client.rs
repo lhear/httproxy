@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
             .tcp_keepalive_interval(Duration::from_secs(45))
             .pool_idle_timeout(Duration::from_secs(300))
             .pool_max_idle_per_host(6)
-            .emulation(wreq_util::Emulation::Chrome143)
+            .emulation(httproxy::client::chrome_emulation())
             .no_proxy()
             .dns_resolver(Arc::new(httproxy::client::state::ManualResolver {
                 target_addr: final_addr,

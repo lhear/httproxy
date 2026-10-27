@@ -155,7 +155,7 @@ pub async fn spawn_client_with_redirects(
     let http_client = Arc::new(
         wreq::Client::builder()
             .tcp_nodelay(true)
-            .emulation(wreq_util::Emulation::Chrome143)
+            .emulation(httproxy::client::chrome_emulation())
             .no_proxy()
             .dns_resolver(Arc::new(httproxy::client::state::ManualResolver {
                 target_addr: server_addr.ip().to_string(),

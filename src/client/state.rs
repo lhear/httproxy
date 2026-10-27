@@ -169,6 +169,9 @@ impl ClientPqFsm {
         }
     }
 
+    // 出错时把 `Resuming` 原样还给调用方正是这个 API 的用途，错误路径也是冷路径，
+    // 没必要为了缩小 Err 变体再套一层 Box。
+    #[allow(clippy::result_large_err)]
     async fn try_resume(
         resuming: Resuming,
         http_client: &Arc<wreq::Client>,
