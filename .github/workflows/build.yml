@@ -36,7 +36,7 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
       - name: Run integration tests
-        run: cargo test --test bypass --test dns --test encrypted_tunnel --test plain_tunnel --test rotation
+        run: cargo test --test bypass --test dns --test encrypted_tunnel --test plain_tunnel --test redirect --test rotation
 
   linux-gnu:
     needs: [lint-audit, test]

@@ -1,3 +1,6 @@
+// 共享的测试辅助：每个测试二进制都会编译一份，难免有用不到的项。
+#![allow(dead_code)]
+
 use httproxy::config::{
     AuthSection, BypassConfig, ClientAuthSection, ClientSection, ClientTopConfig, ServerSection,
     ServerTopConfig,
