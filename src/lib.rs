@@ -24,5 +24,6 @@ pub mod crypto;
 pub mod dns;
 pub mod error;
 pub mod log;
+pub mod mux;
 pub mod server;
 pub mod shaper;
