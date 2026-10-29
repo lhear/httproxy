@@ -271,7 +271,15 @@ fn parse_json_payload_into(json: &[u8], out: &mut Vec<u8>) -> Result<usize, Erro
 
 #[inline]
 fn frame_raw_limit(cipher: Option<&dyn FrameCipher>, encoding: EncodingType) -> usize {
-    match (cipher.is_some(), encoding) {
+    frame_raw_limit_of(cipher.is_some(), encoding)
+}
+
+/// 单帧能承载的明文长度上限（按是否加密 + 编码方式）。
+///
+/// 虚拟内网的多路复用层要用它算出每个 DATA 帧能带多少业务字节。
+#[inline]
+pub fn frame_raw_limit_of(encrypted: bool, encoding: EncodingType) -> usize {
+    match (encrypted, encoding) {
         (true, EncodingType::Json) => JSON_PAYLOAD_CAP_CIPHER,
         (false, EncodingType::Json) => JSON_PAYLOAD_CAP_PLAIN,
         _ => MAX_RAW_PAYLOAD,

@@ -20,6 +20,7 @@ use crate::server::constants::{
 };
 use crate::server::stream::FrameDecoder;
 use crate::server::stream_registry::StreamQueryResult;
+use crate::server::vnet;
 use crate::server::{SessionHandle, utils};
 use crate::shaper::{self, FrameCipher};
 use tokio::sync::oneshot;
@@ -119,19 +120,22 @@ async fn setup_tunnel_response(
 
     let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
 
-    let upstream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        connect_upstream(
-            state.dns_client.as_ref(),
-            state.client_subnet,
-            state.socks5_proxy.as_ref(),
-            host,
-            port,
-        ),
-    )
-    .await
-    .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
-    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
+    let upstream = match state.vnet.open(host, port).await? {
+        Some(sock) => sock,
+        None => tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_upstream(
+                state.dns_client.as_ref(),
+                state.client_subnet,
+                state.socks5_proxy.as_ref(),
+                host,
+                port,
+            ),
+        )
+        .await
+        .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
+        .map_err(|e| ServerError::bad_gateway(e.to_string()))?,
+    };
 
     let (upstream_read, upstream_write) = upstream.into_split();
 
@@ -424,6 +428,17 @@ pub async fn dispatch(
     let span = tracing::Span::current();
     let has_target = headers.get("X-Target").is_some();
 
+    // 虚拟内网的两条专用通道：`vnet` 是长连接的响应体（下行），
+    // `vnet_up` 是并发上传的数据帧（上行）
+    if let Some(cookie) = utils::extract_cookie_value(&headers, "vnet") {
+        let cookie = cookie.to_owned();
+        return handle_vnet_downlink(state, headers, &cookie).await;
+    }
+    if let Some(cookie) = utils::extract_cookie_value(&headers, "vnet_up") {
+        let cookie = cookie.to_owned();
+        return handle_vnet_uplink(state, headers, &cookie, body).await;
+    }
+
     if let Some(stream_cookie_val) = utils::extract_cookie_value(&headers, "stream") {
         let stream_id = Uuid::parse_str(stream_cookie_val)
             .map_err(|_| ServerError::precondition_required("invalid stream id"))?;
@@ -538,6 +553,218 @@ async fn handle_plaintext_tunnel(
 
     info!(stream_id = %stream_id, "tunnel established");
     Ok(response)
+}
+
+/// 虚拟内网：在线节点的身份。
+struct PeerIdentity {
+    id: Uuid,
+    ip: std::net::IpAddr,
+    /// 加密模式下的下行帧密文（服务端 → 节点）
+    down_cipher: Option<Arc<dyn FrameCipher>>,
+}
+
+fn b64_decode(value: &str, what: &str) -> Result<Vec<u8>, ServerError> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value.as_bytes())
+        .map_err(|_| ServerError::precondition_required(format!("invalid {what} encoding")))
+}
+
+/// 取出一条未过期的会话主密钥。
+fn load_master(state: &AppState, session_id: &str) -> Result<Zeroizing<[u8; 32]>, ServerError> {
+    utils::validate_uuid(session_id)?;
+    let entry = state
+        .master_store
+        .get(session_id)
+        .ok_or_else(|| ServerError::precondition_required("session not found"))?;
+    let (_, master_z, created) = entry.value();
+    let created = *created;
+    let mut master = Zeroizing::new([0u8; 32]);
+    master.copy_from_slice(&**master_z);
+    drop(entry);
+
+    if crate::now_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
+        state.master_store.remove(session_id);
+        return Err(ServerError::precondition_required("master key expired"));
+    }
+    Ok(master)
+}
+
+/// 解密节点标识：`<session_id>:<b64(enc peer_id)>`。
+fn decode_peer_id(
+    state: &AppState,
+    session_id: &str,
+    enc_id: &str,
+) -> Result<(Uuid, Zeroizing<[u8; 32]>), ServerError> {
+    let master = load_master(state, session_id)?;
+    let key = crypto::derive_cookie_stream_key(&master);
+    let raw = crypto::decrypt_bytes(&key, &b64_decode(enc_id, "peer id")?)
+        .map_err(|_| ServerError::precondition_required("failed to decrypt peer id"))?;
+    let bytes: [u8; 16] = raw
+        .try_into()
+        .map_err(|_| ServerError::precondition_required("invalid peer id length"))?;
+    Ok((Uuid::from_bytes(bytes), master))
+}
+
+/// 明文模式的节点身份：`<b64(IP)>.<节点 id>`。
+fn decode_plain_identity(cookie: &str) -> Result<(Uuid, std::net::IpAddr), ServerError> {
+    let (ip_part, session) = cookie
+        .split_once('.')
+        .ok_or_else(|| ServerError::bad_request("invalid vnet cookie"))?;
+    let raw = b64_decode(ip_part, "vnet ip")?;
+    let ip = String::from_utf8(raw)
+        .ok()
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| ServerError::bad_request("invalid virtual ip in vnet cookie"))?;
+    let session =
+        Uuid::parse_str(session).map_err(|_| ServerError::bad_request("invalid peer id"))?;
+    Ok((session, ip))
+}
+
+/// 虚拟内网的下行通道：一次 POST 的响应体就是节点的长连接。
+async fn handle_vnet_downlink(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    cookie: &str,
+) -> Result<Response, ServerError> {
+    let span = tracing::Span::current();
+    let user = validate_jwt_if_needed(
+        &headers,
+        &state.decoding_key,
+        &state.jwt_validation,
+        &state.jwt_cache,
+    )
+    .await?;
+    span.record("user", &*user);
+
+    let ports = headers
+        .get("X-Vnet-Ports")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::bad_request("missing X-Vnet-Ports header"))?;
+    let ports = crate::config::PortSet::parse_list(ports)
+        .map_err(|e| ServerError::bad_request(format!("invalid X-Vnet-Ports: {e}")))?;
+
+    let identity = match cookie.split_once(':') {
+        None => {
+            let (id, ip) = decode_plain_identity(cookie)?;
+            PeerIdentity {
+                id,
+                ip,
+                down_cipher: None,
+            }
+        }
+        Some((session_id, rest)) => {
+            let (enc_id, enc_ip) = rest
+                .split_once(':')
+                .ok_or_else(|| ServerError::precondition_required("invalid vnet cookie"))?;
+            let (id, master) = decode_peer_id(&state, session_id, enc_id)?;
+            let (_, down_key, target_key) = crypto::derive_connection_keys(&master, id.as_bytes());
+            let ip_bytes = crypto::decrypt_bytes(&target_key, &b64_decode(enc_ip, "vnet ip")?)
+                .map_err(|_| ServerError::precondition_required("failed to decrypt vnet ip"))?;
+            let ip = String::from_utf8(ip_bytes)
+                .ok()
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .ok_or_else(|| ServerError::precondition_required("invalid vnet ip"))?;
+            PeerIdentity {
+                id,
+                ip,
+                down_cipher: Some(Arc::new(AesFrameCipher::new(&down_key))),
+            }
+        }
+    };
+
+    let target = identity.ip.to_string();
+    span.record("target", target.as_str());
+
+    let max_data = vnet::max_data_chunk(
+        identity.down_cipher.is_some(),
+        state.traffic_config.encoding_type,
+    );
+    let (peer, down_rx) = state.vnet.register(
+        identity.id,
+        identity.ip,
+        ports,
+        identity.down_cipher,
+        max_data,
+    )?;
+
+    let frames = vnet::spawn_downlink(
+        Arc::clone(&state.vnet),
+        peer,
+        down_rx,
+        Arc::clone(&state.resolved_traffic),
+    );
+
+    let padding = utils::random_padding();
+    Response::builder()
+        .header("Cache-Control", "no-store")
+        .header("Set-Cookie", padding)
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(frames),
+        ))
+        .map_err(|e| ServerError::internal(e.to_string()))
+}
+
+/// 虚拟内网的上行通道：节点把自己一侧的字节批量 POST 上来。
+async fn handle_vnet_uplink(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    cookie: &str,
+    body: Body,
+) -> Result<Response, ServerError> {
+    let (peer, cipher): (Option<Arc<vnet::VnetPeer>>, Option<Arc<dyn FrameCipher>>) =
+        match cookie.split_once(':') {
+            None => {
+                // 明文模式与普通隧道的上传保持一致：带 token 才认
+                validate_jwt_if_needed(
+                    &headers,
+                    &state.decoding_key,
+                    &state.jwt_validation,
+                    &state.jwt_cache,
+                )
+                .await?;
+                let id = Uuid::parse_str(cookie)
+                    .map_err(|_| ServerError::bad_request("invalid peer id"))?;
+                (state.vnet.get_by_id(&id), None)
+            }
+            Some((session_id, enc_id)) => {
+                let (id, master) = decode_peer_id(&state, session_id, enc_id)?;
+                let (upload_key, _, _) = crypto::derive_connection_keys(&master, id.as_bytes());
+                let cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&upload_key));
+                (state.vnet.get_by_id(&id), Some(cipher))
+            }
+        };
+
+    let Some(peer) = peer else {
+        return Err(ServerError::precondition_required("peer not found"));
+    };
+
+    let byte_stream = body.into_data_stream().map(|r| r.map_err(io::Error::other));
+    let mut decoder = FrameDecoder::new(
+        byte_stream,
+        cipher,
+        state.traffic_config.encoding_type,
+        MAX_FRAME_BUF_SIZE,
+    );
+
+    let deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
+    while let Some(result) = tokio::time::timeout_at(deadline, decoder.next())
+        .await
+        .map_err(|_| ServerError::request_timeout("peer uplink read timed out"))?
+    {
+        let (seq, payload) = result
+            .map_err(|e| ServerError::bad_request(format!("peer frame decode error: {e}")))?;
+        if !peer.push_uplink(vnet::UplinkFrame { seq, payload }).await {
+            break;
+        }
+    }
+
+    let padding = utils::random_padding();
+    Response::builder()
+        .header("Cache-Control", "no-store")
+        .header("Set-Cookie", padding)
+        .status(axum::http::StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .map_err(|e| ServerError::internal(e.to_string()))
 }
 
 async fn handle_fresh_handshake(

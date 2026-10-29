@@ -6,6 +6,7 @@ pub mod janitor;
 pub mod stream;
 pub mod stream_registry;
 pub mod utils;
+pub mod vnet;
 
 use crate::config::ServerTopConfig;
 use crate::crypto;
@@ -73,6 +74,8 @@ pub struct AppState {
     /// 已校验 JWT 的短时缓存：明文模式下每个上传 POST 都要查一次，没必要每次
     /// 都重做一遍 HMAC 校验和 JSON 解析
     pub jwt_cache: moka::future::Cache<Box<str>, Arc<str>>,
+    /// 虚拟内网：虚拟 IP → 在线节点（长连接客户端）的注册表
+    pub vnet: Arc<vnet::VnetRegistry>,
 }
 
 pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<AppState>> {
@@ -125,6 +128,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
             .max_capacity(JWT_CACHE_CAPACITY)
             .time_to_live(JWT_CACHE_TTL)
             .build(),
+        vnet: Arc::new(vnet::VnetRegistry::new(max_tunnels)),
     }))
 }
 

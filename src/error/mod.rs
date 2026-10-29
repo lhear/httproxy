@@ -80,6 +80,14 @@ impl ServerError {
         Self(StatusCode::UNAUTHORIZED, msg.into())
     }
     #[inline]
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self(StatusCode::FORBIDDEN, msg.into())
+    }
+    #[inline]
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self(StatusCode::CONFLICT, msg.into())
+    }
+    #[inline]
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self(StatusCode::NOT_FOUND, msg.into())
     }
