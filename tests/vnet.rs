@@ -291,8 +291,8 @@ async fn dead_local_port_fails_fast() {
         "GET http://{VIRTUAL_IP}:{dead_port}/ HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
     );
     // 断言的是「不会挂住」：节点先拨回环、再拨虚拟地址，两次都被拒，
-    // 于是回 OPEN_FAIL、服务端撤掉连接、访问方立刻读到 EOF。两次被拒的
-    // connect 在部分平台上要 ~2s（本机实测 2060ms），所以给两倍余量。
+    // 于是回 OPEN_FAIL、服务端撤掉连接、访问方立刻读到 EOF。每次拨号最多
+    // 等 `VNET_CONNECT_TIMEOUT`（1s），两次封顶 2s，所以给 6s 余量。
     let outcome = tokio::time::timeout(Duration::from_secs(6), fetch(proxy, &request))
         .await
         .expect("dead port must not hang the request");

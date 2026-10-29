@@ -43,7 +43,11 @@ pub const MASTER_RESUME_WINDOW_SECS: u64 = 1170;
 pub const VNET_RECONNECT_MIN: Duration = Duration::from_secs(1);
 pub const VNET_RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// 虚拟内网：连本机服务的超时（先试回环，失败再试虚拟 IP）。
-pub const VNET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// 两次都是**本机**拨号：要么毫秒级连上，要么立刻被拒，唯一会挂住的情形是
+/// 「那个地址不属于本机」——SYN 被发到网卡外面再也没人应答。1s 足够覆盖正常
+/// 情况，同时把这种黑洞情形从 5s 压到 1s。
+pub const VNET_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// 虚拟内网：单个上行 POST 最多攒多少已编码字节。
 ///
 /// 上行吞吐 ≈（批次 × 在飞数）/ RTT，所以这个上限直接决定链路带宽延迟积：

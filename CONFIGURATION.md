@@ -232,7 +232,9 @@ Behaviour:
   Only if that is refused does it try `<virtual_ip>:<port>`, which covers a
   service bound to one specific interface. The address is *not* tried first on
   purpose: it is a rendezvous key, so dialing it usually means paying for a
-  connection attempt that was doomed from the start.
+  connection attempt that was doomed from the start. Each attempt is bounded by
+  1 s: both are local dials, so anything slower is a black hole rather than a
+  slow service.
 - **The open handshake is one-way.** The server pushes `OPEN` and immediately
   starts streaming the caller's bytes behind it; the peer dials while the first
   data is already arriving, so no acknowledgement round trip sits in front of
