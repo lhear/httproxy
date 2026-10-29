@@ -8,6 +8,7 @@
 - **Flexible Topology**: Engineered for seamless traversal of CDNs, Web proxies, and middleboxes, ensuring robust compatibility with complex network environments.
 - **Traffic Obfuscation**: Features configurable traffic shaping with randomized padding to mitigate pattern-based traffic analysis.
 - **Secure Access Control**: Enforces mandatory bearer token authentication for all client-server communication.
+- **Virtual Network**: Clients can join a virtual network by declaring a `virtual_ip` plus the local ports they serve. Every other client of the same server then reaches those services by using that address as its proxy target. The server is only the hub — no server-side configuration is involved, and clients that do not join are completely unaffected.
 
 ## Getting Started
 

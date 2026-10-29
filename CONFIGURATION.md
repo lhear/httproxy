@@ -73,6 +73,8 @@ remote = "https://your-server-domain/YOUR_SECRET_PATH"
 # max_connections = 1024
 # max_in_flight_bytes = 2097152
 # upload_concurrency = 128
+# virtual_ip = "10.0.0.5"
+# virtual_ports = [80, 443, "8000-8100"]
 
 # [client.auth]
 # username = "proxyuser"
@@ -123,6 +125,8 @@ padding_threshold = 2000
 | `max_connections`     | integer | no       | `1024`      | Cap on concurrent local connections; excess connections are refused. Bounds client-side memory under load. |
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Cap on upload bytes in flight per tunnel. Trade-off between throughput and memory. **Must not exceed the server's reorder buffer (§9).** |
 | `upload_concurrency`  | integer | no       | `128`       | Cap on concurrent upload POSTs per tunnel. |
+| `virtual_ip`          | string  | no       | —           | Address this client occupies in the virtual network (§2.6). Requires `virtual_ports`. |
+| `virtual_ports`       | integer \| string \| array | no | — | Local ports served at `virtual_ip`. Array, range string, or a mix (§2.6). Requires `virtual_ip`. |
 
 ### 2.2 `[client.auth]` — Local Proxy Authentication
 
@@ -179,6 +183,90 @@ ssh -p 2222 your-user@127.0.0.1
 
 Optional. Routes traffic matching the rules in the referenced JSON files
 directly, outside the tunnel (§6).
+
+### 2.6 Virtual Network — `virtual_ip` / `virtual_ports`
+
+Optional pair. All clients of a server, together with the server itself, form a
+**virtual network**: a client that declares `virtual_ip` occupies that address on
+the network, and any other client can then use `<virtual_ip>:<port>` as its proxy
+target. The server is the hub — it looks the address up in its table of live
+peers and relays the stream over that peer's long-lived connection.
+
+Note what this is **not**: it is not port forwarding of an intranet service to
+the public internet (frp/ngrok style). There is no public visitor, nothing
+leaves the set of clients that share the server, and the server never dials the
+virtual address itself. The address is only a rendezvous key, so it need not
+exist on any real network.
+
+```toml
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://your-server-domain/YOUR_SECRET_PATH"
+virtual_ip = "10.0.0.5"                 # address other clients dial
+virtual_ports = [80, 443, "8000-8100"]  # ports served at that address
+```
+
+| Field           | Type                        | Required | Description |
+| --------------- | --------------------------- | -------- | ----------- |
+| `virtual_ip`    | string                      | one of the pair | Address this client occupies in the virtual network, and the target other clients dial. Must be an IP literal (IPv4 or IPv6), not a hostname. It does not have to be reachable from anywhere — it is only a rendezvous key. |
+| `virtual_ports` | integer / string / array    | one of the pair | Local ports served at that address. Accepts a single port (`22`), a range (`"8000-8100"`), an array (`[80, 443]`), or a mix (`[80, "8000-8100"]`). Ports are deduplicated and sorted. |
+
+Behaviour:
+
+- **Both or neither.** Setting only one of the two fails startup, so you can
+  never half-believe an address has joined the network.
+- **A long-lived connection is mandatory.** The client keeps one request open
+  against the server for as long as it runs. While it is up the address is
+  online; the moment it drops the address goes offline for everyone, and the
+  client reconnects with exponential backoff (1 s → 30 s). The server also sends
+  a heartbeat every ~20 s and drops peers that have been silent for ~75 s.
+- **The port list is enforced by the server.** A target `<virtual_ip>:<port>`
+  with a port that is not in `virtual_ports` is rejected (HTTP 403) instead of
+  being dialled, so a typo cannot silently reach other local services.
+- **No peer, no route.** If nobody currently holds an address, the server has no
+  way to know it was meant to be a virtual one (it keeps no state about absent
+  clients) and falls back to its normal direct connection, which usually ends in
+  HTTP 502 — i.e. the address is unreachable until that client is back online.
+- **Local dial order.** The client connects `<virtual_ip>:<port>` first (natural
+  when the address really is one of the machine's own), then falls back to
+  `127.0.0.1:<port>` for services bound to loopback only. If neither works the
+  caller gets HTTP 502 instead of an empty 200.
+- **One node per address.** A second client claiming an address that another
+  peer refreshed within the last 5 s is refused (HTTP 409), which stops two
+  misconfigured clients from fighting over the same address. Past that window the
+  address is taken over, so a restarted client is back within seconds.
+- **Encryption follows the tunnel.** With `public_key` configured, virtual
+  network frames are sealed with keys derived from the session master key,
+  exactly like normal tunnels; the address itself is encrypted too. Without
+  `public_key` the frames are plaintext (transport TLS still applies) and the
+  uplink requests carry the bearer token.
+- **No server-side configuration.** The server learns addresses from the
+  clients themselves, and clients without `virtual_ip` behave exactly as before:
+  no extra connection, no extra traffic, identical routing.
+- **Traffic shaping.** Virtual network frames use the
+  `[traffic_shaping.global]` padding settings; per-stage overrides
+  (`[[traffic_shaping.stages]]`) apply to normal tunnels only, because this
+  channel is a single long-lived stream rather than a sequence of short tunnels.
+- **Watch the `[bypass]` rules of the accessing side.** Bypass rules are applied
+  before the tunnel is opened, so a client whose `ip_cidr` list covers the
+  virtual address (for example the `10.0.0.0/8` entry in §6) will connect
+  directly and never reach the peer. Narrow the rule set on the clients that
+  need to reach the virtual network.
+
+Example — put a home machine's SSH daemon at `10.0.0.5:22`, then reach it from a
+laptop that uses the same server:
+
+```toml
+# on the machine that runs the service (10.0.0.5)
+[client]
+virtual_ip = "10.0.0.5"
+virtual_ports = 22
+```
+
+```bash
+# on the laptop, through its own client's proxy port
+ssh -o ProxyCommand="nc -X connect -x 127.0.0.1:8080 %h %p" user@10.0.0.5
+```
 
 ---
 
