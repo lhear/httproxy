@@ -44,8 +44,6 @@ pub const VNET_HEARTBEAT: Duration = Duration::from_secs(20);
 pub const VNET_STALE_SECS: u64 = 75;
 /// 虚拟内网：同一地址的旧注册在这段时间内刷新过就拒绝顶替，避免相互抢占。
 pub const VNET_REPLACE_GUARD_SECS: u64 = 5;
-/// 虚拟内网：等待节点回执「本地端口连上了」的上限。
-pub const VNET_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// 虚拟内网：下行帧通道容量（背压直接作用在对端本地服务的读取速度上）。
 pub const VNET_DOWNLINK_CAPACITY: usize = 512;
 /// 虚拟内网：上行帧通道容量。

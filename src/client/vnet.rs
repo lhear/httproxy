@@ -309,6 +309,10 @@ async fn dispatch(
 }
 
 /// 连上本机端口并开始搬运字节。
+///
+/// 先登记连接再拨号：服务端不等回执就把访问方的首包紧跟着 `OPEN` 推下来，
+/// 那些 DATA 帧会先落在这个有界队列里，等拨号完成再写进 socket。拨号失败时
+/// 整条连接被撤掉，排队的数据一并丢弃（服务端也会收到 `OPEN_FAIL` 并收尾）。
 async fn serve_local(
     conn_id: u32,
     ip: IpAddr,
@@ -317,10 +321,14 @@ async fn serve_local(
     uplink: mpsc::Sender<Bytes>,
     chunk: usize,
 ) {
+    let (tx, rx) = mpsc::channel::<ToSocket>(VNET_CONN_CAPACITY);
+    conns.insert(conn_id, tx);
+
     let socket = match connect_local(ip, port).await {
         Ok(socket) => socket,
         Err(e) => {
             warn!(port, error = %e, "local port unreachable");
+            conns.remove(&conn_id);
             let _ = uplink.send(mux::encode(Tag::OpenFail, conn_id, &[])).await;
             return;
         }
@@ -328,9 +336,7 @@ async fn serve_local(
     socket.set_nodelay(true).ok();
     debug!(port, conn_id, "local connection opened");
 
-    let (tx, rx) = mpsc::channel::<ToSocket>(VNET_CONN_CAPACITY);
-    conns.insert(conn_id, tx);
-    // 先登记再回执：服务端收到 OPEN_OK 后立刻就可能推 DATA 下来
+    // 回执只用于观测与快速失败，不在数据路径上
     if uplink
         .send(mux::encode(Tag::OpenOk, conn_id, &[]))
         .await
@@ -364,10 +370,13 @@ async fn relay_local(
                         break;
                     }
                 }
-                Some(ToSocket::Eof) | None => {
+                Some(ToSocket::Eof) => {
+                    // 服务端那边收完了：半关闭写方向，读方向继续
                     let _ = write_half.shutdown().await;
                     writer_open = false;
                 }
+                // 连接被撤掉（服务端不再需要它、或通道销毁）：连本地 socket 一起丢
+                None => break,
             },
             read = read_half.read(&mut buf) => match read {
                 Ok(0) => {
@@ -397,22 +406,24 @@ async fn relay_local(
 
 /// 连接本机服务。
 ///
-/// 优先连配置里的虚拟 IP：它正好是本机地址（最常见的用法）时最自然，服务绑
-/// 在 `0.0.0.0` 也能连上；失败再回退到 `127.0.0.1`——虚拟 IP 只是个会合地
-/// 址、本机并不持有时，服务只监听回环仍然可用。
+/// 回环优先：服务绝大多数时候监听 `0.0.0.0` 或 `127.0.0.1`，一次就连上。
+/// 虚拟 IP 只作为备选——它常常只是一个会合地址、本机并不持有，先拨它等于把
+/// 一次注定失败的 connect（实测能被拖到 SYN 超时）排在真正能用的那个前面，
+/// 白白给每条连接加一截延迟。
 async fn connect_local(ip: IpAddr, port: u16) -> Result<TcpStream> {
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let primary = SocketAddr::new(ip, port);
-    match dial(primary).await {
+
+    match dial(loopback).await {
         Ok(socket) => Ok(socket),
-        Err(err) => {
-            let fallback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            if primary == fallback {
-                return Err(err);
+        Err(loopback_err) => {
+            if primary == loopback {
+                return Err(loopback_err);
             }
-            debug!(error = %err, %primary, "falling back to loopback");
-            dial(fallback)
-                .await
-                .with_context(|| format!("connect {primary} failed ({err}) and loopback failed"))
+            debug!(error = %loopback_err, %primary, "loopback refused, trying the virtual address");
+            dial(primary).await.with_context(|| {
+                format!("connect {loopback} failed ({loopback_err}) and {primary} failed too")
+            })
         }
     }
 }
@@ -588,16 +599,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_local_falls_back_to_loopback() {
+    async fn connect_local_reaches_a_loopback_service() {
         // 用阻塞 listener 并留在作用域里：只要 socket 还在监听，内核就会替
         // 我们收下连接，不依赖 accept 是否被调度到。
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // 127.0.0.9 上没有监听，应该回退到 127.0.0.1
+        // 虚拟 IP（127.0.0.9）上没有监听，但服务在回环上，一次就该连上
         let socket = connect_local("127.0.0.9".parse().unwrap(), port)
             .await
-            .expect("loopback fallback must succeed");
+            .expect("a loopback service must be reachable");
         assert!(socket.peer_addr().is_ok());
         drop(listener);
     }

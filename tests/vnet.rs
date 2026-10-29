@@ -253,3 +253,54 @@ async fn encrypted_vnet_relays_traffic() {
     assert_eq!(body.len(), 512 * 1024);
     assert!(body.iter().all(|&b| b == 0xAB));
 }
+
+/// 端口被声明了、但本机没人监听：请求必须快速失败，不能挂在一条不会再有
+/// 数据的连接上（`OPEN` 是单向的，服务端不等回执就放行数据，所以这条路径
+/// 靠节点的 `OPEN_FAIL` 收尾）。
+#[tokio::test]
+async fn dead_local_port_fails_fast() {
+    init_logging();
+    let server = spawn_server(server_config(traffic(true, None), None, None)).await;
+
+    let upstream = spawn_upstream().await;
+    // 占一个空闲端口再立刻放掉：节点会把它声明出去，但那里没人监听
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let mut tunnel_cfg = client_config(traffic(true, None), None, None, vec![]);
+    with_vnet(&mut tunnel_cfg, VIRTUAL_IP, &[upstream.port(), dead_port]);
+    let _tunnel = spawn_client(tunnel_cfg, server).await;
+    let proxy = spawn_client(
+        client_config(traffic(true, None), None, None, vec![]),
+        server,
+    )
+    .await;
+
+    // 先用活着的端口确认节点已经上线，否则下面测到的是「地址还没注册」
+    fetch_until_ok(
+        proxy,
+        &format!(
+            "GET http://{VIRTUAL_IP}:{}/hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+            upstream.port()
+        ),
+    )
+    .await;
+
+    let request = format!(
+        "GET http://{VIRTUAL_IP}:{dead_port}/ HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+    );
+    // 断言的是「不会挂住」：节点先拨回环、再拨虚拟地址，两次都被拒，
+    // 于是回 OPEN_FAIL、服务端撤掉连接、访问方立刻读到 EOF。两次被拒的
+    // connect 在部分平台上要 ~2s（本机实测 2060ms），所以给两倍余量。
+    let outcome = tokio::time::timeout(Duration::from_secs(6), fetch(proxy, &request))
+        .await
+        .expect("dead port must not hang the request");
+    match outcome {
+        None => {}
+        Some((status, body)) => {
+            assert_eq!(status, 200, "dead port must not turn into a 5xx payload");
+            assert!(body.is_empty(), "dead port must not emit a body");
+        }
+    }
+}

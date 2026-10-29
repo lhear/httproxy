@@ -227,10 +227,19 @@ Behaviour:
   way to know it was meant to be a virtual one (it keeps no state about absent
   clients) and falls back to its normal direct connection, which usually ends in
   HTTP 502 — i.e. the address is unreachable until that client is back online.
-- **Local dial order.** The client connects `<virtual_ip>:<port>` first (natural
-  when the address really is one of the machine's own), then falls back to
-  `127.0.0.1:<port>` for services bound to loopback only. If neither works the
-  caller gets HTTP 502 instead of an empty 200.
+- **Local dial order.** The client dials `127.0.0.1:<port>` first, because that is
+  what a service listening on `0.0.0.0` or on loopback answers on immediately.
+  Only if that is refused does it try `<virtual_ip>:<port>`, which covers a
+  service bound to one specific interface. The address is *not* tried first on
+  purpose: it is a rendezvous key, so dialing it usually means paying for a
+  connection attempt that was doomed from the start.
+- **The open handshake is one-way.** The server pushes `OPEN` and immediately
+  starts streaming the caller's bytes behind it; the peer dials while the first
+  data is already arriving, so no acknowledgement round trip sits in front of
+  the request. A peer that cannot reach the port reports it, and the connection
+  is torn down at once — the caller sees an immediate EOF rather than a request
+  that hangs. Note this matches how the tunnel already treats an unreachable
+  upstream for `CONNECT`: the `200` is sent before the upstream is dialled.
 - **One node per address.** A second client claiming an address that another
   peer refreshed within the last 5 s is refused (HTTP 409), which stops two
   misconfigured clients from fighting over the same address. Past that window the

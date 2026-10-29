@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -31,8 +31,8 @@ use crate::config::PortSet;
 use crate::error::ServerError;
 use crate::mux::{self, Tag, ToSocket};
 use crate::server::constants::{
-    VNET_CONN_CAPACITY, VNET_DOWNLINK_CAPACITY, VNET_HEARTBEAT, VNET_OPEN_TIMEOUT,
-    VNET_REPLACE_GUARD_SECS, VNET_STALE_SECS, VNET_UPLINK_FRAMES, VNET_UPLINK_PENDING_BYTES,
+    VNET_CONN_CAPACITY, VNET_DOWNLINK_CAPACITY, VNET_HEARTBEAT, VNET_REPLACE_GUARD_SECS,
+    VNET_STALE_SECS, VNET_UPLINK_FRAMES, VNET_UPLINK_PENDING_BYTES,
 };
 use crate::shaper::{self, FrameCipher, ResolvedShaperConfig, encode_frame_into};
 
@@ -57,8 +57,6 @@ pub struct VnetPeer {
     /// 上行帧投递口，由 `drain_uplink` 顺序化后派发
     uplink_tx: mpsc::Sender<UplinkFrame>,
     conns: DashMap<u32, ConnEntry>,
-    /// 已下发 OPEN、等待虚拟内网节点回执的逻辑连接
-    pending: DashMap<u32, oneshot::Sender<bool>>,
     next_conn: AtomicU32,
     /// 最近一次收到上行数据的时间（秒，进程相对时间）
     last_seen: AtomicU64,
@@ -118,11 +116,12 @@ impl VnetPeer {
                     let _ = entry.send(ToSocket::Eof).await;
                 }
             }
-            Tag::OpenOk | Tag::OpenFail => {
-                let ok = frame.tag == Tag::OpenOk;
-                if let Some((_, ack)) = self.pending.remove(&frame.conn) {
-                    let _ = ack.send(ok);
-                }
+            Tag::OpenOk => debug!(ip = %self.ip, conn = frame.conn, "peer reached the local port"),
+            Tag::OpenFail => {
+                // 拨号失败：撤掉这条连接，relay 随即丢弃两端 socket，
+                // 访问方立刻看到 EOF，而不是挂在一条永远不会来数据的连接上
+                warn!(ip = %self.ip, conn = frame.conn, "peer could not reach the local port");
+                self.conns.remove(&frame.conn);
             }
             Tag::Pong | Tag::Ping => {}
             Tag::Open => warn!(ip = %self.ip, "unexpected OPEN from vnet client"),
@@ -131,7 +130,6 @@ impl VnetPeer {
 
     fn discard_conn(&self, conn: u32) {
         self.conns.remove(&conn);
-        self.pending.remove(&conn);
     }
 
     /// 收下一个上行帧（由上传 POST 投递，顺序由 `drain_uplink` 负责）。
@@ -211,7 +209,6 @@ impl VnetRegistry {
             down_tx,
             uplink_tx,
             conns: DashMap::new(),
-            pending: DashMap::new(),
             next_conn: AtomicU32::new(1),
             last_seen: AtomicU64::new(crate::now_secs()),
             cancel: Notify::new(),
@@ -249,7 +246,13 @@ impl VnetRegistry {
     ///
     /// - `Ok(None)`：这个目标不是已注册的虚拟 IP，调用方按普通方式直连；
     /// - `Ok(Some(sock))`：已经接上虚拟内网节点，`sock` 当作隧道上游使用；
-    /// - `Err(..)`：虚拟 IP 在，但端口没被暴露或客户端连不上。
+    /// - `Err(..)`：虚拟 IP 在，但端口没被暴露（或通道已断）。
+    ///
+    /// 这里**不等**节点的拨号回执：`OPEN` 一下发就把 socket 交给隧道，访问方的
+    /// 首包紧跟着 `OPEN` 同批下行，节点边连边收。省掉的正是这条路径上唯一的
+    /// 一个结构性 RTT——代价是「端口没起来」不再变成 502，而是连接被立刻中断
+    /// （节点回 `OPEN_FAIL` 后这条连接随即被撤掉，访问方看到 EOF）。
+    /// 端口写错的情况由上面的白名单同步挡掉，不需要回执也知道。
     pub async fn open(&self, host: &str, port: u16) -> Result<Option<TcpStream>, ServerError> {
         let Ok(ip) = host.parse::<IpAddr>() else {
             return Ok(None);
@@ -271,39 +274,25 @@ impl VnetRegistry {
             )));
         }
 
-        let (tunnel_side, client_side) = loopback_pair()
-            .await
-            .map_err(|e| ServerError::internal(format!("peer loopback pair failed: {e}")))?;
-
         let conn_id = peer.next_conn.fetch_add(1, Ordering::Relaxed);
-        let (ack_tx, ack_rx) = oneshot::channel();
-        peer.pending.insert(conn_id, ack_tx);
         let (to_sock_tx, to_sock_rx) = mpsc::channel::<ToSocket>(VNET_CONN_CAPACITY);
         peer.conns.insert(conn_id, ConnEntry { tx: to_sock_tx });
 
+        // 先把 OPEN 推出去再建 socket 对：loopback 的 bind/connect/accept 与
+        // 这一程网络往返重叠，不再挡在 OPEN 出站之前
         let open = mux::encode(Tag::Open, conn_id, &port.to_be_bytes());
         if !peer.send_frame(open).await {
             peer.discard_conn(conn_id);
             return Err(ServerError::bad_gateway("vnet peer channel is closed"));
         }
 
-        match tokio::time::timeout(VNET_OPEN_TIMEOUT, ack_rx).await {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) | Ok(Err(_)) => {
-                peer.discard_conn(conn_id);
-                warn!(ip = %ip, port, "vnet client could not reach local port");
-                return Err(ServerError::bad_gateway(format!(
-                    "vnet client could not reach {ip}:{port}"
-                )));
-            }
-            Err(_) => {
-                peer.discard_conn(conn_id);
-                warn!(ip = %ip, port, "vnet open timed out");
-                return Err(ServerError::gateway_timeout("vnet open timed out"));
-            }
-        }
+        let (tunnel_side, client_side) = loopback_pair().await.map_err(|e| {
+            // 已经让节点去拨了，失败就顺手把那条连接撤掉
+            peer.discard_conn(conn_id);
+            ServerError::internal(format!("peer loopback pair failed: {e}"))
+        })?;
 
-        debug!(ip = %ip, port, conn_id, "vnet connection opened");
+        debug!(ip = %ip, port, conn_id, "vnet connection handed to the tunnel");
         let relay_peer = Arc::clone(&peer);
         tokio::spawn(async move {
             relay(relay_peer, conn_id, client_side, to_sock_rx).await;
@@ -363,10 +352,14 @@ async fn relay(
                         break;
                     }
                 }
-                Some(ToSocket::Eof) | None => {
+                Some(ToSocket::Eof) => {
+                    // 节点那边收完了：半关闭写方向，读方向继续
                     let _ = write_half.shutdown().await;
                     writer_open = false;
                 }
+                // 连接被撤掉（节点拨号失败、通道销毁）：直接丢掉两端，
+                // 访问方立刻看到 EOF，而不是挂在一条不会再有数据的连接上
+                None => break,
             },
             read = read_half.read(&mut buf) => match read {
                 Ok(0) => {
@@ -594,45 +587,28 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
     }
 
+    /// `open()` 不等回执：这条断言就是那 1 个 RTT 的回归测试。
     #[tokio::test]
-    async fn open_fails_when_client_never_acks() {
-        tokio::time::pause();
+    async fn open_hands_out_a_socket_without_waiting_for_the_ack() {
         let reg = registry();
         let (_peer, mut rx) = register(&reg, "10.0.0.9");
         let handle = tokio::spawn({
             let reg = Arc::clone(&reg);
             async move { reg.open("10.0.0.9", 80).await }
         });
-        // 收到 OPEN 但故意不回执
+
         let frame = rx.recv().await.expect("OPEN frame");
         let parsed = mux::parse(&frame).unwrap();
         assert_eq!(parsed.tag, Tag::Open);
         assert_eq!(mux::open_port(parsed.payload), Some(80));
 
-        tokio::time::advance(VNET_OPEN_TIMEOUT + std::time::Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        tokio::time::resume();
-        let err = handle.await.unwrap().unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::GATEWAY_TIMEOUT);
-    }
-
-    #[tokio::test]
-    async fn open_ok_returns_connected_socket() {
-        let reg = registry();
-        let (peer, mut rx) = register(&reg, "10.0.0.10");
-        let handle = tokio::spawn({
-            let reg = Arc::clone(&reg);
-            async move { reg.open("10.0.0.10", 8080).await }
-        });
-        let frame = rx.recv().await.expect("OPEN frame");
-        let parsed = mux::parse(&frame).unwrap();
-        assert_eq!(mux::open_port(parsed.payload), Some(8080));
-
-        // 虚拟内网节点回执：连上了
-        peer.deliver(mux::encode(Tag::OpenOk, parsed.conn, &[]))
-            .await;
-
-        let sock = handle.await.unwrap().unwrap().expect("peerd socket");
+        // 一个回执都不发，open() 也必须已经交出一个可用的 socket
+        let sock = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("open must not wait for the peer ack")
+            .unwrap()
+            .unwrap()
+            .expect("bridged socket");
         assert!(sock.peer_addr().is_ok());
     }
 
@@ -646,7 +622,7 @@ mod tests {
         });
         let frame = down_rx.recv().await.unwrap();
         let conn = mux::parse(&frame).unwrap().conn;
-        peer.deliver(mux::encode(Tag::OpenOk, conn, &[])).await;
+        // 不等 OPEN_OK：data 也跟着 OPEN 一起走，节点边连边收
         let mut tunnel_side = handle.await.unwrap().unwrap().unwrap();
 
         // 虚拟内网节点 → 隧道：DATA 帧应该出现在隧道上游的 socket 上
@@ -672,5 +648,30 @@ mod tests {
         assert_eq!(parsed.tag, Tag::Data);
         assert_eq!(parsed.conn, conn);
         assert_eq!(parsed.payload, b"from-tunnel");
+    }
+
+    /// 节点拨号失败后，隧道上游必须立刻收到 EOF——否则访问方会挂到天荒地老。
+    #[tokio::test]
+    async fn open_fail_tears_the_connection_down() {
+        let reg = registry();
+        let (peer, mut down_rx) = register(&reg, "10.0.0.12");
+        let handle = tokio::spawn({
+            let reg = Arc::clone(&reg);
+            async move { reg.open("10.0.0.12", 80).await }
+        });
+        let conn = mux::parse(&down_rx.recv().await.unwrap()).unwrap().conn;
+        let mut tunnel_side = handle.await.unwrap().unwrap().unwrap();
+
+        peer.deliver(mux::encode(Tag::OpenFail, conn, &[])).await;
+
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tunnel_side.read(&mut buf),
+        )
+        .await
+        .expect("failed dial must not leave the upstream hanging")
+        .unwrap();
+        assert_eq!(n, 0, "failed dial must close the upstream");
     }
 }

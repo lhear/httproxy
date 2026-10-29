@@ -42,7 +42,7 @@ pub const MASTER_RESUME_WINDOW_SECS: u64 = 1170;
 /// 虚拟内网：通道断开后的重连退避区间。
 pub const VNET_RECONNECT_MIN: Duration = Duration::from_secs(1);
 pub const VNET_RECONNECT_MAX: Duration = Duration::from_secs(30);
-/// 虚拟内网：连本机服务的超时（先试虚拟 IP，失败再回退 127.0.0.1）。
+/// 虚拟内网：连本机服务的超时（先试回环，失败再试虚拟 IP）。
 pub const VNET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 虚拟内网：单个上行 POST 最多攒多少已编码字节。
 pub const VNET_BATCH_BYTES: usize = 64 * 1024;
