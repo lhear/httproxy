@@ -60,6 +60,9 @@ async fn main() -> anyhow::Result<()> {
 
     let conn_sem = Arc::new(Semaphore::new(state.max_connections));
 
+    // 虚拟内网：配置了 virtual_ip 才启动，未配置时这里什么都不做
+    httproxy::client::vnet::spawn(Arc::clone(&http_client), Arc::clone(&state));
+
     // [[redirect]]：本地端口转发，与 HTTP 代理入站共用同一个连接数上限
     for rule in httproxy::client::redirect::RedirectRule::parse_all(&config.redirect)? {
         httproxy::client::redirect::spawn(

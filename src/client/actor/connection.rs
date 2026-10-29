@@ -191,6 +191,7 @@ mod tests {
             max_connections: 8,
             max_in_flight_bytes: 1024 * 1024,
             upload_concurrency: 4,
+            vnet: None,
         })
     }
 

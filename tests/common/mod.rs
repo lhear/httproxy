@@ -173,6 +173,9 @@ pub async fn spawn_client_with_redirects(
     );
     let sem = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
 
+    // 与 bin/client.rs 保持一致：配置了虚拟 IP 才会启动虚拟内网通道
+    httproxy::client::vnet::spawn(Arc::clone(&http_client), Arc::clone(&state));
+
     let mut redirect_addrs = Vec::new();
     for rule in httproxy::client::redirect::RedirectRule::parse_all(&cfg.redirect).unwrap() {
         let addr = httproxy::client::redirect::spawn(

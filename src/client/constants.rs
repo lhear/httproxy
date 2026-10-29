@@ -39,5 +39,21 @@ pub const WRITE_FLUSH_TIMEOUT: Duration = Duration::from_millis(2);
 
 pub const MASTER_RESUME_WINDOW_SECS: u64 = 1170;
 
+/// 虚拟内网：通道断开后的重连退避区间。
+pub const VNET_RECONNECT_MIN: Duration = Duration::from_secs(1);
+pub const VNET_RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// 虚拟内网：连本机服务的超时（先试虚拟 IP，失败再回退 127.0.0.1）。
+pub const VNET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 虚拟内网：单个上行 POST 最多攒多少已编码字节。
+pub const VNET_BATCH_BYTES: usize = 64 * 1024;
+/// 虚拟内网：并发上行 POST 数量。
+pub const VNET_UPLINK_CONCURRENCY: usize = 4;
+/// 虚拟内网：单条逻辑连接待写字节的队列容量。
+pub const VNET_CONN_CAPACITY: usize = 32;
+/// 虚拟内网：等待发送的 mux 帧队列容量。
+pub const VNET_UPLINK_QUEUE: usize = 1024;
+/// 虚拟内网：下行解码缓冲上限（一个最大帧 + 余量）。
+pub const VNET_DECODE_BUF: usize = 16 * 1024 + 2396;
+
 pub const PADDING_POOL: &[u8] = b"padding=XXXXXXXXXXXXXXXXXXXXXXXXXX";
 pub const MIN_PADDING: usize = 16;

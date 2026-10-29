@@ -51,6 +51,8 @@ pub struct SharedState {
     pub max_connections: usize,
     pub max_in_flight_bytes: usize,
     pub upload_concurrency: usize,
+    /// 虚拟内网配置；`None` 时客户端行为与未引入该功能时完全一致
+    pub vnet: Option<Arc<crate::client::vnet::VnetSpec>>,
 }
 
 pub struct Resuming {
@@ -259,6 +261,7 @@ mod tests {
             max_connections: 10,
             max_in_flight_bytes: 1024 * 1024,
             upload_concurrency: 4,
+            vnet: None,
         })
     }
 

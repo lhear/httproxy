@@ -6,6 +6,7 @@ pub mod proxy;
 pub mod redirect;
 pub mod state;
 pub mod utils;
+pub mod vnet;
 
 use crate::client::constants::{MAX_IN_FLIGHT_BYTES, MAX_LOCAL_CONNECTIONS, UPLOAD_CONCURRENCY};
 use crate::config::ClientTopConfig;
@@ -77,6 +78,28 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         (expected, a.username.clone())
     });
 
+    // 虚拟内网：地址与端口必须同配同缺，缺一半直接拒绝启动，
+    // 免得配了一半还以为地址已经上线
+    let vnet = match (
+        cfg.client.virtual_ip.as_deref(),
+        cfg.client.virtual_ports.clone(),
+    ) {
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(anyhow::anyhow!(
+                "[client] virtual_ip requires virtual_ports (array or range)"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "[client] virtual_ports requires virtual_ip"
+            ));
+        }
+        (Some(ip), Some(ports)) => Some(Arc::new(
+            vnet::VnetSpec::new(ip, ports).context("invalid virtual network configuration")?,
+        )),
+    };
+
     Ok(Arc::new(state::SharedState {
         remote_str,
         auth_header: format!("Bearer {}", cfg.auth.token),
@@ -91,6 +114,7 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         max_connections: cfg.client.max_connections.unwrap_or(MAX_LOCAL_CONNECTIONS),
         max_in_flight_bytes,
         upload_concurrency,
+        vnet,
     }))
 }
 
@@ -148,5 +172,47 @@ padding_threshold = 50
         let state = build_state(&cfg).unwrap();
         assert_eq!(state.max_in_flight_bytes, 256 * 1024);
         assert_eq!(state.upload_concurrency, 4);
+    }
+
+    #[test]
+    fn build_state_without_vnet_keeps_defaults() {
+        let cfg = minimal_client_cfg();
+        let state = build_state(&cfg).unwrap();
+        assert!(state.vnet.is_none(), "未配置虚拟 IP 时不应启用虚拟内网");
+    }
+
+    #[test]
+    fn build_state_accepts_vnet_config() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.virtual_ip = Some("10.0.0.5".to_string());
+        cfg.client.virtual_ports = Some(crate::config::PortSet::new(vec![80, 443]));
+        let state = build_state(&cfg).unwrap();
+        let vnet = state.vnet.as_ref().expect("vnet spec");
+        assert_eq!(vnet.ip, "10.0.0.5".parse::<std::net::IpAddr>().unwrap());
+        assert!(vnet.ports.contains(443));
+    }
+
+    #[test]
+    fn build_state_rejects_half_vnet_config() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.virtual_ip = Some("10.0.0.5".to_string());
+        assert!(build_state(&cfg).is_err(), "缺少端口必须拒绝");
+
+        let mut cfg = minimal_client_cfg();
+        cfg.client.virtual_ports = Some(crate::config::PortSet::new(vec![80]));
+        assert!(build_state(&cfg).is_err(), "缺少地址必须拒绝");
+
+        let mut cfg = minimal_client_cfg();
+        cfg.client.virtual_ip = Some("10.0.0.5".to_string());
+        cfg.client.virtual_ports = Some(crate::config::PortSet::default());
+        assert!(build_state(&cfg).is_err(), "空端口列表必须拒绝");
+    }
+
+    #[test]
+    fn build_state_rejects_bad_virtual_ip() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.virtual_ip = Some("10.0.0.5/24".to_string());
+        cfg.client.virtual_ports = Some(crate::config::PortSet::new(vec![80]));
+        assert!(build_state(&cfg).is_err());
     }
 }

@@ -33,6 +33,18 @@ pub fn build_stream_cookie(buf: &mut String, stream_id: Uuid) {
     build_cookie_into(buf, "stream", stream_id.as_hyphenated())
 }
 
+/// 虚拟内网：下行长连接的 cookie。
+#[inline]
+pub fn build_vnet_cookie(buf: &mut String, identity: &str) {
+    build_cookie_into(buf, "vnet", identity)
+}
+
+/// 虚拟内网：上行批量 POST 的 cookie。
+#[inline]
+pub fn build_vnet_up_cookie(buf: &mut String, identity: &str) {
+    build_cookie_into(buf, "vnet_up", identity)
+}
+
 pub fn encode_initial_payload(
     initial_payload: &Bytes,
     max_bytes: usize,
