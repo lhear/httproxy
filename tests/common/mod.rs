@@ -91,6 +91,8 @@ pub fn client_config(
             max_connections: None,
             max_in_flight_bytes: None,
             upload_concurrency: None,
+            virtual_ip: None,
+            virtual_ports: None,
         },
         auth: ClientAuthSection {
             token: token.unwrap_or_else(valid_token),
@@ -100,6 +102,12 @@ pub fn client_config(
         bypass: BypassConfig { bypass_files },
         redirect: Vec::new(),
     }
+}
+
+/// 给客户端配置一份虚拟内网（虚拟 IP + 在这个地址上响应的端口）。
+pub fn with_vnet(cfg: &mut ClientTopConfig, ip: &str, ports: &[u16]) {
+    cfg.client.virtual_ip = Some(ip.to_string());
+    cfg.client.virtual_ports = Some(httproxy::config::PortSet::new(ports.to_vec()));
 }
 
 pub async fn spawn_upstream() -> SocketAddr {
