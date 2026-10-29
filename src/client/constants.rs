@@ -45,7 +45,11 @@ pub const VNET_RECONNECT_MAX: Duration = Duration::from_secs(30);
 /// 虚拟内网：连本机服务的超时（先试回环，失败再试虚拟 IP）。
 pub const VNET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 虚拟内网：单个上行 POST 最多攒多少已编码字节。
-pub const VNET_BATCH_BYTES: usize = 64 * 1024;
+///
+/// 上行吞吐 ≈（批次 × 在飞数）/ RTT，所以这个上限直接决定链路带宽延迟积：
+/// 256 KiB × 4 在飞 = 1 MiB，约为服务端重排序窗口的一半，给乱序留出余量。
+/// 批次只在队列里已有数据时才攒，攒不满也照样立刻发，因此不影响延迟。
+pub const VNET_BATCH_BYTES: usize = 256 * 1024;
 /// 虚拟内网：并发上行 POST 数量。
 pub const VNET_UPLINK_CONCURRENCY: usize = 4;
 /// 虚拟内网：单条逻辑连接待写字节的队列容量。
