@@ -32,7 +32,7 @@ use crate::error::ServerError;
 use crate::mux::{self, Tag, ToSocket};
 use crate::server::constants::{
     VNET_CONN_CAPACITY, VNET_DOWNLINK_CAPACITY, VNET_HEARTBEAT, VNET_REPLACE_GUARD_SECS,
-    VNET_STALE_SECS, VNET_UPLINK_FRAMES, VNET_UPLINK_PENDING_BYTES,
+    VNET_STALE_SECS, VNET_UPLINK_FRAMES, VNET_UPLINK_PENDING_BYTES, WRITE_TIMEOUT,
 };
 use crate::shaper::{self, FrameCipher, ResolvedShaperConfig, encode_frame_into};
 
@@ -348,8 +348,18 @@ async fn relay(
             biased;
             cmd = to_socket.recv(), if writer_open => match cmd {
                 Some(ToSocket::Data(data)) => {
-                    if write_half.write_all(&data).await.is_err() {
-                        break;
+                    // 写不动就认这条连接已经死了：上行派发是串行的，一条卡住的
+                    // 连接会把整个节点（它承载的所有连接）一起拖住
+                    match tokio::time::timeout(WRITE_TIMEOUT, write_half.write_all(&data)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            debug!(conn_id, error = %e, "peer relay write failed");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(conn_id, "peer relay write stalled, dropping connection");
+                            break;
+                        }
                     }
                 }
                 Some(ToSocket::Eof) => {

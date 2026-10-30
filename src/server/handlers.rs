@@ -697,6 +697,11 @@ async fn handle_vnet_downlink(
     let padding = utils::random_padding();
     Response::builder()
         .header("Cache-Control", "no-store")
+        // 这条响应是永不结束的流，反向代理一缓冲就全毁了：帧（尤其是 20s
+        // 一次的心跳）会滞留在代理的缓冲里，节点收不到 PING 也就不回 PONG，
+        // 服务端随后判定节点失联并摘掉注册——表现为「用一会儿就全断了」。
+        // nginx 认这个头；其他代理按 §部署 里的说明关掉缓冲。
+        .header("X-Accel-Buffering", "no")
         .header("Set-Cookie", padding)
         .body(Body::from_stream(
             tokio_stream::wrappers::ReceiverStream::new(frames),
