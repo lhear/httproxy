@@ -227,6 +227,22 @@ Behaviour:
   way to know it was meant to be a virtual one (it keeps no state about absent
   clients) and falls back to its normal direct connection, which usually ends in
   HTTP 502 — i.e. the address is unreachable until that client is back online.
+- **The channel is rebuilt as a whole.** The downlink and the uplink are two
+  halves of one channel: if either side ends the client tears the channel down
+  immediately and reconnects, rather than waiting for the server's ~75 s
+  heartbeat to notice half of it is gone. Every connection through the address
+  is dropped with it. The reconnect backoff resets once a channel has been
+  established, so a blip costs a new connection, not a growing delay. An uplink
+  batch that fails is resent (same frames, same sequence numbers — the server
+  discards duplicates), because losing one batch would stall everything queued
+  behind its sequence number.
+- **Intermediaries must not buffer the channel.** The downlink is an endless
+  response, so a proxy that buffers it will hold frames — including the 20 s
+  heartbeat — until its buffer fills. The server sends `X-Accel-Buffering: no`
+  for nginx; other proxies need the equivalent of `proxy_buffering off` (§10).
+  A buffered channel looks like this: a few requests work, then they stop,
+  because the peer is declared silent and de-registered while its frames sit in
+  the proxy.
 - **Local dial order.** The client dials `127.0.0.1:<port>` first, because that is
   what a service listening on `0.0.0.0` or on loopback answers on immediately.
   Only if that is refused does it try `<virtual_ip>:<port>`, which covers a
@@ -595,7 +611,10 @@ upstream httproxy_backend {
 Key points:
 
 - `proxy_request_buffering off` and `proxy_buffering off` keep the tunnel
-  streaming (required for low latency and full duplex throughput).
+  streaming (required for low latency and full duplex throughput). They matter
+  even more for the virtual network channel (§2.6), whose downlink never ends:
+  a buffering proxy holds its frames until the buffer fills, the peer stops
+  answering heartbeats, and the address silently goes offline.
 - Long `proxy_read/send_timeout`s prevent idle tunnel teardown.
 - `client_max_body_size` must be at least the largest upload batch: batches
   reach `min(1 MiB, max_in_flight_bytes)` plus one frame of slack

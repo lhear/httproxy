@@ -304,3 +304,91 @@ async fn dead_local_port_fails_fast() {
         }
     }
 }
+
+/// 连续多次请求：部署里报过的「前几个成功、后续全部失败」就是这条路径。
+///
+/// 每条请求都是一条全新的逻辑连接，服务端会给它分配新的 `conn_id`；只要
+/// 某一条的帧在节点侧没找到落点，它就会一直挂着，而后续请求又各自独立，
+/// 所以「全都失败」往往意味着节点侧对每条连接都做了同一件错事。
+#[tokio::test]
+async fn many_sequential_requests_all_succeed() {
+    let env = start().await;
+    let request = format!(
+        "GET http://{VIRTUAL_IP}:{}/hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        env.upstream.port()
+    );
+    fetch_until_ok(env.proxy, &request).await;
+
+    for i in 0..20 {
+        let (status, body) = fetch(env.proxy, &request)
+            .await
+            .unwrap_or_else(|| panic!("request #{i} failed"));
+        assert_eq!(status, 200, "request #{i} status");
+        assert_eq!(body, b"hello upstream", "request #{i} body");
+    }
+}
+
+/// 同一条代理连接上连续请求（keep-alive）：虚拟内网的一条逻辑连接要能
+/// 承载多次请求，不能第一个响应结束后就把它拆掉。
+#[tokio::test]
+async fn keepalive_requests_share_one_vnet_connection() {
+    init_logging();
+    let env = start().await;
+    let url = format!("http://{VIRTUAL_IP}:{}/hello", env.upstream.port());
+    let request = format!("GET {url} HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n");
+
+    // 先等节点上线
+    fetch_until_ok(
+        env.proxy,
+        &format!("GET {url} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+
+    let mut stream = TcpStream::connect(env.proxy).await.unwrap();
+    for i in 0..10 {
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let (status, body) = read_one_response(&mut stream)
+            .await
+            .unwrap_or_else(|| panic!("request #{i} on a kept-alive connection failed"));
+        assert_eq!(status, 200, "request #{i} status");
+        assert_eq!(body, b"hello upstream", "request #{i} body");
+    }
+}
+
+/// 读一条带 `Content-Length` 的响应，只读到该响应的边界，保留后续字节在
+/// 内核缓冲里给下一次请求用。
+async fn read_one_response(stream: &mut TcpStream) -> Option<(u16, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let head_end = loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
+    let len: usize = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())?;
+    while buf.len() < head_end + len {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    Some((status, buf[head_end..head_end + len].to_vec()))
+}
