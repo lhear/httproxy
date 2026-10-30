@@ -56,8 +56,17 @@ pub const VNET_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 pub const VNET_BATCH_BYTES: usize = 256 * 1024;
 /// 虚拟内网：并发上行 POST 数量。
 pub const VNET_UPLINK_CONCURRENCY: usize = 4;
+/// 虚拟内网：一批上行帧最多发几次（含首发）。重发是幂等的，见 `send_batch_with_retry`。
+pub const VNET_UPLINK_ATTEMPTS: u32 = 3;
+/// 虚拟内网：上行重发的首次间隔（之后翻倍）。
+pub const VNET_UPLINK_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// 虚拟内网：单条逻辑连接待写字节的队列容量。
 pub const VNET_CONN_CAPACITY: usize = 32;
+/// 虚拟内网：往本机 socket 写的超时。
+///
+/// 所有连接共用一条通道，一条写不动的连接会把整条通道堵住（上行派发是串行的），
+/// 所以这里必须有个上限：超过就认这条连接已经死了，丢掉它让其他连接继续。
+pub const VNET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 虚拟内网：等待发送的 mux 帧队列容量。
 pub const VNET_UPLINK_QUEUE: usize = 1024;
 /// 虚拟内网：下行解码缓冲上限（一个最大帧 + 余量）。

@@ -33,7 +33,8 @@ use zeroize::Zeroizing;
 use crate::client::constants::{
     DOWNLOAD_CONNECT_TIMEOUT, MASTER_RESUME_WINDOW_SECS, UPLOAD_REQUEST_TIMEOUT, VNET_BATCH_BYTES,
     VNET_CONN_CAPACITY, VNET_CONNECT_TIMEOUT, VNET_DECODE_BUF, VNET_RECONNECT_MAX,
-    VNET_RECONNECT_MIN, VNET_UPLINK_CONCURRENCY, VNET_UPLINK_QUEUE,
+    VNET_RECONNECT_MIN, VNET_UPLINK_ATTEMPTS, VNET_UPLINK_CONCURRENCY, VNET_UPLINK_QUEUE,
+    VNET_UPLINK_RETRY_DELAY, VNET_WRITE_TIMEOUT,
 };
 use crate::client::state::SharedState;
 use crate::client::utils;
@@ -75,12 +76,16 @@ pub fn spawn(http_client: Arc<wreq::Client>, state: Arc<SharedState>) {
     tokio::spawn(async move {
         let mut backoff = VNET_RECONNECT_MIN;
         loop {
-            match run_vnet(&http_client, &state, &spec).await {
-                Ok(()) => {
-                    info!(ip = %spec.ip, "vnet closed, reconnecting");
-                    backoff = VNET_RECONNECT_MIN;
-                }
+            let (live, result) = run_vnet(&http_client, &state, &spec).await;
+            match result {
+                Ok(()) => info!(ip = %spec.ip, "vnet closed, reconnecting"),
                 Err(e) => warn!(ip = %spec.ip, error = %e, "vnet failed"),
+            }
+            // 上过线就说明配置、鉴权、网络都是通的，断掉只是抖动：立刻重连，
+            // 别沿用上一个失败周期攒起来的退避——否则一次抖动之后这个节点要
+            // 等半分钟才回来，那段时间里它的地址完全不可用。
+            if live {
+                backoff = VNET_RECONNECT_MIN;
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(VNET_RECONNECT_MAX);
@@ -93,10 +98,25 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 /// 建立一次虚拟内网通道，直到服务端断开或出错。
+///
+/// 两个返回值分别是「这次通道有没有成功上线过」和结果：上过线说明配置、
+/// 鉴权、网络都是通的，断了只是抖动，上层应当立刻重连。
 async fn run_vnet(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
     spec: &VnetSpec,
+) -> (bool, Result<()>) {
+    let mut live = false;
+    let result = channel(http_client, state, spec, &mut live).await;
+    (live, result)
+}
+
+/// 通道本体。`live` 在注册成功那一刻置位，即便随后以 `?` 提前返回也能带回去。
+async fn channel(
+    http_client: &Arc<wreq::Client>,
+    state: &Arc<SharedState>,
+    spec: &VnetSpec,
+    live: &mut bool,
 ) -> Result<()> {
     let encrypted = state.server_public_key.is_some();
     let ip_b64 = b64(spec.ip.to_string().as_bytes());
@@ -149,6 +169,7 @@ async fn run_vnet(
         .context("vnet connect timed out")?
         .context("vnet connect failed")?;
     let response = utils::check_response_status(response, "server rejected vnet").await?;
+    *live = true;
 
     info!(
         ip = %spec.ip,
@@ -173,21 +194,34 @@ async fn run_vnet(
     ));
 
     let conns: Arc<DashMap<u32, mpsc::Sender<ToSocket>>> = Arc::new(DashMap::new());
-    let result = pump_downlink(
-        response,
-        state,
-        spec,
-        down_cipher,
-        uplink_tx,
-        Arc::clone(&conns),
-        chunk,
-    )
-    .await;
+    let mut uplink_task = uplink_task;
+    // 上行一死这条通道就废了：数据只能从节点往服务端走，少了它每个请求都会
+    // 卡住。所以不能只盯着下行——否则服务端要等到心跳超时（75s）才会发现，
+    // 这段时间里所有请求都是失败的。这里直接收尾，交给上层重连。
+    let result = tokio::select! {
+        biased;
+        done = &mut uplink_task => Err(match done {
+            Ok(Ok(())) => anyhow!("vnet uplink closed"),
+            Ok(Err(e)) => e,
+            Err(e) => anyhow!("vnet uplink task stopped: {e}"),
+        }),
+        result = pump_downlink(
+            response,
+            state,
+            spec,
+            down_cipher,
+            uplink_tx,
+            Arc::clone(&conns),
+            chunk,
+        ) => result,
+    };
 
     // 通道没了，本地连接也就没有意义了：丢掉 sender 让 relay 立即收尾
     conns.clear();
-    uplink_task.abort();
-    let _ = uplink_task.await;
+    if !uplink_task.is_finished() {
+        uplink_task.abort();
+        let _ = uplink_task.await;
+    }
 
     result
 }
@@ -237,6 +271,9 @@ async fn pump_downlink(
     let encoding = state.traffic_config.encoding_type;
     let mut stream = response.into_data_stream();
     let mut buf = BytesMut::with_capacity(VNET_DECODE_BUF);
+    // 完整帧已经全部解掉了，剩下的必然是半帧，所以「缓冲区超过一帧」就等于
+    // 「对端在发一个不可能的帧」。上限按当前编码算，别写死一个数字。
+    let max_frame = shaper::max_encoded_frame_len(encoding);
 
     while let Some(next) = stream.next().await {
         let chunk_bytes = next.context("vnet downlink read error")?;
@@ -248,8 +285,11 @@ async fn pump_downlink(
             dispatch(payload, spec, &uplink_tx, Arc::clone(&conns), chunk).await;
         }
 
-        if buf.len() > VNET_DECODE_BUF {
-            bail!("vnet downlink buffer overflow");
+        if buf.len() > max_frame {
+            bail!(
+                "vnet downlink buffer overflow: {} bytes without a complete frame",
+                buf.len()
+            );
         }
     }
 
@@ -282,11 +322,20 @@ async fn dispatch(
                 return;
             }
             let conn_id = frame.conn;
+            // 先登记再撒手：服务端把访问方的首包紧跟在 OPEN 后面推下来，
+            // 两者常常落在同一个读取块里。派发是串行的，`tokio::spawn` 之后的
+            // 任务要等到下次让出执行权才会跑，所以登记必须在这里同步完成，
+            // 否则紧跟其后的 DATA 会找不到落点而被丢掉——那是一条永远等不到
+            // 请求字节的连接，看起来就是「请求挂死」。
+            let (tx, rx) = mpsc::channel::<ToSocket>(VNET_CONN_CAPACITY);
+            if conns.insert(conn_id, tx).is_some() {
+                warn!(conn_id, "OPEN reused a live connection id");
+            }
             let ip = spec.ip;
             let conns = Arc::clone(&conns);
             let uplink = uplink_tx.clone();
             tokio::spawn(async move {
-                serve_local(conn_id, ip, port, conns, uplink, chunk).await;
+                serve_local(conn_id, ip, port, conns, uplink, chunk, rx).await;
             });
         }
         Tag::Data => {
@@ -294,6 +343,8 @@ async fn dispatch(
                 let _ = tx
                     .send(ToSocket::Data(Bytes::copy_from_slice(frame.payload)))
                     .await;
+            } else {
+                debug!(conn = frame.conn, "DATA for an unknown connection dropped");
             }
         }
         Tag::Close => {
@@ -310,9 +361,10 @@ async fn dispatch(
 
 /// 连上本机端口并开始搬运字节。
 ///
-/// 先登记连接再拨号：服务端不等回执就把访问方的首包紧跟着 `OPEN` 推下来，
-/// 那些 DATA 帧会先落在这个有界队列里，等拨号完成再写进 socket。拨号失败时
-/// 整条连接被撤掉，排队的数据一并丢弃（服务端也会收到 `OPEN_FAIL` 并收尾）。
+/// 连接在派发 `OPEN` 时就已登记进 `conns`，因此服务端紧跟着推下来的 DATA 会
+/// 先落在 `to_socket` 这个有界队列里，等拨号完成再写进 socket。拨号失败时整条
+/// 连接被撤掉，排队的数据一并丢弃（服务端也会收到 `OPEN_FAIL` 并收尾）。
+#[allow(clippy::too_many_arguments)]
 async fn serve_local(
     conn_id: u32,
     ip: IpAddr,
@@ -320,10 +372,8 @@ async fn serve_local(
     conns: Arc<DashMap<u32, mpsc::Sender<ToSocket>>>,
     uplink: mpsc::Sender<Bytes>,
     chunk: usize,
+    to_socket: mpsc::Receiver<ToSocket>,
 ) {
-    let (tx, rx) = mpsc::channel::<ToSocket>(VNET_CONN_CAPACITY);
-    conns.insert(conn_id, tx);
-
     let socket = match connect_local(ip, port).await {
         Ok(socket) => socket,
         Err(e) => {
@@ -346,7 +396,7 @@ async fn serve_local(
         return;
     }
 
-    relay_local(conn_id, socket, rx, uplink, conns, chunk).await;
+    relay_local(conn_id, socket, to_socket, uplink, conns, chunk).await;
 }
 
 async fn relay_local(
@@ -366,8 +416,18 @@ async fn relay_local(
             biased;
             cmd = to_socket.recv(), if writer_open => match cmd {
                 Some(ToSocket::Data(data)) => {
-                    if write_half.write_all(&data).await.is_err() {
-                        break;
+                    // 写超时同样是自保：本机服务读不动时，这条连接不能把整条
+                    // 通道（所有其他连接共用）一起堵死
+                    match tokio::time::timeout(VNET_WRITE_TIMEOUT, write_half.write_all(&data)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            debug!(conn_id, error = %e, "local write failed");
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(conn_id, "local write stalled, dropping connection");
+                            break;
+                        }
                     }
                 }
                 Some(ToSocket::Eof) => {
@@ -491,7 +551,7 @@ async fn uplink_loop(
         let cookie = cookie.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            send_batch(&client, &shared, &cookie, body, encrypted).await
+            send_batch_with_retry(&client, &shared, &cookie, body, encrypted).await
         });
 
         while let Some(done) = tasks.try_join_next() {
@@ -532,6 +592,37 @@ fn push_frame(
         out,
     )
     .context("encode vnet uplink frame")
+}
+
+/// 发一批上行帧，失败就重发同一批。
+///
+/// 重发是安全的：每帧自带 `seq`，服务端对已经交付过的序号直接丢弃（乱序缓冲
+/// 里重复的也丢弃），所以「首发送到一半失败」之后重发整批，服务端看到的仍然
+/// 是同一条有序字节流。
+///
+/// 这一步存在的理由是失败代价太不对等：一批没了，后续各批的序号都会卡在它
+/// 后面（服务端重排序要求连续），整条通道立刻不可用；而一次重试只要几百毫秒。
+/// 长连接被中间代理按 keepalive 上限掐掉一次，本来不该等于整个虚拟地址下线。
+async fn send_batch_with_retry(
+    http_client: &Arc<wreq::Client>,
+    state: &SharedState,
+    cookie: &str,
+    body: Bytes,
+    encrypted: bool,
+) -> Result<()> {
+    let mut delay = VNET_UPLINK_RETRY_DELAY;
+    for attempt in 1..=VNET_UPLINK_ATTEMPTS {
+        match send_batch(http_client, state, cookie, body.clone(), encrypted).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt == VNET_UPLINK_ATTEMPTS => return Err(e),
+            Err(e) => {
+                debug!(attempt, error = %e, "vnet uplink batch failed, retrying");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn send_batch(
@@ -611,6 +702,54 @@ mod tests {
             .expect("a loopback service must be reachable");
         assert!(socket.peer_addr().is_ok());
         drop(listener);
+    }
+
+    /// `OPEN` 和紧接着的 `DATA` 常常同处一个读取块（服务端把首包紧跟着 OPEN
+    /// 推下来，中间不隔任何东西）。派发是串行的，`OPEN` 只是把连接丢给一个
+    /// 后台任务——若 DATA 先于那条任务登记到达，它就会被静默丢掉，请求从此
+    /// 挂死。这条断言盯的正是「同一批里的 DATA 不能丢」。
+    #[tokio::test]
+    async fn data_in_the_same_batch_as_open_is_delivered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 128];
+            let n = sock.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+
+        let spec = VnetSpec {
+            ip: "127.0.0.9".parse().unwrap(),
+            ports: ports(&[port]),
+        };
+        let conns = Arc::new(DashMap::new());
+        let (uplink_tx, _uplink_rx) = mpsc::channel::<Bytes>(16);
+
+        // 与 `pump_downlink` 一样：同一个读取块里连续派发，中间不让出执行权
+        dispatch(
+            mux::encode(Tag::Open, 1, &port.to_be_bytes()),
+            &spec,
+            &uplink_tx,
+            Arc::clone(&conns),
+            4096,
+        )
+        .await;
+        dispatch(
+            mux::encode(Tag::Data, 1, b"GET / HTTP/1.1\r\n\r\n"),
+            &spec,
+            &uplink_tx,
+            Arc::clone(&conns),
+            4096,
+        )
+        .await;
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), service)
+            .await
+            .expect("DATA sent right after OPEN must reach the local service")
+            .unwrap();
+        assert_eq!(&got, b"GET / HTTP/1.1\r\n\r\n");
     }
 
     #[tokio::test]
