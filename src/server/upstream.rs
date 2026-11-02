@@ -1,7 +1,8 @@
 //! 出站连接抽象。
 //!
-//! 隧道 actor 只关心「可读的字节流」和「可写的字节流」，所以这里用枚举把传输差异
-//! 收住，避免把 `Box<dyn AsyncWrite>` 引入热路径。
+//! 服务端有两种上游：直连的 `TcpStream`，以及走 Cloudflare WARP 的 MASQUE
+//! CONNECT 流。隧道 actor 只关心「可读的字节流」和「可写的字节流」，所以这里
+//! 用两个枚举把差异收住，避免把 `Box<dyn AsyncWrite>` 引入热路径。
 
 use std::io;
 use std::pin::Pin;
@@ -13,9 +14,11 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::server::constants::MAX_WRITE_IOV;
+use crate::warp::masque::{MasqueRecv, MasqueSend, MasqueStream};
 
 pub(crate) enum Upstream {
     Direct(TcpStream),
+    Warp(MasqueStream),
 }
 
 impl Upstream {
@@ -25,12 +28,17 @@ impl Upstream {
                 let (read, write) = stream.into_split();
                 (UpstreamRead::Direct(read), UpstreamWrite::Direct(write))
             }
+            Upstream::Warp(stream) => (
+                UpstreamRead::Warp(stream.recv),
+                UpstreamWrite::Warp(stream.send),
+            ),
         }
     }
 }
 
 pub(crate) enum UpstreamRead {
     Direct(OwnedReadHalf),
+    Warp(MasqueRecv),
 }
 
 impl AsyncRead for UpstreamRead {
@@ -41,6 +49,7 @@ impl AsyncRead for UpstreamRead {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             UpstreamRead::Direct(read) => Pin::new(read).poll_read(cx, buf),
+            UpstreamRead::Warp(read) => Pin::new(read).poll_read(cx, buf),
         }
     }
 }
@@ -53,15 +62,18 @@ impl From<OwnedReadHalf> for UpstreamRead {
 
 pub(crate) enum UpstreamWrite {
     Direct(OwnedWriteHalf),
+    Warp(MasqueSend),
 }
 
 impl UpstreamWrite {
     /// 把一段连续帧写进上游。
     ///
-    /// 单帧走普通 write，多帧用 `write_vectored` 合并成一次系统调用。
+    /// TCP 走 `write_vectored`（一次系统调用写多帧）；WARP 走 `write_all_chunks`
+    /// （`Bytes` 直接挂到 QUIC 流上，不拷贝载荷）。
     pub async fn write_frames(&mut self, frames: &[Bytes]) -> io::Result<()> {
         match self {
             UpstreamWrite::Direct(write) => write_tcp_frames(write, frames).await,
+            UpstreamWrite::Warp(write) => write.write_frames(frames).await,
         }
     }
 
@@ -69,6 +81,7 @@ impl UpstreamWrite {
     pub async fn shutdown(&mut self) -> io::Result<()> {
         match self {
             UpstreamWrite::Direct(write) => write.shutdown().await,
+            UpstreamWrite::Warp(write) => write.shutdown().await,
         }
     }
 }

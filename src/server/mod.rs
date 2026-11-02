@@ -12,6 +12,7 @@ use crate::config::ServerTopConfig;
 use crate::crypto;
 use crate::dns::{self, DnsClient};
 use crate::shaper::{EncodingType, FrameCipher, ResolvedShaperConfig, TrafficConfig};
+use crate::warp::WarpClient;
 
 use anyhow::Context;
 use axum::serve::ListenerExt;
@@ -30,7 +31,7 @@ use stream_registry::StreamRegistry;
 use tokio::sync::{Semaphore, mpsc};
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -62,6 +63,7 @@ pub struct AppState {
     pub jwt_validation: Validation,
     pub socks5_proxy: Option<Arc<str>>,
     pub dns_client: Option<Arc<DnsClient>>,
+    pub warp: Option<Arc<WarpClient>>,
     pub client_subnet: Option<IpAddr>,
     pub traffic_config: Arc<TrafficConfig>,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
@@ -82,10 +84,30 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         .validate()
         .context("invalid traffic_shaping config")?;
 
-    let (dns_client, client_subnet) = match config.dns {
-        Some(ref mut dc) => {
-            let mut dc = dc.clone();
-            let client = dns::init_dns(&mut dc).await?;
+    // WARP 先建：DNS 传输要按它的判定决定查询是否也走隧道
+    let warp = match config.warp.as_ref() {
+        Some(section) if section.enabled => Some(
+            WarpClient::init(section)
+                .await
+                .context("warp initialization failed")?,
+        ),
+        Some(_) => {
+            info!("warp: disabled by config");
+            None
+        }
+        None => None,
+    };
+
+    // WARP 打开后域名必须由 DNS 模块解析（不能交给 WARP），所以没配 [dns] 时
+    // 用 Cloudflare 的解析器兜底，并且同样经 WARP 出去。
+    let mut dns_config = config.dns.clone();
+    if dns_config.is_none() && warp.is_some() {
+        warn!("warp: no [dns] section, resolving names via 1.1.1.1:53 over WARP");
+        dns_config = Some(crate::dns::DnsConfig::public_default());
+    }
+    let (dns_client, client_subnet) = match dns_config {
+        Some(mut dc) => {
+            let client = dns::init_dns(&mut dc, warp.as_ref()).await?;
             (Some(client), dc.options.client_subnet)
         }
         None => (None, None),
@@ -113,6 +135,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
             .and_then(|p| p.socks5.as_deref())
             .map(Arc::from),
         dns_client,
+        warp,
         client_subnet,
         traffic_config: Arc::new(config.traffic_shaping.clone()),
         resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&config.traffic_shaping)),
@@ -206,6 +229,7 @@ mod tests {
             proxy: None,
             log: None,
             dns: None,
+            warp: None,
             traffic_shaping: TrafficConfig {
                 global: shaper::PaddingConfig {
                     padding_threshold: 100,

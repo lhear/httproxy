@@ -1,31 +1,41 @@
 use anyhow::{Context, Result, anyhow};
 use std::{
     collections::HashMap,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, OnceLock},
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpStream, UdpSocket},
     sync::{Mutex, mpsc, oneshot},
     time::timeout,
 };
 use tokio_rustls::{
     TlsConnector,
-    client::TlsStream,
     rustls::{self, RootCertStore, pki_types::ServerName},
 };
 use tracing::{debug, warn};
 
-use super::config::DnsConfig;
+use super::config::{DnsConfig, Protocol};
+use crate::warp::WarpClient;
 
 static ROOT_CERT_STORE: OnceLock<Arc<RootCertStore>> = OnceLock::new();
 
 /// 查询里声明的 EDNS UDP 载荷为 1232 字节，接收缓冲取 2 KiB 足够。
 const UDP_RECV_BUF: usize = 2048;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TLS_TIMEOUT: Duration = Duration::from_secs(5);
+
 type PendingMap = Arc<Mutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>>>>>>;
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// 建一条 DNS 传输连接的工厂。每次重连都调用一次。
+type Connector = Arc<dyn Fn() -> BoxFuture<Result<DnsStream>> + Send + Sync>;
 
 async fn assign_id_and_register(
     pending: &PendingMap,
@@ -68,23 +78,63 @@ impl UdpTransport {
     }
 }
 
-pub(super) struct DotTransport {
+/// DNS 传输用到的字节流：直连 TCP、TLS，或一条承载在 MASQUE CONNECT 上的流。
+pub(super) struct DnsStream(Box<dyn DnsStreamInner>);
+
+trait DnsStreamInner: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> DnsStreamInner for T {}
+
+impl DnsStream {
+    fn new(stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static) -> Self {
+        Self(Box::new(stream))
+    }
+}
+
+impl AsyncRead for DnsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        AsyncRead::poll_read(Pin::new(&mut *self.get_mut().0), cx, buf)
+    }
+}
+
+impl AsyncWrite for DnsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        AsyncWrite::poll_write(Pin::new(&mut *self.get_mut().0), cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut *self.get_mut().0), cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_shutdown(Pin::new(&mut *self.get_mut().0), cx)
+    }
+}
+
+/// 基于「长度前缀 + 可复用连接」的 DNS 传输（DNS-over-TCP 与 DoT 共用）。
+///
+/// 一个 actor 持有连接，按报文 ID 把响应分发给等待者；连接断了就清空所有
+/// 等待者，下次查询重新连接。
+pub(super) struct StreamTransport {
     tx: mpsc::Sender<(Vec<u8>, u16)>,
     pending: PendingMap,
 }
 
-impl DotTransport {
-    pub(super) fn new(
-        upstream: SocketAddr,
-        tls_connector: TlsConnector,
-        server_name: ServerName<'static>,
-    ) -> Self {
+impl StreamTransport {
+    pub(super) fn new(connector: Connector) -> Self {
         let pending: PendingMap = Default::default();
         let actor_pending = pending.clone();
         let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u16)>(32);
 
         tokio::spawn(async move {
-            let mut writer: Option<tokio::io::WriteHalf<TlsStream<TcpStream>>> = None;
+            let mut writer: Option<tokio::io::WriteHalf<DnsStream>> = None;
             let mut reader_task: Option<tokio::task::JoinHandle<()>> = None;
 
             loop {
@@ -93,13 +143,13 @@ impl DotTransport {
                         let Some((data, id)) = req else { break; };
 
                         if writer.is_none() {
-                            match Self::connect(upstream, &tls_connector, server_name.clone()).await {
+                            match (connector)().await {
                                 Ok(s) => {
                                     let (r, w) = tokio::io::split(s);
                                     writer = Some(w);
                                     let pm = actor_pending.clone();
                                     reader_task = Some(tokio::spawn(Self::reader_loop(r, pm)));
-                                    debug!("DoT connection established");
+                                    debug!("DNS stream transport connected");
                                 }
                                 Err(e) => {
                                     if let Some(tx) = actor_pending.lock().await.remove(&id) {
@@ -119,7 +169,7 @@ impl DotTransport {
                         })
                         .await;
                         if !matches!(write_result, Ok(Ok(()))) {
-                            warn!("DoT write failed or timed out, dropping connection");
+                            warn!("DNS upstream write failed or timed out, dropping connection");
 
                             for (_, tx) in actor_pending.lock().await.drain() {
                                 let _ = tx.send(Err(anyhow!("write failed, connection reset")));
@@ -136,7 +186,7 @@ impl DotTransport {
                             std::future::pending::<()>().await;
                         }
                     } => {
-                        debug!("DoT reader task exited, cleaning up connection");
+                        debug!("DNS upstream reader exited, cleaning up connection");
                         writer = None;
                         reader_task = None;
 
@@ -151,7 +201,7 @@ impl DotTransport {
         Self { tx, pending }
     }
 
-    async fn reader_loop(mut r: tokio::io::ReadHalf<TlsStream<TcpStream>>, pending: PendingMap) {
+    async fn reader_loop(mut r: tokio::io::ReadHalf<DnsStream>, pending: PendingMap) {
         let mut len_buf = [0u8; 2];
         loop {
             let len_res = timeout(Duration::from_secs(30), r.read_exact(&mut len_buf)).await;
@@ -176,16 +226,6 @@ impl DotTransport {
         }
     }
 
-    async fn connect(
-        upstream: SocketAddr,
-        connector: &TlsConnector,
-        name: ServerName<'static>,
-    ) -> Result<TlsStream<TcpStream>> {
-        let stream = timeout(Duration::from_secs(5), TcpStream::connect(upstream)).await??;
-        stream.set_nodelay(true)?;
-        Ok(timeout(Duration::from_secs(5), connector.connect(name, stream)).await??)
-    }
-
     pub(super) async fn send(&self, data: &mut [u8]) -> Result<(Vec<u8>, u16)> {
         let (tx, rx) = oneshot::channel();
 
@@ -193,28 +233,81 @@ impl DotTransport {
 
         if self.tx.send((data.to_vec(), id)).await.is_err() {
             self.pending.lock().await.remove(&id);
-            return Err(anyhow!("DoT actor closed"));
+            return Err(anyhow!("DNS transport actor closed"));
         }
 
         match timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(res)) => Ok((res?, id)),
-            Ok(Err(_)) => Err(anyhow!("DoT response channel closed")),
+            Ok(Err(_)) => Err(anyhow!("DNS response channel closed")),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err(anyhow!("DoT query timeout"))
+                Err(anyhow!("DNS query timeout"))
             }
         }
     }
 }
 
-pub(super) fn init_dot_transport(config: &DnsConfig) -> Result<DotTransport> {
+pub(super) enum Transport {
+    Udp(UdpTransport),
+    Stream(StreamTransport),
+}
+
+impl Transport {
+    pub(super) async fn send(&self, data: &mut [u8]) -> Result<(Vec<u8>, u16)> {
+        match self {
+            Transport::Udp(t) => t.send(data).await,
+            Transport::Stream(t) => t.send(data).await,
+        }
+    }
+}
+
+/// 按配置挑一条 DNS 传输。
+///
+/// 上游是公网地址且启用了 WARP 时，查询本身也走 WARP：CONNECT 只能承载 TCP，
+/// 所以 `protocol = "udp"`（端口 53）会退化成 DNS-over-TCP，`protocol = "dot"`
+/// 则是 TLS-over-CONNECT。上游是私网/回环地址时保持直连 —— WARP 到不了内网，
+/// 把内网解析器塞进隧道只会让所有查询失败。
+pub(super) fn build_transport(
+    config: &DnsConfig,
+    warp: Option<&Arc<WarpClient>>,
+) -> Result<Transport> {
+    let upstream = config.upstream;
+    let via_warp = warp.filter(|w| !w.is_direct_ip(upstream.ip())).cloned();
+
+    match (config.options.protocol, via_warp) {
+        (Protocol::Udp, None) => Ok(Transport::Udp(UdpTransport::new(upstream))),
+        (Protocol::Udp, Some(warp)) => {
+            debug!(
+                upstream = %upstream,
+                "dns: UDP upstream carried as DNS-over-TCP through WARP"
+            );
+            Ok(Transport::Stream(StreamTransport::new(warp_connector(
+                warp, upstream,
+            ))))
+        }
+        (Protocol::Dot, via_warp) => {
+            let name = tls_server_name(config)?;
+            let tls = TlsConnector::from(Arc::new(rustls_client_config()));
+            let connector = match via_warp {
+                Some(warp) => warp_dot_connector(warp, upstream, name, tls),
+                None => direct_dot_connector(upstream, name, tls),
+            };
+            Ok(Transport::Stream(StreamTransport::new(connector)))
+        }
+    }
+}
+
+fn tls_server_name(config: &DnsConfig) -> Result<ServerName<'static>> {
     let domain = config
         .tls_domain
         .as_deref()
         .context("DoT requires a TLS domain")?;
-    let server_name = ServerName::try_from(domain)
-        .map_err(|_| anyhow!("invalid TLS domain: {domain}"))?
-        .to_owned();
+    ServerName::try_from(domain)
+        .map_err(|_| anyhow!("invalid TLS domain: {domain}"))
+        .map(|n| n.to_owned())
+}
+
+fn rustls_client_config() -> rustls::ClientConfig {
     let root_store = ROOT_CERT_STORE
         .get_or_init(|| {
             Arc::new(RootCertStore::from_iter(
@@ -222,14 +315,60 @@ pub(super) fn init_dot_transport(config: &DnsConfig) -> Result<DotTransport> {
             ))
         })
         .clone();
-    let cfg = rustls::ClientConfig::builder()
+    rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_no_client_auth();
-    Ok(DotTransport::new(
-        config.upstream,
-        TlsConnector::from(Arc::new(cfg)),
-        server_name,
-    ))
+        .with_no_client_auth()
+}
+
+fn warp_connector(warp: Arc<WarpClient>, upstream: SocketAddr) -> Connector {
+    Arc::new(move || {
+        let warp = Arc::clone(&warp);
+        Box::pin(async move {
+            let stream = warp.dial(upstream.ip(), upstream.port()).await?;
+            Ok(DnsStream::new(stream.into_io()))
+        })
+    })
+}
+
+fn direct_dot_connector(
+    upstream: SocketAddr,
+    name: ServerName<'static>,
+    tls: TlsConnector,
+) -> Connector {
+    Arc::new(move || {
+        let tls = tls.clone();
+        let name = name.clone();
+        Box::pin(async move {
+            let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream))
+                .await
+                .context("connect timeout")??;
+            tcp.set_nodelay(true)?;
+            let stream = timeout(TLS_TIMEOUT, tls.connect(name, tcp))
+                .await
+                .context("TLS handshake timeout")??;
+            Ok(DnsStream::new(stream))
+        })
+    })
+}
+
+fn warp_dot_connector(
+    warp: Arc<WarpClient>,
+    upstream: SocketAddr,
+    name: ServerName<'static>,
+    tls: TlsConnector,
+) -> Connector {
+    Arc::new(move || {
+        let warp = Arc::clone(&warp);
+        let tls = tls.clone();
+        let name = name.clone();
+        Box::pin(async move {
+            let io = warp.dial(upstream.ip(), upstream.port()).await?.into_io();
+            let stream = timeout(TLS_TIMEOUT, tls.connect(name, io))
+                .await
+                .context("TLS handshake timeout")??;
+            Ok(DnsStream::new(stream))
+        })
+    })
 }
 
 #[cfg(test)]
@@ -277,36 +416,53 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_secs(2));
     }
 
+    /// DNS-over-TCP（`protocol = "udp"` 经 WARP 时的实际形态）：长度前缀分帧。
     #[tokio::test]
-    async fn udp_id_assignment_avoids_collision() {
-        let pending: PendingMap = Default::default();
-        let mut data1 = [0u8; 12];
-        let (tx1, _rx1) = oneshot::channel();
-        let id1 = assign_id_and_register(&pending, &mut data1, tx1).await;
-        assert_eq!(data1[0..2], id1.to_be_bytes());
-        let mut data2 = [0u8; 12];
-        let (tx2, _rx2) = oneshot::channel();
-        let id2 = assign_id_and_register(&pending, &mut data2, tx2).await;
-        assert_ne!(id1, id2);
+    async fn stream_transport_uses_length_prefixed_framing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 2];
+            socket.read_exact(&mut len_buf).await.unwrap();
+            let len = u16::from_be_bytes(len_buf) as usize;
+            let mut msg = vec![0u8; len];
+            socket.read_exact(&mut msg).await.unwrap();
+            // 原样回显，保留同样的 ID
+            socket.write_all(&len_buf).await.unwrap();
+            socket.write_all(&msg).await.unwrap();
+            socket.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let connector: Connector = Arc::new(move || {
+            Box::pin(async move {
+                let tcp = TcpStream::connect(addr).await?;
+                Ok(DnsStream::new(tcp))
+            })
+        });
+        let t = StreamTransport::new(connector);
+
+        let mut query = vec![0u8; 12];
+        let (resp, id) = t.send(&mut query).await.unwrap();
+        assert_eq!(id, u16::from_be_bytes([query[0], query[1]]));
+        assert_eq!(resp, query);
     }
 
     #[tokio::test]
-    async fn dot_transport_connect_failure_reports_error() {
+    async fn stream_transport_reports_connect_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let connector = TlsConnector::from(Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth(),
-        ));
-        let t = DotTransport::new(
-            addr,
-            connector,
-            ServerName::try_from("example.com").unwrap().to_owned(),
-        );
+
+        let connector: Connector = Arc::new(move || {
+            Box::pin(async move {
+                let tcp = TcpStream::connect(addr).await?;
+                Ok(DnsStream::new(tcp))
+            })
+        });
+        let t = StreamTransport::new(connector);
         let mut query = [0u8; 12];
-        let r = t.send(&mut query).await;
-        assert!(r.is_err());
+        assert!(t.send(&mut query).await.is_err());
     }
 }

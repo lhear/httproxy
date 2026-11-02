@@ -71,6 +71,7 @@ pub fn server_config(
         proxy: None,
         log: None,
         dns: None,
+        warp: None,
         traffic_shaping: traffic,
     }
 }

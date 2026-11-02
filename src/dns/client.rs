@@ -29,15 +29,11 @@ use tokio_socks::tcp::Socks5Stream;
 use tracing::{debug, warn};
 
 use super::config::{DnsConfig, Protocol};
-use super::transport::{DotTransport, UdpTransport, init_dot_transport};
+use super::transport::{self, Transport};
+use crate::warp::WarpClient;
 
 type CacheKey = (String, u16, Option<IpAddr>);
 type SharedDnsResult = Result<(Vec<IpAddr>, Duration), Arc<anyhow::Error>>;
-
-enum Transport {
-    Udp(UdpTransport),
-    Dot(DotTransport),
-}
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -56,12 +52,14 @@ pub struct DnsClient {
 }
 
 impl DnsClient {
+    /// 直连传输（不经过 WARP）。
     pub async fn new(config: &DnsConfig) -> Result<Self> {
-        let transport = match config.options.protocol {
-            Protocol::Udp => Transport::Udp(UdpTransport::new(config.upstream)),
-            Protocol::Dot => Transport::Dot(init_dot_transport(config)?),
-        };
-        Ok(Self {
+        let transport = transport::build_transport(config, None)?;
+        Ok(Self::with_transport(config, transport))
+    }
+
+    fn with_transport(config: &DnsConfig, transport: Transport) -> Self {
+        Self {
             config: config.clone(),
             cache: Cache::builder()
                 .max_capacity(config.options.cache_size)
@@ -72,7 +70,7 @@ impl DnsClient {
             single_flight: SingleFlight::new(),
             semaphore: Arc::new(Semaphore::new(config.options.max_concurrent_queries)),
             transport,
-        })
+        }
     }
 
     pub async fn lookup(
@@ -159,10 +157,7 @@ impl DnsClient {
 
         let mut query = self.build_query(domain, rtype, ecs, 0)?;
 
-        let (resp, id) = match &self.transport {
-            Transport::Udp(udp) => udp.send(&mut query).await?,
-            Transport::Dot(dot) => dot.send(&mut query).await?,
-        };
+        let (resp, id) = self.transport.send(&mut query).await?;
 
         self.parse_response(&resp, id, rtype, domain)
     }
@@ -271,18 +266,17 @@ impl DnsClient {
         Ok((ips, ttl))
     }
 
-    pub async fn connect(
+    /// 解析域名（A + AAAA），返回洗牌后交替排列的地址。
+    ///
+    /// IP 字面量直接返回，不查上游 —— 上游查询本身可能经 WARP 走，没必要绕一圈。
+    pub async fn resolve(
         self: &Arc<Self>,
         host: &str,
-        port: u16,
         ecs: Option<IpAddr>,
-        socks5_proxy: Option<String>,
-    ) -> Result<TcpStream> {
+    ) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = IpAddr::from_str(host) {
-            debug!("host is an IP address: {}, connecting directly", ip);
-            return self
-                .happy_eyeballs_connect(vec![ip], port, socks5_proxy)
-                .await;
+            debug!("host is an IP address: {}, no lookup needed", ip);
+            return Ok(vec![ip]);
         }
 
         let (res_a, res_aaaa) = tokio::join!(
@@ -310,7 +304,17 @@ impl DnsClient {
             v4.shuffle(&mut rng);
             v6.shuffle(&mut rng);
         }
-        let sorted = self.interleave_ips(v4, v6);
+        Ok(self.interleave_ips(v4, v6))
+    }
+
+    pub async fn connect(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+        ecs: Option<IpAddr>,
+        socks5_proxy: Option<String>,
+    ) -> Result<TcpStream> {
+        let sorted = self.resolve(host, ecs).await?;
         debug!(
             "Happy Eyeballs connecting to {} with IPs: {:?}",
             host, sorted
@@ -422,7 +426,10 @@ impl DnsClient {
     }
 }
 
-pub async fn init_dns(config: &mut DnsConfig) -> Result<Arc<DnsClient>> {
+pub async fn init_dns(
+    config: &mut DnsConfig,
+    warp: Option<&Arc<WarpClient>>,
+) -> Result<Arc<DnsClient>> {
     if config.options.protocol == Protocol::Dot && config.tls_domain.is_none() {
         config.tls_domain = Some(config.upstream.ip().to_string());
     }
@@ -433,7 +440,8 @@ pub async fn init_dns(config: &mut DnsConfig) -> Result<Arc<DnsClient>> {
             config.options.max_ttl
         ));
     }
-    Ok(Arc::new(DnsClient::new(config).await?))
+    let transport = transport::build_transport(config, warp)?;
+    Ok(Arc::new(DnsClient::with_transport(config, transport)))
 }
 
 #[cfg(test)]
@@ -656,7 +664,7 @@ mod tests {
                 ..DnsOptions::default()
             },
         };
-        assert!(init_dns(&mut cfg).await.is_err());
+        assert!(init_dns(&mut cfg, None).await.is_err());
     }
 
     #[tokio::test]

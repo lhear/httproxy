@@ -4,6 +4,7 @@ use crate::log::LogConfig;
 
 pub use crate::bypass::BypassConfig;
 pub use crate::shaper::TrafficConfig;
+pub use crate::warp::WarpSection;
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +14,7 @@ pub struct ServerTopConfig {
     pub proxy: Option<ProxySection>,
     pub log: Option<LogConfig>,
     pub dns: Option<crate::dns::DnsConfig>,
+    pub warp: Option<WarpSection>,
     pub traffic_shaping: TrafficConfig,
 }
 
@@ -114,6 +116,55 @@ padding_threshold = 50
         assert_eq!(cfg.server.listen, "127.0.0.1:3000");
         assert_eq!(cfg.server.path, "/secret");
         assert!(cfg.proxy.is_none());
+    }
+
+    #[test]
+    fn parse_server_warp_section() {
+        let toml_str = r#"
+[server]
+listen = "127.0.0.1:3000"
+path = "/secret"
+
+[auth]
+secret = "key"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+
+[warp]
+enabled = true
+endpoint = "162.159.192.1"
+bypass_suffixes = ["corp.local"]
+"#;
+        let cfg: ServerTopConfig = toml::from_str(toml_str).unwrap();
+        let warp = cfg.warp.as_ref().unwrap();
+        assert!(warp.enabled);
+        // 未写的键走默认值
+        assert!(warp.bypass_private);
+        assert_eq!(warp.port, None);
+        assert_eq!(warp.endpoint.as_deref(), Some("162.159.192.1"));
+        assert_eq!(warp.bypass_suffixes, vec!["corp.local".to_string()]);
+    }
+
+    #[test]
+    fn server_warp_section_rejects_unknown_keys() {
+        let toml_str = r#"
+[server]
+listen = "127.0.0.1:3000"
+path = "/secret"
+
+[auth]
+secret = "key"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+
+[warp]
+enable = true
+"#;
+        assert!(toml::from_str::<ServerTopConfig>(toml_str).is_err());
     }
 
     #[test]

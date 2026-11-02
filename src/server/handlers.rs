@@ -122,6 +122,7 @@ async fn setup_tunnel_response(
     let upstream = tokio::time::timeout(
         CONNECT_TIMEOUT,
         connect_upstream(
+            state.warp.as_ref(),
             state.dns_client.as_ref(),
             state.client_subnet,
             state.socks5_proxy.as_ref(),
@@ -738,6 +739,7 @@ mod tests {
             proxy: None,
             log: None,
             dns: None,
+            warp: None,
             traffic_shaping: crate::shaper::TrafficConfig {
                 global: crate::shaper::PaddingConfig {
                     padding_threshold: 0,
