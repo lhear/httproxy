@@ -40,19 +40,28 @@ http-body-util = "0.1.4"
 httparse = "1.10"
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
-jsonwebtoken = {version = "11.0.0", features = ["aws_lc_rs"]}
+jsonwebtoken = {version = "11.1.0", features = ["aws_lc_rs"]}
 memchr = "2.8.3"
 ml-kem = {version = "0.3.2", features = ["zeroize"]}
 moka = {version = "0.12", features = ["future"]}
+p256 = {version = "0.14.0", features = ["ecdsa", "pkcs8"]}
 pin-project-lite = "0.2"
+quinn = {version = "0.11.12", default-features = false, features = [
+  "runtime-tokio",
+  "rustls-aws-lc-rs",
+]}
 rand = "0.10.2"
 rand_distr = "0.6"
-rustls = "0.23.43"
+rcgen = {version = "0.14.10", default-features = false, features = [
+  "crypto",
+  "aws_lc_rs",
+]}
+rustls = "0.23.46"
 serde = {version = "1.0.229", features = ["derive"]}
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 singleflight-async = "0.2"
-tokio = {version = "1.53.1", features = ["rt-multi-thread", "test-util"]}
+tokio = {version = "1.54.1", features = ["rt-multi-thread", "test-util"]}
 tokio-rustls = "0.26"
 tokio-socks = "0.5.3"
 tokio-stream = {version = "0.1.19", features = ["net"]}
@@ -67,7 +76,7 @@ tracing-subscriber = {version = "0.3", features = [
   "json",
 ]}
 url = "2.5"
-uuid = "1.24.0"
+uuid = "1.29.0"
 webpki-roots = "1.0.9"
 wreq = "0.16"
 wreq-util = "0.2"
@@ -76,9 +85,19 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 axum = {version = "0.8.9", features = ["http2", "macros"]}
-jsonwebtoken = {version = "11.0.0", features = ["aws_lc_rs"]}
+jsonwebtoken = {version = "11.1.0", features = ["aws_lc_rs"]}
+# 集成测试自己会起一个回环 MASQUE 网关，需要直接用到这几个 crate
+quinn = {version = "0.11.12", default-features = false, features = [
+  "runtime-tokio",
+  "rustls-aws-lc-rs",
+]}
+rcgen = {version = "0.14.10", default-features = false, features = [
+  "crypto",
+  "aws_lc_rs",
+]}
+rustls = "0.23.46"
 serde_json = "1.0.150"
-tokio = {version = "1.52.3", features = ["full"]}
+tokio = {version = "1.54.1", features = ["full"]}
 tracing-subscriber = {version = "0.3", features = ["env-filter"]}
 wreq = "0.16"
 wreq-util = "0.2"
