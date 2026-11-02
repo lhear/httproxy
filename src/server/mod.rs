@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod janitor;
 pub mod stream;
 pub mod stream_registry;
+pub mod upstream;
 pub mod utils;
 
 use crate::config::ServerTopConfig;

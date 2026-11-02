@@ -5,7 +5,6 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard};
 use std::task::{Context, Poll};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{Instrument, info, warn};
@@ -18,6 +17,7 @@ use crate::server::constants::{
     UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream_registry::StreamRegistry;
+use crate::server::upstream::{UpstreamRead, UpstreamWrite};
 use crate::shaper::{FrameCipher, ResolvedShaperConfig, TrafficShaper};
 
 /// 隧道控制面命令。
@@ -40,7 +40,7 @@ enum Phase {
     Closed,
 }
 
-type ShaperStream = Pin<Box<TrafficShaper<OwnedReadHalf>>>;
+type ShaperStream = Pin<Box<TrafficShaper<UpstreamRead>>>;
 /// shaper 的交接槽：同一时刻只有一个下载段持有 shaper。
 type ShaperSlot = Arc<StdMutex<Option<ShaperStream>>>;
 
@@ -166,7 +166,7 @@ pub struct TunnelActor {
     stream_registry: Arc<StreamRegistry>,
     shutdown_signal: Arc<Notify>,
     max_download_bytes: Option<u64>,
-    pending_write_half: Option<OwnedWriteHalf>,
+    pending_write_half: Option<UpstreamWrite>,
     pending_initial_seq: u64,
     last_activity: Arc<AtomicU64>,
 }
@@ -214,10 +214,10 @@ impl TunnelActor {
         self.upload_handle = Some(upload_handle);
     }
 
-    pub fn on_upstream_connected(
+    pub(crate) fn on_upstream_connected(
         &mut self,
-        read_half: OwnedReadHalf,
-        write_half: Option<OwnedWriteHalf>,
+        read_half: UpstreamRead,
+        write_half: Option<UpstreamWrite>,
         config: &ResolvedShaperConfig,
         download_cipher: Option<Arc<dyn FrameCipher>>,
         initial_seq: u64,
@@ -425,6 +425,7 @@ mod tests {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
     async fn tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf, OwnedWriteHalf) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -483,7 +484,7 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, 1000);
-        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -516,7 +517,7 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, 1000);
-        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -553,7 +554,7 @@ mod tests {
             None,
             Arc::new(AtomicU64::new(crate::now_secs())),
         );
-        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
         let handle = tokio::spawn(async move { actor.run().await });
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -572,7 +573,7 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, 1000);
-        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -608,7 +609,7 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, u64::MAX);
-        actor.on_upstream_connected(read_half, Some(client_write), &resolved_config(), None, 0);
+        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
         let segment = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -633,6 +634,7 @@ mod timeout_tests {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
     async fn tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf, OwnedWriteHalf) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -666,8 +668,8 @@ mod timeout_tests {
             Arc::new(AtomicU64::new(crate::now_secs())),
         );
         actor.on_upstream_connected(
-            read_half,
-            Some(client_write),
+            read_half.into(),
+            Some(client_write.into()),
             &Arc::new(ResolvedShaperConfig::resolve(&cfg)),
             None,
             0,

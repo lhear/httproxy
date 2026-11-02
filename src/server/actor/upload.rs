@@ -1,8 +1,5 @@
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use std::io::IoSlice;
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 use tracing::warn;
@@ -12,6 +9,7 @@ use crate::server::constants::{
     MAX_EOS_WAITERS, MAX_PENDING_BYTES, MAX_PENDING_FRAMES, MAX_REORDER_SECS, MAX_WRITE_IOV,
     WRITE_TIMEOUT,
 };
+use crate::server::upstream::UpstreamWrite;
 
 pub enum UploadCmd {
     Frame {
@@ -41,14 +39,14 @@ enum UploadPhase {
 pub struct UploadActor {
     rx: mpsc::Receiver<UploadCmd>,
     phase: UploadPhase,
-    upstream: Option<OwnedWriteHalf>,
+    upstream: Option<UpstreamWrite>,
     last_activity: Instant,
     /// 复用的一次性写批次，避免每次补齐空档都分配
     run_buf: Vec<Bytes>,
 }
 
 impl UploadActor {
-    pub fn new(rx: mpsc::Receiver<UploadCmd>, upstream: OwnedWriteHalf, initial_seq: u64) -> Self {
+    pub(crate) fn new(rx: mpsc::Receiver<UploadCmd>, upstream: UpstreamWrite, initial_seq: u64) -> Self {
         Self {
             rx,
             phase: UploadPhase::Reordering {
@@ -246,55 +244,14 @@ impl UploadActor {
 }
 
 /// 把一段连续帧写进上游。返回 `false` 表示写失败/超时，调用方需要收尾。
-async fn write_run(upstream: &mut Option<OwnedWriteHalf>, frames: &[Bytes]) -> bool {
+async fn write_run(upstream: &mut Option<UpstreamWrite>, frames: &[Bytes]) -> bool {
     let Some(upstream) = upstream.as_mut() else {
         return false;
     };
-    let written = if frames.len() == 1 {
-        // 单帧是常态，走普通 write，省掉 iov 装配
-        tokio::time::timeout(WRITE_TIMEOUT, upstream.write_all(&frames[0])).await
-    } else {
-        tokio::time::timeout(WRITE_TIMEOUT, write_vectored_all(upstream, frames)).await
-    };
-    matches!(written, Ok(Ok(())))
-}
-
-/// 一段连续帧一次系统调用写出去；部分写时按帧/帧内偏移推进。
-async fn write_vectored_all(
-    upstream: &mut OwnedWriteHalf,
-    frames: &[Bytes],
-) -> std::io::Result<()> {
-    let mut first = 0usize;
-    let mut skip = 0usize;
-    while first < frames.len() {
-        let written = {
-            let mut slices: [IoSlice<'_>; MAX_WRITE_IOV] =
-                std::array::from_fn(|_| IoSlice::new(&[]));
-            let mut count = 0;
-            for (i, frame) in frames[first..].iter().enumerate().take(MAX_WRITE_IOV) {
-                let slice: &[u8] = if i == 0 { &frame[skip..] } else { &frame[..] };
-                slices[count] = IoSlice::new(slice);
-                count += 1;
-            }
-            upstream.write_vectored(&slices[..count]).await?
-        };
-        if written == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        let mut left = written;
-        while left > 0 && first < frames.len() {
-            let remain = frames[first].len() - skip;
-            if left >= remain {
-                left -= remain;
-                first += 1;
-                skip = 0;
-            } else {
-                skip += left;
-                left = 0;
-            }
-        }
-    }
-    Ok(())
+    matches!(
+        tokio::time::timeout(WRITE_TIMEOUT, upstream.write_frames(frames)).await,
+        Ok(Ok(()))
+    )
 }
 
 #[cfg(test)]
@@ -304,7 +261,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::net::tcp::OwnedReadHalf;
 
-    async fn tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf) {
+    async fn tcp_pair() -> (OwnedReadHalf, UpstreamWrite) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
@@ -312,7 +269,7 @@ mod tests {
         let server_stream = server.await.unwrap();
         let (client_read, _client_write) = client.into_split();
         let (_server_read, server_write) = server_stream.into_split();
-        (client_read, server_write)
+        (client_read, server_write.into())
     }
 
     #[tokio::test]
@@ -464,7 +421,7 @@ mod tests {
 
         let (_cr, write_half) = client.into_split();
         let (tx, rx) = mpsc::channel::<UploadCmd>(16);
-        let actor = UploadActor::new(rx, write_half, 0);
+        let actor = UploadActor::new(rx, write_half.into(), 0);
         let handle = tokio::spawn(async move { actor.run().await });
 
         let (ack_tx, ack_rx) = oneshot::channel();
