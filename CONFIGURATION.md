@@ -213,6 +213,17 @@ secret = "my_secret_key"
 # happy_eyeballs_delay_ms = 250
 # max_concurrent_queries = 1024
 
+# Optional WARP egress: send non-private traffic through Cloudflare WARP (MASQUE)
+# [warp]
+# enabled = true
+# config_path = "./warp.json"
+# port = 443
+# keepalive_secs = 25
+# idle_timeout_secs = 60
+# bypass_private = true
+# bypass_cidrs = ["203.0.113.0/24"]
+# bypass_suffixes = ["corp.local"]
+
 # [log]
 # file_path = "server.log"
 # level = "info"
@@ -252,9 +263,87 @@ padding_threshold = 2000
 
 | Field    | Type   | Required | Description |
 | -------- | ------ | -------- | ----------- |
-| `socks5` | string | no       | Optional upstream SOCKS5 proxy; all tunneled connections are routed through it. |
+| `socks5` | string | no       | Optional upstream SOCKS5 proxy for direct connections. Ignored for targets routed through `[warp]`. |
 
-### 3.4 `[traffic_shaping]`
+### 3.4 `[warp]` — Optional Cloudflare WARP Egress
+
+When enabled, every non-private outbound TCP connection made by the server is
+first carried to Cloudflare WARP and dialled from there; private targets
+(`10/8`, `172.16/12`, `192.168/16`, `127/8`, `169.254/16`, `100.64/10`, plus
+IPv6 `::1`, `fc00::/7` and `fe80::/10`) still go out directly. The tunnel
+itself is unaffected: clients keep talking only to your server.
+
+```toml
+[warp]
+enabled = true
+# config_path = "./warp.json"          # credentials; registered when missing
+# endpoint = "162.159.192.1"           # override the WARP endpoint (IPv4)
+# endpoint_v6 = "2606:4700:d0::1"      # override the WARP endpoint (IPv6)
+# port = 443
+# sni = "consumer-masque-proxy.cloudflareclient.com"
+# connect_timeout_secs = 10
+# keepalive_secs = 25
+# idle_timeout_secs = 60
+# register_model = "PC"
+# register_locale = "en_US"
+# insecure_skip_verify = false
+# bypass_private = true
+# bypass_cidrs = ["203.0.113.0/24"]
+# bypass_suffixes = ["corp.local", "internal"]
+```
+
+| Field | Type | Required | Default | Description |
+| ----- | ---- | -------- | ------- | ----------- |
+| `enabled` | bool | no | `true` | `false` behaves exactly like omitting the section. |
+| `config_path` | string | no | `./warp.json` | Device credentials. Registered with Cloudflare and written back (mode `0600`) when missing or unreadable. |
+| `endpoint` / `endpoint_v6` | string | no | registration response | Override the WARP endpoint IP. When unset, the address from the registration response is used. |
+| `port` | integer | no | `443` | WARP endpoint UDP port. |
+| `sni` | string | no | `consumer-masque-proxy.cloudflareclient.com` | TLS SNI, i.e. the L4 CONNECT gateway name. |
+| `connect_timeout_secs` | integer | no | `10` | QUIC handshake timeout. |
+| `keepalive_secs` | integer | no | `25` | QUIC keepalive interval; keeps the NAT mapping alive. |
+| `idle_timeout_secs` | integer | no | `60` | QUIC idle timeout. |
+| `register_model` / `register_locale` | string | no | `PC` / `en_US` | Device model and locale reported during auto-registration. |
+| `insecure_skip_verify` | bool | no | `false` | Disables endpoint public-key pinning. Troubleshooting only. |
+| `bypass_private` | bool | no | `true` | Connect directly to private, loopback and link-local targets. |
+| `bypass_cidrs` | string[] | no | `[]` | Additional CIDR blocks to connect to directly. |
+| `bypass_suffixes` | string[] | no | `[]` | Additional domain suffixes to connect to directly, matched per label (`corp.local` matches `db.corp.local`, not `evilcorp.local`). Name resolution still goes through `[dns]`, so pair it with an upstream that can see the internal zone. |
+
+**How it works**
+
+- Registration mirrors the official client: a throwaway curve25519 key creates
+  the account via `POST /reg`, then `PATCH /reg/{id}` switches the device to
+  MASQUE and enrols the secp256r1 device key. Later starts reuse `warp.json` and
+  never re-register.
+- Each outbound TCP connection maps to one **HTTP/3 `CONNECT` stream** (a QUIC
+  bidi stream), and all of them share a single QUIC connection, which is
+  re-established on demand when the peer closes it. `CONNECT-IP` — a full packet
+  tunnel plus a userspace TCP/IP stack — buys nothing for a TCP-only proxy, so
+  this takes the lighter L4 path that usque's `l4` modes also use.
+- Names are never handed to WARP: every hostname is resolved by the DNS module
+  first, and the CONNECT `:authority` is always an IP literal. When `[dns]` is
+  absent, `1.1.1.1:53` is used. `[proxy] socks5` is bypassed for tunneled
+  targets (WARP replaces it) and still applies to direct ones.
+- The DNS queries themselves also go through WARP when the configured upstream
+  is a public address. `CONNECT` carries TCP only, so `protocol = "udp"` becomes
+  DNS-over-TCP on the configured port (53 by default) and `protocol = "dot"`
+  becomes TLS inside the tunnel. An upstream on a private or loopback address
+  keeps the original direct UDP/DoT transport, because WARP cannot reach it —
+  point `[dns]` at such a resolver when you need internal names resolved.
+- `bypass_suffixes` still forces a direct connection for matching domains, and
+  any resolved address inside a private range is dialled directly as well.
+- Concurrent tunnels are bounded by the peer's QUIC stream quota (three digits
+  on Cloudflare's side); beyond it `open_bi()` queues instead of failing.
+- The endpoint certificate is not issued by a public CA, so the chain is not
+  validated. Instead the leaf certificate's `SubjectPublicKeyInfo` is compared
+  byte for byte against `config.peers[0].public_key` from the registration
+  response. `insecure_skip_verify = true` skips that step and keeps only the
+  TLS 1.3 handshake signature check.
+- If registration fails at startup — for example the host cannot reach
+  `api.cloudflareclient.com` at all — the server exits with an error instead of
+  silently falling back to direct connections. Otherwise "all outbound traffic
+  goes through WARP" would be an empty promise.
+
+### 3.5 `[traffic_shaping]`
 
 See [§5 Traffic Shaping](#5-traffic-shaping). Both sides must agree on
 `encoding_type` and `max_download_bytes`.
@@ -392,6 +481,14 @@ The `[bypass]` section itself is optional and defaults to empty.
 
 Optional server-side DNS resolver (`[dns]`). When omitted, the system
 resolver is used.
+
+> With `[warp]` enabled, names are resolved by this DNS module instead of by
+> Cloudflare — every CONNECT carries an IP literal. The DNS transport itself
+> follows the upstream address: a public resolver is reached through WARP
+> (DNS-over-TCP on port 53, or DoT on port 853), while a private or loopback
+> resolver is queried directly. If `[dns]` is omitted, `1.1.1.1:53` over WARP is
+> used, so internal names need an explicit `[dns]` section pointing at a
+> resolver that can see them.
 
 | Field                     | Type    | Required | Default    | Description |
 | ------------------------- | ------- | -------- | ---------- | ----------- |
