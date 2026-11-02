@@ -134,15 +134,15 @@ impl WarpClient {
         let port = section.port.unwrap_or(DEFAULT_PORT);
 
         let keepalive = Duration::from_secs(section.keepalive_secs.unwrap_or(KEEPALIVE.as_secs()));
-        let idle_timeout = Duration::from_secs(
-            section
-                .idle_timeout_secs
-                .unwrap_or(IDLE_TIMEOUT.as_secs()),
-        );
+        let idle_timeout =
+            Duration::from_secs(section.idle_timeout_secs.unwrap_or(IDLE_TIMEOUT.as_secs()));
 
         let masque = MasqueConfig {
             endpoint: SocketAddr::new(addr, port),
-            sni: section.sni.clone().unwrap_or_else(|| DEFAULT_SNI.to_string()),
+            sni: section
+                .sni
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SNI.to_string()),
             connect_timeout: Duration::from_secs(
                 section
                     .connect_timeout_secs

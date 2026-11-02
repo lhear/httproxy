@@ -269,11 +269,7 @@ impl DnsClient {
     /// 解析域名（A + AAAA），返回洗牌后交替排列的地址。
     ///
     /// IP 字面量直接返回，不查上游 —— 上游查询本身可能经 WARP 走，没必要绕一圈。
-    pub async fn resolve(
-        self: &Arc<Self>,
-        host: &str,
-        ecs: Option<IpAddr>,
-    ) -> Result<Vec<IpAddr>> {
+    pub async fn resolve(self: &Arc<Self>, host: &str, ecs: Option<IpAddr>) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = IpAddr::from_str(host) {
             debug!("host is an IP address: {}, no lookup needed", ip);
             return Ok(vec![ip]);

@@ -484,7 +484,13 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, 1000);
-        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
+        actor.on_upstream_connected(
+            read_half.into(),
+            Some(client_write.into()),
+            &resolved_config(),
+            None,
+            0,
+        );
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -517,7 +523,13 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, 1000);
-        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
+        actor.on_upstream_connected(
+            read_half.into(),
+            Some(client_write.into()),
+            &resolved_config(),
+            None,
+            0,
+        );
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -554,7 +566,13 @@ mod tests {
             None,
             Arc::new(AtomicU64::new(crate::now_secs())),
         );
-        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
+        actor.on_upstream_connected(
+            read_half.into(),
+            Some(client_write.into()),
+            &resolved_config(),
+            None,
+            0,
+        );
         let handle = tokio::spawn(async move { actor.run().await });
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -573,7 +591,13 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, 1000);
-        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
+        actor.on_upstream_connected(
+            read_half.into(),
+            Some(client_write.into()),
+            &resolved_config(),
+            None,
+            0,
+        );
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -609,7 +633,13 @@ mod tests {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
         let mut actor = new_rotating_actor(cmd_rx, u64::MAX);
-        actor.on_upstream_connected(read_half.into(), Some(client_write.into()), &resolved_config(), None, 0);
+        actor.on_upstream_connected(
+            read_half.into(),
+            Some(client_write.into()),
+            &resolved_config(),
+            None,
+            0,
+        );
         let segment = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 

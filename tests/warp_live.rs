@@ -53,7 +53,11 @@ async fn real_warp_serves_a_page() {
     });
 
     let server = spawn_server(cfg).await;
-    let client = spawn_client(client_config(traffic(true, None), None, None, vec![]), server).await;
+    let client = spawn_client(
+        client_config(traffic(true, None), None, None, vec![]),
+        server,
+    )
+    .await;
 
     let exchange = async {
         let mut stream = TcpStream::connect(client).await.unwrap();

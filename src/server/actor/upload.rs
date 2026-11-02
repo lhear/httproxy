@@ -46,7 +46,11 @@ pub struct UploadActor {
 }
 
 impl UploadActor {
-    pub(crate) fn new(rx: mpsc::Receiver<UploadCmd>, upstream: UpstreamWrite, initial_seq: u64) -> Self {
+    pub(crate) fn new(
+        rx: mpsc::Receiver<UploadCmd>,
+        upstream: UpstreamWrite,
+        initial_seq: u64,
+    ) -> Self {
         Self {
             rx,
             phase: UploadPhase::Reordering {

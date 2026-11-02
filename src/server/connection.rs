@@ -38,7 +38,9 @@ pub(crate) async fn connect_upstream(
     let mut last_error = None;
     for ip in addresses.into_iter().take(MAX_ADDRESS_ATTEMPTS) {
         let attempt = if force_direct || warp.is_direct_ip(ip) {
-            connect_ip(socks5_proxy, ip, port).await.map(Upstream::Direct)
+            connect_ip(socks5_proxy, ip, port)
+                .await
+                .map(Upstream::Direct)
         } else {
             warp.dial(ip, port).await.map(Upstream::Warp)
         };

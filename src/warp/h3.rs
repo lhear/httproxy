@@ -280,7 +280,9 @@ pub(crate) fn decode_status(block: &[u8]) -> Result<u16, &'static str> {
             let name_end = name_start
                 .checked_add(name_len as usize)
                 .ok_or("literal field name overflow")?;
-            let name = block.get(name_start..name_end).ok_or("truncated literal field name")?;
+            let name = block
+                .get(name_start..name_end)
+                .ok_or("truncated literal field name")?;
             let (value, used, value_huffman) =
                 get_string(&block[name_end..]).ok_or("truncated literal field value")?;
             offset = name_end + used;
@@ -358,7 +360,11 @@ mod tests {
     #[test]
     fn decode_status_from_static_index() {
         for (index, expected) in STATIC_STATUS_VALUES.iter().enumerate() {
-            let block = [0u8, 0u8, INDEXED_STATIC | (STATIC_STATUS_FIRST as u8 + index as u8)];
+            let block = [
+                0u8,
+                0u8,
+                INDEXED_STATIC | (STATIC_STATUS_FIRST as u8 + index as u8),
+            ];
             assert_eq!(decode_status(&block).unwrap(), *expected);
         }
     }

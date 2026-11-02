@@ -108,7 +108,8 @@ async fn write_vectored_all(write: &mut OwnedWriteHalf, frames: &[Bytes]) -> io:
     let mut skip = 0usize;
     while first < frames.len() {
         let written = {
-            let mut slices: [IoSlice<'_>; MAX_WRITE_IOV] = std::array::from_fn(|_| IoSlice::new(&[]));
+            let mut slices: [IoSlice<'_>; MAX_WRITE_IOV] =
+                std::array::from_fn(|_| IoSlice::new(&[]));
             let mut count = 0;
             for (i, frame) in frames[first..].iter().enumerate().take(MAX_WRITE_IOV) {
                 let slice: &[u8] = if i == 0 { &frame[skip..] } else { &frame[..] };
@@ -164,7 +165,10 @@ mod tests {
         let mut got = vec![0u8; frames.len() * 32];
         server.read_exact(&mut got).await.unwrap();
         for (i, chunk) in got.chunks(32).enumerate() {
-            assert!(chunk.iter().all(|&b| b == i as u8), "frame {i} out of order");
+            assert!(
+                chunk.iter().all(|&b| b == i as u8),
+                "frame {i} out of order"
+            );
         }
     }
 

@@ -132,7 +132,9 @@ async fn serve_stream(
 
     let Ok(upstream) = TcpStream::connect(target).await else {
         // 上游不可达：回一个错误状态让调用方看到失败
-        let _ = send.write_all(&frame(FRAME_HEADERS, &[0, 0, 0xC0 | 30])).await;
+        let _ = send
+            .write_all(&frame(FRAME_HEADERS, &[0, 0, 0xC0 | 30]))
+            .await;
         return;
     };
     if send
@@ -191,9 +193,11 @@ async fn spawn_masque_proxy() -> (SocketAddr, Arc<AtomicUsize>) {
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
-    let endpoint =
-        quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(crypto)), "127.0.0.1:0".parse().unwrap())
-            .unwrap();
+    let endpoint = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
     let addr = endpoint.local_addr().unwrap();
 
     let connects = Arc::new(AtomicUsize::new(0));
@@ -278,7 +282,11 @@ async fn start_with_warp_and_dns(
     });
 
     let server = spawn_server(cfg).await;
-    let client = spawn_client(client_config(traffic(true, None), None, None, vec![]), server).await;
+    let client = spawn_client(
+        client_config(traffic(true, None), None, None, vec![]),
+        server,
+    )
+    .await;
 
     (upstream, client, connects)
 }

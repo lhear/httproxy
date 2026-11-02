@@ -101,7 +101,9 @@ pub(crate) async fn load_or_register(
                         info!(path = %path.display(), id = %creds.id, "warp: loaded credentials");
                         return Ok(creds);
                     }
-                    Err(e) => warn!(path = %path.display(), error = %e, "warp: unusable credentials"),
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "warp: unusable credentials")
+                    }
                 }
             }
             Err(e) => warn!(path = %path.display(), error = %e, "warp: malformed credentials"),
@@ -248,7 +250,9 @@ fn strip_port(addr: &str) -> String {
     }
     match addr.rsplit_once(':') {
         Some((host, port))
-            if !host.contains(':') && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+            if !host.contains(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
         {
             host.to_string()
         }
@@ -469,7 +473,11 @@ mod tests {
         };
         let restored = creds.signing_key().unwrap();
         assert_eq!(
-            restored.verifying_key().to_public_key_der().unwrap().as_bytes(),
+            restored
+                .verifying_key()
+                .to_public_key_der()
+                .unwrap()
+                .as_bytes(),
             spki.as_slice()
         );
         assert_eq!(creds.endpoint_spki().unwrap(), spki);

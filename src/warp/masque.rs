@@ -107,9 +107,13 @@ impl MasqueConn {
         // 我们通告了动态表容量 0，这两个流永远不会承载数据，但 RFC 9204 要求
         // 端点必须创建它们，留着占位最省事。
         let mut qpack_encoder = conn.open_uni().await.context("warp: open QPACK encoder")?;
-        qpack_encoder.write_all(&[h3::STREAM_QPACK_ENCODER as u8]).await?;
+        qpack_encoder
+            .write_all(&[h3::STREAM_QPACK_ENCODER as u8])
+            .await?;
         let mut qpack_decoder = conn.open_uni().await.context("warp: open QPACK decoder")?;
-        qpack_decoder.write_all(&[h3::STREAM_QPACK_DECODER as u8]).await?;
+        qpack_decoder
+            .write_all(&[h3::STREAM_QPACK_DECODER as u8])
+            .await?;
 
         debug!(endpoint = %cfg.endpoint, "warp: MASQUE connection established");
 
@@ -132,7 +136,11 @@ impl MasqueConn {
 
     /// 在共享的 QUIC 连接上开一条 CONNECT 流。
     pub(crate) async fn open(&self, authority: &str) -> Result<MasqueStream> {
-        let (mut send, mut recv) = self.conn.open_bi().await.context("warp: open request stream")?;
+        let (mut send, mut recv) = self
+            .conn
+            .open_bi()
+            .await
+            .context("warp: open request stream")?;
 
         let block = h3::encode_connect_headers(authority);
         let mut frame = BytesMut::with_capacity(block.len() + 12);
@@ -231,10 +239,16 @@ async fn read_response_head(recv: &mut RecvStream, authority: &str) -> Result<(u
         }
 
         if buf.len() > MAX_RESPONSE_HEAD_BUFFER {
-            bail!("warp: CONNECT response for {authority} exceeded {MAX_RESPONSE_HEAD_BUFFER} bytes");
+            bail!(
+                "warp: CONNECT response for {authority} exceeded {MAX_RESPONSE_HEAD_BUFFER} bytes"
+            );
         }
 
-        match recv.read_chunk(4096, true).await.context("warp: read response")? {
+        match recv
+            .read_chunk(4096, true)
+            .await
+            .context("warp: read response")?
+        {
             Some(chunk) => buf.extend_from_slice(&chunk.bytes),
             None => bail!("warp: connection closed before CONNECT response for {authority}"),
         }
@@ -316,9 +330,9 @@ impl MasqueSend {
     /// 半关闭：发出 FIN，告诉对端请求体结束。
     pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
         self.finished = true;
-        self.stream.finish().map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "warp: CONNECT stream closed")
-        })
+        self.stream
+            .finish()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "warp: CONNECT stream closed"))
     }
 }
 
@@ -346,7 +360,11 @@ impl AsyncWrite for MasqueSend {
         while this.write.header_sent < this.write.header_len {
             let start = this.write.header_sent as usize;
             let end = this.write.header_len as usize;
-            match AsyncWrite::poll_write(Pin::new(&mut this.stream), cx, &this.write.header[start..end]) {
+            match AsyncWrite::poll_write(
+                Pin::new(&mut this.stream),
+                cx,
+                &this.write.header[start..end],
+            ) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(0)) => {
@@ -833,8 +851,8 @@ mod tests {
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
 
-        let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
-            .unwrap();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = endpoint.local_addr().unwrap();
 
         let driver = endpoint.clone();
