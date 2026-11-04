@@ -1,6 +1,5 @@
 [package]
 edition = "2024"
-# wreq 0.16 要求 1.98+，写在这里能让旧工具链直接报出可读的错误
 rust-version = "1.98"
 license = "MPL-2.0"
 name = "httproxy"
@@ -24,8 +23,8 @@ strip = true
 aes-gcm = "0.11.0"
 anyhow = "1.0.104"
 axum = {version = "0.8.9", features = ["http2", "macros"]}
-base122-fast = "0.1.4"
-base64 = "0.23.0"
+base122-fast = "0.1.5"
+base64 = "0.23.1"
 bytes = "1.12.1"
 clap = {version = "4.6.5", features = ["derive"]}
 crypto-common = "0.2.2"
@@ -86,7 +85,6 @@ zeroize = "1.9.0"
 [dev-dependencies]
 axum = {version = "0.8.9", features = ["http2", "macros"]}
 jsonwebtoken = {version = "11.1.0", features = ["aws_lc_rs"]}
-# 集成测试自己会起一个回环 MASQUE 网关，需要直接用到这几个 crate
 quinn = {version = "0.11.12", default-features = false, features = [
   "runtime-tokio",
   "rustls-aws-lc-rs",

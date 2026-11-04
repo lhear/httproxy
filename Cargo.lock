@@ -284,9 +284,9 @@ dependencies = [
 
 [[package]]
 name = "base122-fast"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e00b499c3ae0a45a400cfe5a91cccd56b24d9ed0d0831e0030f41dec44fa228"
+checksum = "c5df953472f1686a570e851b183c46a815c2a865975d7e5790c32ac8c9e38442"
 
 [[package]]
 name = "base16ct"
