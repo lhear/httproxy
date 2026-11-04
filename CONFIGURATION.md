@@ -567,7 +567,7 @@ server {
 
     location ^~ /YOUR_SECRET_PATH {
         access_log off;
-        proxy_pass http://httproxy_backend;
+        proxy_pass http://unix:/dev/shm/httproxy.sock:;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_request_buffering off;
         proxy_http_version 1.1;
@@ -578,15 +578,10 @@ server {
         proxy_busy_buffers_size 16k;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
-        proxy_set_header Connection "";
     }
     location / {
         return 404;
     }
-}
-upstream httproxy_backend {
-    server unix:/dev/shm/httproxy.sock;
-    keepalive 32;
 }
 ```
 
@@ -599,8 +594,11 @@ Key points:
   reach `min(1 MiB, max_in_flight_bytes)` plus one frame of slack
   (~16 KiB), so size it accordingly (the 4m above covers any
   `max_in_flight_bytes` up to the 2 MiB ceiling).
-- The Unix socket upstream (`listen = "/dev/shm/httproxy.sock"`) avoids
-  loopback TCP overhead; the server may equally listen on a TCP port instead.
+- The backend is addressed directly in `proxy_pass` as a Unix socket
+  (`http://unix:/dev/shm/httproxy.sock:`). The trailing colon with no path
+  means the original request URI is forwarded unchanged — required here,
+  since the tunnel path is part of the URL. The server may equally listen on
+  a TCP port instead (`proxy_pass http://127.0.0.1:8081;`).
 
 ---
 
