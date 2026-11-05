@@ -144,6 +144,24 @@ impl FrameCipher for AesFrameCipher {
     }
 
     #[inline]
+    fn decrypt_in_place(&self, buf: &mut [u8]) -> io::Result<std::ops::Range<usize>> {
+        if buf.len() < NONCE_LEN + TAG_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ciphertext too short",
+            ));
+        }
+        let nonce = Nonce::try_assume_unique_for_key(&buf[..NONCE_LEN])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid nonce length"))?;
+        let pt_len = self
+            .cipher
+            .open_in_place(nonce, Aad::empty(), &mut buf[NONCE_LEN..])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption error"))?
+            .len();
+        Ok(NONCE_LEN..NONCE_LEN + pt_len)
+    }
+
+    #[inline]
     fn seal_in_place(
         &self,
         out: &mut bytes::BytesMut,

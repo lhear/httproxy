@@ -41,7 +41,6 @@ pub fn encode_initial_payload(
 ) -> Result<(Bytes, Bytes, u64)> {
     let take_len = initial_payload.len().min(max_bytes);
     let data_to_send = &initial_payload[..take_len];
-    // 剩余部分直接切片复用原分配，不做整块拷贝
     let remaining = if take_len < initial_payload.len() {
         initial_payload.slice(take_len..)
     } else {
@@ -233,6 +232,9 @@ mod tests {
                 DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
                 DecodedFrame::InScratch { start, end, .. } => {
                     decoded.extend_from_slice(&scratch[start..end])
+                }
+                DecodedFrame::InJsonScratch { start, end, .. } => {
+                    decoded.extend_from_slice(&json_scratch[start..end])
                 }
             }
             count += 1;

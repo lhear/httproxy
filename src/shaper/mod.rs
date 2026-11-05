@@ -33,9 +33,6 @@ const MAX_BINARY_FRAME_LEN: usize = MAX_RAW_PAYLOAD + 38;
 const MAX_JSON_LINE_LEN: usize = MAX_RAW_PAYLOAD + 2396;
 const HEADER_LEN: usize = 10;
 
-/// 单帧编码后的最大字节数（含二进制长度前缀 / JSON 行尾换行）。
-///
-/// 用它一次性预分配编码缓冲区，避免 `BytesMut` 从 0 开始反复扩容拷贝。
 #[inline]
 pub fn max_encoded_frame_len(encoding: EncodingType) -> usize {
     match encoding {
@@ -185,6 +182,19 @@ pub trait FrameCipher: Send + Sync {
         Ok(())
     }
 
+    fn decrypt_in_place(&self, buf: &mut [u8]) -> Result<std::ops::Range<usize>, Error> {
+        let decrypted = self.decrypt(buf)?;
+        let len = decrypted.len();
+        if len > buf.len() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "decrypted frame too large",
+            ));
+        }
+        buf[..len].copy_from_slice(&decrypted);
+        Ok(0..len)
+    }
+
     fn seal_in_place(
         &self,
         out: &mut BytesMut,
@@ -249,24 +259,25 @@ fn parse_json_payload_into(json: &[u8], out: &mut Vec<u8>) -> Result<usize, Erro
     let json = trim_bytes(json);
     let err = |msg: &str| Error::new(ErrorKind::InvalidData, msg);
 
-    const PREFIX: &[u8] = b"\"data\":\"";
+    if let Some(payload) = json
+        .strip_prefix(b"{\"data\":\"")
+        .and_then(|rest| rest.strip_suffix(b"\"}"))
+    {
+        return base122_fast::decode_into_bytes(payload, out).map_err(err);
+    }
+
+    const FIELD: &[u8] = b"\"data\":\"";
     static DATA_FINDER: OnceLock<memchr::memmem::Finder<'static>> = OnceLock::new();
 
-    let finder = DATA_FINDER.get_or_init(|| memchr::memmem::Finder::new(PREFIX));
+    let finder = DATA_FINDER.get_or_init(|| memchr::memmem::Finder::new(FIELD));
     let start = finder
         .find(json)
         .ok_or_else(|| err("missing 'data' field"))?;
-    let data_start = start + PREFIX.len();
-
-    let remaining = &json[data_start..];
+    let remaining = &json[start + FIELD.len()..];
     let data_end =
         memchr::memchr(b'"', remaining).ok_or_else(|| err("malformed JSON structure"))?;
 
-    let enc_str_bytes = &remaining[..data_end];
-    let enc_str =
-        std::str::from_utf8(enc_str_bytes).map_err(|_| err("payload is not valid UTF-8"))?;
-
-    base122_fast::decode_into(enc_str, out).map_err(err)
+    base122_fast::decode_into_bytes(&remaining[..data_end], out).map_err(err)
 }
 
 #[inline]
@@ -294,11 +305,6 @@ fn resolve_frame_padding(
     }
 }
 
-/// 把一帧直接编码进调用方提供的缓冲区。
-///
-/// 与 [`encode_frame`] 相比省掉了“临时 `Vec` + `BytesMut` + `to_vec`”三次
-/// 分配与两次整帧拷贝；二进制编码下复用同一个 `BytesMut` 即零额外分配
-/// （JSON 编码因为要过 Base122，仍需一个临时缓冲）。
 pub fn encode_frame_into(
     data: &[u8],
     seq: u64,
@@ -396,6 +402,7 @@ pub fn encode_frame(
 #[derive(Debug)]
 pub enum DecodedFrame {
     InScratch { seq: u64, start: usize, end: usize },
+    InJsonScratch { seq: u64, start: usize, end: usize },
     Owned { seq: u64, data: Bytes },
 }
 
@@ -458,24 +465,21 @@ pub fn decode_frame(
 
                     parse_json_payload_into(&line, json_scratch)?;
 
-                    if let Some(c) = cipher {
-                        scratch.clear();
-                        c.decrypt_into(json_scratch, scratch)?;
-                        let (seq, start, end) = extract_frame_range(scratch)?;
-                        Ok(Some(DecodedFrame::InScratch { seq, start, end }))
-                    } else {
-                        // 拷贝进可复用的 scratch，而不是把 json_scratch 的分配交出去：
-                        // 后者会让每帧都重新 malloc + free 一次
-                        let (seq, start, end) = extract_frame_range(json_scratch)?;
-                        let len = end - start;
-                        scratch.clear();
-                        scratch.extend_from_slice(&json_scratch[start..end]);
-                        Ok(Some(DecodedFrame::InScratch {
-                            seq,
-                            start: 0,
-                            end: len,
-                        }))
-                    }
+                    let plain = match cipher {
+                        Some(c) => {
+                            let range = c.decrypt_in_place(json_scratch)?;
+                            range.start..range.end
+                        }
+                        None => 0..json_scratch.len(),
+                    };
+
+                    let (seq, start, end) =
+                        extract_frame_range(&json_scratch[plain.start..plain.end])?;
+                    Ok(Some(DecodedFrame::InJsonScratch {
+                        seq,
+                        start: plain.start + start,
+                        end: plain.start + end,
+                    }))
                 }
                 None => {
                     if src.len() > MAX_JSON_LINE_LEN {
@@ -503,6 +507,10 @@ pub fn decode_from_buffer(
             let plain = scratch.split().freeze();
             Ok(Some((seq, plain.slice(start..end))))
         }
+        Some(DecodedFrame::InJsonScratch { seq, start, end }) => {
+            let plain = Bytes::from(std::mem::take(&mut json_scratch));
+            Ok(Some((seq, plain.slice(start..end))))
+        }
         Some(DecodedFrame::Owned { seq, data }) => Ok(Some((seq, data))),
         None => Ok(None),
     }
@@ -523,7 +531,6 @@ pin_project! {
         reader: R,
 
         raw_buf: BytesMut,
-        out_buf: BytesMut,
         enc_buf: BytesMut,
         json_buf: Vec<u8>,
 
@@ -569,7 +576,6 @@ impl<R> TrafficShaper<R> {
         Self {
             reader,
             raw_buf: BytesMut::with_capacity(READ_HIGH_WATER),
-            out_buf: BytesMut::with_capacity(out_capacity),
             enc_buf: BytesMut::new(),
             json_buf: Vec::new(),
             flush_timer: tokio::time::sleep_until(Instant::now()),
@@ -659,24 +665,20 @@ impl<R> TrafficShaper<R> {
                 }
             }
             (_, EncodingType::Json) => {
-                this.out_buf.clear();
-                this.out_buf.reserve(payload_len);
-                this.out_buf.put_u64(seq);
-                this.out_buf.put_u16(raw_len as u16);
-                this.out_buf.put_slice(&this.raw_buf[..raw_len]);
+                let head = if this.cipher.is_some() { NONCE_LEN } else { 0 };
+                this.enc_buf.clear();
+                this.enc_buf.reserve(head + payload_len + TAG_LEN);
+                this.enc_buf.put_bytes(0u8, head);
+                this.enc_buf.put_u64(seq);
+                this.enc_buf.put_u16(raw_len as u16);
+                this.enc_buf.put_slice(&this.raw_buf[..raw_len]);
                 if padding_len > 0 {
-                    this.out_buf.put_bytes(0u8, padding_len);
+                    this.enc_buf.put_bytes(0u8, padding_len);
                 }
-                // 只借用切片而不是 split()：split() 会把 out_buf 的分配整体移走，
-                // 导致下一帧又要重新 malloc 一次。
                 if let Some(cipher) = this.cipher.as_deref() {
-                    this.enc_buf.clear();
-                    this.enc_buf.reserve(payload_len + NONCE_LEN + TAG_LEN);
-                    cipher.encrypt_into(&this.out_buf[..payload_len], this.enc_buf)?;
-                    base122_fast::encode_into(&this.enc_buf[..], this.json_buf);
-                } else {
-                    base122_fast::encode_into(&this.out_buf[..payload_len], this.json_buf);
+                    cipher.seal_in_place(this.enc_buf, 0, NONCE_LEN)?;
                 }
+                base122_fast::encode_into(&this.enc_buf[..], this.json_buf);
                 out.reserve(9 + this.json_buf.len() + 3);
                 out.put_slice(b"{\"data\":\"");
                 out.put_slice(this.json_buf);
@@ -768,7 +770,6 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let capacity = self.as_ref().get_ref().frame_capacity;
-        // 预分配整帧容量，避免从 0 开始按倍增反复 realloc + memcpy
         let mut frame = BytesMut::with_capacity(capacity);
         match self.poll_fill_and_seal(cx, &mut frame) {
             Poll::Ready(Ok(Some(seq))) => Poll::Ready(Some(Ok((seq, frame.freeze())))),
@@ -1042,11 +1043,11 @@ mod tests {
         .unwrap()
         .unwrap()
         {
-            DecodedFrame::InScratch { seq, start, end } => {
+            DecodedFrame::InJsonScratch { seq, start, end } => {
                 assert_eq!(seq, 3);
-                assert_eq!(&scratch[start..end], b"json payload");
+                assert_eq!(&json_scratch[start..end], b"json payload");
             }
-            _ => panic!("expected InScratch frame"),
+            _ => panic!("expected InJsonScratch frame"),
         }
         assert!(src.is_empty());
     }
@@ -1074,11 +1075,11 @@ mod tests {
             .unwrap()
             .unwrap()
             {
-                DecodedFrame::InScratch { seq, start, end } => {
+                DecodedFrame::InJsonScratch { seq, start, end } => {
                     assert_eq!(seq, i);
-                    decoded.extend_from_slice(&scratch[start..end]);
+                    decoded.extend_from_slice(&json_scratch[start..end]);
                 }
-                _ => panic!("expected InScratch frame"),
+                _ => panic!("expected InJsonScratch frame"),
             }
             if i == 0 {
                 cap_after_first = json_scratch.capacity();
@@ -1124,11 +1125,11 @@ mod tests {
         .unwrap()
         .unwrap()
         {
-            DecodedFrame::InScratch { seq, start, end } => {
+            DecodedFrame::InJsonScratch { seq, start, end } => {
                 assert_eq!(seq, 5);
-                assert_eq!(&scratch[start..end], b"json cipher payload");
+                assert_eq!(&json_scratch[start..end], b"json cipher payload");
             }
-            _ => panic!("expected InScratch frame"),
+            _ => panic!("expected InJsonScratch frame"),
         }
         assert!(src.is_empty());
     }
@@ -1179,6 +1180,9 @@ mod tests {
                 {
                     DecodedFrame::InScratch { start, end, .. } => {
                         decoded.extend_from_slice(&scratch[start..end]);
+                    }
+                    DecodedFrame::InJsonScratch { start, end, .. } => {
+                        decoded.extend_from_slice(&json_scratch[start..end]);
                     }
                     DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
                 }
@@ -1408,6 +1412,7 @@ mod tests {
         match frame {
             DecodedFrame::Owned { seq, .. } => assert_eq!(seq, 42),
             DecodedFrame::InScratch { seq, .. } => assert_eq!(seq, 42),
+            DecodedFrame::InJsonScratch { seq, .. } => assert_eq!(seq, 42),
         }
     }
 

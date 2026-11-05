@@ -47,18 +47,10 @@ pub struct DownloadLoopActor {
     buffers: DecodeBuffers,
 }
 
-/// 跨轮转复用的解码缓冲。
-///
-/// 每轮（`max_download_bytes` 触发换连接）都重新分配 16 KiB 解码缓冲的代价不小，
-/// 这里随 actor 一起存活，只保留容量。
 struct DecodeBuffers {
-    /// 未解完的帧字节
     input: BytesMut,
-    /// 解密输出
     scratch: BytesMut,
-    /// Base122 解码输出
     json_scratch: Vec<u8>,
-    /// 待写回浏览器的明文分块，用 `Bytes` 队列避免再拷一遍到写缓冲
     pending: VecDeque<Bytes>,
     pending_bytes: usize,
 }
@@ -74,9 +66,6 @@ impl DecodeBuffers {
         }
     }
 
-    /// 并入一个响应分块，并把其中所有完整帧放进待写队列。
-    ///
-    /// 缓冲为空且分块独占时直接接管其分配，整条路径不产生额外拷贝。
     fn ingest(
         &mut self,
         chunk: Bytes,
@@ -107,7 +96,6 @@ impl DecodeBuffers {
             self.push_frame(frame, expected_seq)?;
         }
 
-        // 保留残留字节，同时保留其容量给下一个分块复用
         self.input = src;
         Ok(())
     }
@@ -115,13 +103,14 @@ impl DecodeBuffers {
     #[inline]
     fn push_frame(&mut self, frame: DecodedFrame, expected_seq: &mut u64) -> Result<()> {
         let (seq, data) = match frame {
-            // 明文帧本来就是输入缓冲上的切片，直接排队，零拷贝
             DecodedFrame::Owned { seq, data } => (seq, data),
             DecodedFrame::InScratch { seq, start, end } => {
-                // 解密结果落在可复用的 scratch 里：把它的分配整体交给 Bytes，
-                // 下一帧再按需分配（比再 memcpy 一遍到写缓冲更划算）
                 let plain = std::mem::replace(&mut self.scratch, BytesMut::new());
                 (seq, plain.freeze().slice(start..end))
+            }
+            DecodedFrame::InJsonScratch { seq, start, end } => {
+                let plain = std::mem::take(&mut self.json_scratch);
+                (seq, Bytes::from(plain).slice(start..end))
             }
         };
         if seq != *expected_seq {
@@ -145,8 +134,6 @@ impl DecodeBuffers {
         self.pending_bytes >= WRITE_BUF_CAPACITY
     }
 
-    /// 用向量写把排队的明文一次吐给浏览器：省掉「拷进写缓冲」这一步，
-    /// 同时仍然把多个小帧合并进同一次系统调用。
     async fn flush(&mut self, write_half: &mut OwnedWriteHalf) -> Result<()> {
         while !self.pending.is_empty() {
             let written = {
@@ -172,7 +159,6 @@ impl DecodeBuffers {
         Ok(())
     }
 
-    /// 从队头丢弃已经写出的 `n` 字节。
     fn consume(&mut self, mut n: usize) {
         while n > 0 {
             let Some(front) = self.pending.front_mut() else {
@@ -183,7 +169,6 @@ impl DecodeBuffers {
                 self.pending_bytes -= front.len();
                 self.pending.pop_front();
             } else {
-                // Bytes::advance 只是移动游标，不拷贝
                 front.advance(n);
                 self.pending_bytes -= n;
                 n = 0;
@@ -339,7 +324,6 @@ impl DownloadLoopActor {
                 remaining = self.buffers.input.len(),
                 "download stream ended with undecoded data"
             );
-            // 残留的半帧不能带到下一轮，直接丢弃
             self.buffers.input.clear();
         }
         Ok((bytes_received, expected_seq))
@@ -463,7 +447,6 @@ mod tests {
         DecodeBuffers::new()
     }
 
-    /// 把待写队列拼成一段字节，方便断言。
     fn queued(bufs: &DecodeBuffers) -> Vec<u8> {
         bufs.pending
             .iter()
@@ -502,7 +485,6 @@ mod tests {
 
     #[test]
     fn ingest_hands_over_plain_frames_without_copying() {
-        // 明文帧是输入分配上的切片：入队后仍与输入缓冲共用同一块内存
         let mut bufs = buffers();
         let mut expected_seq = 0u64;
         let raw = frame(&[0xAB; 512], 0);
@@ -575,7 +557,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(queued(&bufs), plain);
-        // scratch 的分配被交给 Bytes，槽位本身已经空了
         assert!(bufs.scratch.is_empty());
     }
 
@@ -604,7 +585,6 @@ mod tests {
         bufs.pending.push_back(Bytes::from_static(b"ccc"));
         bufs.pending_bytes = 9;
 
-        // 写出 4 字节：第一块整块消耗，第二块只前进 1 字节
         bufs.consume(4);
         assert_eq!(bufs.pending_bytes, 5);
         assert_eq!(bufs.pending.len(), 2);

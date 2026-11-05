@@ -60,8 +60,6 @@ impl UploadLoopActor {
         ));
         let upload_concurrency = state.upload_concurrency;
         let max_in_flight_bytes = state.max_in_flight_bytes;
-        // 一帧最多可以超出批处理上限一个整帧，必须把这段余量从 in-flight 预算里
-        // 扣掉，否则单批可能申请到超过信号量总量的许可（直接失败/卡死）。
         let frame_headroom = shaper::max_encoded_frame_len(state.traffic_config.encoding_type);
         let max_batch_bytes = MAX_BATCH_BYTES
             .min(max_in_flight_bytes.saturating_sub(frame_headroom))
@@ -155,8 +153,6 @@ impl UploadLoopActor {
             .acquire_owned()
             .await
             .map_err(|_| anyhow!("request semaphore closed"))?;
-        // 单批长度受 max_batch_bytes 限制，正常情况下不会超过总预算；这里再夹一层，
-        // 保证极端配置（in-flight 预算小于两帧）下也不会申请到非法数量的许可。
         let batch_len = batch_buf.len();
         let permit_bytes = batch_len.min(self.max_in_flight_bytes).max(1) as u32;
         let bytes_permit: OwnedSemaphorePermit = self
@@ -358,7 +354,7 @@ mod tests {
         {
             match frame {
                 DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
-                DecodedFrame::InScratch { .. } => panic!("unexpected InScratch frame"),
+                _ => panic!("unexpected borrowed frame"),
             }
         }
         decoded
@@ -452,7 +448,7 @@ mod tests {
         {
             match frame {
                 DecodedFrame::Owned { seq, .. } => seqs.push(seq),
-                DecodedFrame::InScratch { .. } => panic!("unexpected InScratch frame"),
+                _ => panic!("unexpected borrowed frame"),
             }
         }
         assert_eq!(seqs.first(), Some(&7));

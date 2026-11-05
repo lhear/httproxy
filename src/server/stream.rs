@@ -34,7 +34,6 @@ where
     ) -> Self {
         Self {
             inner,
-            // 不再预分配 max_buf_size：首个分块通常能整块接管，扩容交给 BytesMut
             buf: BytesMut::new(),
             scratch: BytesMut::new(),
             json_scratch: Vec::new(),
@@ -71,6 +70,10 @@ where
                             let plain = this.scratch.split().freeze();
                             (seq, plain.slice(start..end))
                         }
+                        DecodedFrame::InJsonScratch { seq, start, end } => {
+                            let plain = Bytes::from(std::mem::take(this.json_scratch));
+                            (seq, plain.slice(start..end))
+                        }
                         DecodedFrame::Owned { seq, data } => (seq, data),
                     };
                     return Poll::Ready(Some(Ok((seq, data))));
@@ -101,7 +104,6 @@ where
 
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    // 缓冲为空时直接接管分块的内存，省掉整个上传体的一次拷贝
                     if this.buf.is_empty() {
                         *this.buf = match chunk.try_into_mut() {
                             Ok(chunk_mut) => chunk_mut,
