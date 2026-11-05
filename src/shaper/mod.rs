@@ -18,6 +18,10 @@ use tokio::{
 
 use crate::crypto::{NONCE_LEN, TAG_LEN};
 
+mod bufpool;
+
+pub use bufpool::frame_bytes as pooled_frame_bytes;
+
 pub const MAX_RAW_PAYLOAD: usize = 16 * 1024;
 
 const READ_HIGH_WATER: usize = 32 * 1024;
@@ -462,6 +466,9 @@ pub fn decode_frame(
                         return Err(Error::new(ErrorKind::InvalidData, "empty frame line"));
                     }
 
+                    if json_scratch.capacity() < MAX_JSON_LINE_LEN {
+                        *json_scratch = bufpool::take(MAX_JSON_LINE_LEN);
+                    }
                     parse_json_payload_into(&line, json_scratch)?;
 
                     let plain = match cipher {
@@ -502,11 +509,47 @@ pub fn decode_from_buffer(
     let mut json_scratch = Vec::new();
     match decode_frame(src, &mut json_scratch, cipher, encoding)? {
         Some(DecodedFrame::InJsonScratch { seq, start, end }) => {
-            let plain = Bytes::from(std::mem::take(&mut json_scratch));
+            let plain = pooled_frame_bytes(std::mem::take(&mut json_scratch));
             Ok(Some((seq, plain.slice(start..end))))
         }
         Some(DecodedFrame::Owned { seq, data }) => Ok(Some((seq, data))),
         None => Ok(None),
+    }
+}
+
+trait FrameBuf: BufMut {
+    fn len(&self) -> usize;
+    fn reserve(&mut self, additional: usize);
+    fn as_bytes_mut(&mut self) -> Option<&mut BytesMut>;
+}
+
+impl FrameBuf for BytesMut {
+    #[inline]
+    fn len(&self) -> usize {
+        BytesMut::len(self)
+    }
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        BytesMut::reserve(self, additional);
+    }
+    #[inline]
+    fn as_bytes_mut(&mut self) -> Option<&mut BytesMut> {
+        Some(self)
+    }
+}
+
+impl FrameBuf for Vec<u8> {
+    #[inline]
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        Vec::reserve(self, additional);
+    }
+    #[inline]
+    fn as_bytes_mut(&mut self) -> Option<&mut BytesMut> {
+        None
     }
 }
 
@@ -620,7 +663,7 @@ impl<R> TrafficShaper<R> {
     }
 
     #[inline]
-    fn seal_into(this: &mut Proj<'_, R>, out: &mut BytesMut) -> Result<u64, Error> {
+    fn seal_into<B: FrameBuf>(this: &mut Proj<'_, R>, out: &mut B) -> Result<u64, Error> {
         let raw_len = this.raw_buf.len().min(*this.seal_threshold);
         debug_assert!(raw_len > 0);
         debug_assert!(raw_len <= MAX_RAW_PAYLOAD);
@@ -646,7 +689,10 @@ impl<R> TrafficShaper<R> {
                 if padding_len > 0 {
                     out.put_bytes(0u8, padding_len);
                 }
-                cipher.seal_in_place(out, nonce_start, ct_start)?;
+                let buf = out.as_bytes_mut().ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidInput, "binary framing requires BytesMut")
+                })?;
+                cipher.seal_in_place(buf, nonce_start, ct_start)?;
             }
             (None, EncodingType::Binary) => {
                 out.reserve(2 + payload_len);
@@ -686,10 +732,10 @@ impl<R> TrafficShaper<R> {
 }
 
 impl<R: AsyncRead> TrafficShaper<R> {
-    fn poll_fill_and_seal(
+    fn poll_fill_and_seal<B: FrameBuf>(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        out: &mut BytesMut,
+        out: &mut B,
     ) -> Poll<std::io::Result<Option<u64>>> {
         let mut this = self.project();
 
@@ -764,6 +810,17 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let capacity = self.as_ref().get_ref().frame_capacity;
+        if matches!(self.as_ref().get_ref().encoding, EncodingType::Json) {
+            let mut frame = bufpool::take(capacity);
+            return match self.poll_fill_and_seal(cx, &mut frame) {
+                Poll::Ready(Ok(Some(seq))) => {
+                    Poll::Ready(Some(Ok((seq, bufpool::frame_bytes(frame)))))
+                }
+                Poll::Ready(Ok(None)) => Poll::Ready(None),
+                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+                Poll::Pending => Poll::Pending,
+            };
+        }
         let mut frame = BytesMut::with_capacity(capacity);
         match self.poll_fill_and_seal(cx, &mut frame) {
             Poll::Ready(Ok(Some(seq))) => Poll::Ready(Some(Ok((seq, frame.freeze())))),

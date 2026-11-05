@@ -96,7 +96,7 @@ impl DecodeBuffers {
             let (seq, data) = match frame {
                 DecodedFrame::Owned { seq, data } => (seq, data),
                 DecodedFrame::InJsonScratch { seq, start, end } => {
-                    let plain = Bytes::from(std::mem::take(json_scratch));
+                    let plain = shaper::pooled_frame_bytes(std::mem::take(json_scratch));
                     (seq, plain.slice(start..end))
                 }
             };

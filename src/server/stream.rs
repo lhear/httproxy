@@ -59,7 +59,8 @@ where
                 Ok(Some(frame)) => {
                     let (seq, data) = match frame {
                         DecodedFrame::InJsonScratch { seq, start, end } => {
-                            let plain = Bytes::from(std::mem::take(this.json_scratch));
+                            let plain =
+                                shaper::pooled_frame_bytes(std::mem::take(this.json_scratch));
                             (seq, plain.slice(start..end))
                         }
                         DecodedFrame::Owned { seq, data } => (seq, data),
