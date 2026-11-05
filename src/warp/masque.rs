@@ -1,16 +1,3 @@
-//! 基于 quinn 的 MASQUE 客户端。
-//!
-//! 除了 RFC 9484 的 `CONNECT-IP`，Cloudflare 的 MASQUE 网关还提供**每条 TCP
-//! 连接一个 HTTP/3 CONNECT 流**的 L4 转发模式，usque 的 `l4-socks` /
-//! `l4-http-proxy` 走的就是这条路。对代理服务器来说它比 `CONNECT-IP` 更合适：
-//! 不需要用户态 TCP/IP 协议栈，一条 QUIC bidi 流天然就是一条 TCP 连接，字节流
-//! 可以直接落到 `AsyncRead`/`AsyncWrite` 上。
-//!
-//! 数据面刻意不引入 `h3` crate：CONNECT 只需要控制流、字段块和 DATA 帧这一小
-//! 部分，自己编解码可以把载荷以 [`Bytes`] 的形式直接交给 quinn
-//! （[`quinn::SendStream::write_all_chunks`]），避免多一次用户态拷贝，也避免
-//! 为每条连接维护 QPACK 动态表。
-
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -31,11 +18,8 @@ use tracing::debug;
 
 use super::h3;
 
-/// 单条 DATA 帧的最大载荷。太大的帧会让对端缓冲更多数据，切成 64 KiB
-/// 既不影响吞吐，也让帧头的相对开销可以忽略。
 const MAX_DATA_FRAME: usize = 64 * 1024;
 
-/// 解析响应头时读缓冲的上限。
 const MAX_RESPONSE_HEAD_BUFFER: usize = 64 * 1024;
 
 const QUIC_ALPN: &[u8] = b"h3";
@@ -50,10 +34,6 @@ pub(crate) struct MasqueConfig {
 }
 
 impl MasqueConfig {
-    /// 组装 quinn 的客户端配置。
-    ///
-    /// 窗口参数按「每条连接可以同时跑几十上百条隧道」来定：单流 1 MiB、
-    /// 整条连接 8 MiB，足够撑满带宽又不会让一条空闲连接占住几十 MB。
     pub(crate) fn client_config(&self) -> Result<quinn::ClientConfig> {
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(self.keepalive));
@@ -61,8 +41,6 @@ impl MasqueConfig {
             quinn::IdleTimeout::try_from(self.idle_timeout)
                 .context("warp: invalid idle timeout")?,
         ));
-        // 服务端不会向我们开流，给个很小的上限即可；上行流数量由对端决定，
-        // `open_bi()` 会在超出配额时自动等待。
         transport.max_concurrent_bidi_streams(VarInt::from_u32(4));
         transport.max_concurrent_uni_streams(VarInt::from_u32(8));
         transport.stream_receive_window(VarInt::from_u32(1 << 20));
@@ -76,10 +54,6 @@ impl MasqueConfig {
     }
 }
 
-/// 一条已建立的 MASQUE 连接。
-///
-/// H3 的控制流与两条 QPACK 流必须一直保持打开：丢掉 `SendStream` 会发出
-/// FIN / RESET_STREAM，对端会把它当成 H3 连接错误。
 pub(crate) struct MasqueConn {
     conn: quinn::Connection,
     _control: SendStream,
@@ -104,8 +78,6 @@ impl MasqueConn {
             .await
             .context("warp: send SETTINGS")?;
 
-        // 我们通告了动态表容量 0，这两个流永远不会承载数据，但 RFC 9204 要求
-        // 端点必须创建它们，留着占位最省事。
         let mut qpack_encoder = conn.open_uni().await.context("warp: open QPACK encoder")?;
         qpack_encoder
             .write_all(&[h3::STREAM_QPACK_ENCODER as u8])
@@ -125,7 +97,6 @@ impl MasqueConn {
         })
     }
 
-    /// 连接是否还能用（对端关闭、超时或本地关闭都会让它不可用）。
     pub(crate) fn is_usable(&self) -> bool {
         self.conn.close_reason().is_none()
     }
@@ -134,7 +105,6 @@ impl MasqueConn {
         self.conn.close(VarInt::from_u32(0), b"reconnect");
     }
 
-    /// 在共享的 QUIC 连接上开一条 CONNECT 流。
     pub(crate) async fn open(&self, authority: &str) -> Result<MasqueStream> {
         let (mut send, mut recv) = self
             .conn
@@ -165,17 +135,12 @@ impl MasqueConn {
     }
 }
 
-/// 一条 CONNECT 隧道：`send` 写请求体，`recv` 读响应体。
 pub(crate) struct MasqueStream {
     pub(crate) send: MasqueSend,
     pub(crate) recv: MasqueRecv,
 }
 
 impl MasqueStream {
-    /// 把整条流当成一个双工字节流用。
-    ///
-    /// 隧道数据面走的是 `write_frames` / `MasqueRecv`（零拷贝、批量），
-    /// 但 DoT 这类需要 `AsyncRead + AsyncWrite` 的调用方只能在整条流上工作。
     pub(crate) fn into_io(self) -> DuplexIo {
         DuplexIo(Box::pin(tokio::io::join(self.recv, self.send)))
     }
@@ -184,7 +149,6 @@ impl MasqueStream {
 trait Duplex: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> Duplex for T {}
 
-/// 一条 CONNECT 流的双工视图。
 pub(crate) struct DuplexIo(Pin<Box<dyn Duplex + Send>>);
 
 impl AsyncRead for DuplexIo {
@@ -215,7 +179,6 @@ impl AsyncWrite for DuplexIo {
     }
 }
 
-/// 等待响应头，返回状态码和紧随其后的字节（可能已经是 DATA 载荷）。
 async fn read_response_head(recv: &mut RecvStream, authority: &str) -> Result<(u16, BytesMut)> {
     let mut buf = BytesMut::with_capacity(512);
     loop {
@@ -234,7 +197,6 @@ async fn read_response_head(recv: &mut RecvStream, authority: &str) -> Result<(u
                     .map_err(|e| anyhow!("warp: unusable CONNECT response for {authority}: {e}"))?;
                 return Ok((status, buf.split_off(total)));
             }
-            // 其它帧（理论上不会出现）整帧丢掉
             buf.advance(total);
         }
 
@@ -255,13 +217,10 @@ async fn read_response_head(recv: &mut RecvStream, authority: &str) -> Result<(u
     }
 }
 
-/// 写侧：把上行的连续帧包成 H3 DATA 帧。
 pub(crate) struct MasqueSend {
     stream: SendStream,
-    /// 复用的一次性 chunk 列表，避免每批数据都重新分配
     chunks: Vec<Bytes>,
     finished: bool,
-    /// `AsyncWrite` 路径的帧头 / 帧内偏移（隧道数据面走 `write_frames`，不碰它）
     write: WriteState,
 }
 
@@ -270,7 +229,6 @@ struct WriteState {
     header: [u8; 16],
     header_len: u8,
     header_sent: u8,
-    /// 当前 DATA 帧还差多少载荷字节
     remaining: usize,
 }
 
@@ -284,10 +242,6 @@ impl MasqueSend {
         }
     }
 
-    /// 把一段连续帧写出去。
-    ///
-    /// 载荷以 [`Bytes`] 直接交给 quinn，不经过任何中间缓冲：`write_all_chunks`
-    /// 把 chunk 挂到流上而不是拷进发送缓冲。
     pub(crate) async fn write_frames(&mut self, frames: &[Bytes]) -> io::Result<()> {
         let mut start = 0;
         while start < frames.len() {
@@ -298,7 +252,6 @@ impl MasqueSend {
                 end += 1;
             }
             if end == start {
-                // 单帧就超过上限：仍然要为它开一个 DATA 帧
                 total = frames[start].len();
                 end = start + 1;
             }
@@ -327,7 +280,6 @@ impl MasqueSend {
             .map_err(io_error)
     }
 
-    /// 半关闭：发出 FIN，告诉对端请求体结束。
     pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
         self.finished = true;
         self.stream
@@ -356,7 +308,6 @@ impl AsyncWrite for MasqueSend {
             this.write.remaining = len;
         }
 
-        // 帧头必须整段发出去，之后才能碰调用方的缓冲区
         while this.write.header_sent < this.write.header_len {
             let start = this.write.header_sent as usize;
             let end = this.write.header_len as usize;
@@ -387,7 +338,6 @@ impl AsyncWrite for MasqueSend {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // quinn 自己管理发送缓冲，没有需要显式 flush 的东西
         Poll::Ready(Ok(()))
     }
 
@@ -404,31 +354,22 @@ impl AsyncWrite for MasqueSend {
 impl Drop for MasqueSend {
     fn drop(&mut self) {
         if self.finished {
-            // quinn 自己会在 drop 时补一次 finish，这里不需要做什么
             return;
         }
-        // 没有半关闭就被丢弃 = 隧道被中断：重置流，让网关立刻断掉目标连接，
-        // 而不是等对端把响应发完
         let _ = self.stream.reset(VarInt::from_u32(0));
     }
 }
 
-/// 读侧：把 H3 DATA 帧的载荷还原成字节流。
 pub(crate) struct MasqueRecv {
     stream: RecvStream,
-    /// 帧头（以及一次多读出来的少量字节）
     header: BytesMut,
-    /// 已经收下来但还没交给调用方的载荷
     pending: BytesMut,
-    /// 当前帧还差多少字节
     remaining: u64,
-    /// 当前帧不是 DATA：读出来直接丢弃
     discard: bool,
     eof: bool,
 }
 
 impl MasqueRecv {
-    /// `leftover` 是响应头之后已经读进缓冲的字节，可能已经是 DATA 载荷。
     fn new(stream: RecvStream, leftover: BytesMut) -> Self {
         Self {
             stream,
@@ -441,7 +382,6 @@ impl MasqueRecv {
     }
 }
 
-/// 从 quinn 读一小块到切片，返回读到的字节数（0 表示 FIN）。
 fn poll_read_some(
     stream: &mut RecvStream,
     cx: &mut Context<'_>,
@@ -474,7 +414,6 @@ impl AsyncRead for MasqueRecv {
                 return Poll::Ready(Ok(()));
             }
 
-            // 先把上一次多读出来的载荷交出去
             if !this.pending.is_empty() {
                 let n = this.pending.len().min(buf.remaining());
                 buf.put_slice(&this.pending[..n]);
@@ -499,9 +438,6 @@ impl AsyncRead for MasqueRecv {
 
                 let want = (this.remaining as usize).min(buf.remaining());
                 let filled = {
-                    // SAFETY: 只把 `want` 字节的未初始化区交给 quinn 填，
-                    // 填多少由 `ReadBuf::filled()` 报告，随后 assume_init 的
-                    // 正是这段已被写入的字节。
                     let unfilled = unsafe { buf.unfilled_mut() };
                     let mut sub = ReadBuf::uninit(&mut unfilled[..want]);
                     match Pin::new(&mut this.stream).poll_read(cx, &mut sub) {
@@ -519,7 +455,6 @@ impl AsyncRead for MasqueRecv {
                 return Poll::Ready(Ok(()));
             }
 
-            // 当前帧读完了：解析下一个帧头
             match h3::get_frame_header(&this.header) {
                 Some((ty, len, used)) => {
                     this.header.advance(used);
@@ -568,15 +503,6 @@ fn io_error(e: quinn::WriteError) -> io::Error {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TLS：自签客户端证书 + 端点公钥钉扎
-// ---------------------------------------------------------------------------
-
-/// 构造 QUIC 用的 rustls 客户端配置。
-///
-/// Cloudflare 的 MASQUE 端点证书不是公有 CA 签的（官方客户端也是靠钉扎
-/// `config.peers[0].public_key` 来认端点），所以这里不用根证书，而是把握手
-/// 拿到的叶子证书 SPKI 与注册时登记的端点公钥逐字节比较。
 pub(crate) fn build_tls_config(
     signing_key: &SigningKey,
     endpoint_spki: Option<Vec<u8>>,
@@ -612,7 +538,6 @@ fn default_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     if let Some(provider) = rustls::crypto::CryptoProvider::get_default() {
         return Arc::clone(provider);
     }
-    // 触发 rustls 按编译期特性安装默认 provider，再取回来
     let _ = rustls::ClientConfig::builder();
     Arc::clone(
         rustls::crypto::CryptoProvider::get_default()
@@ -620,7 +545,6 @@ fn default_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     )
 }
 
-/// 用设备私钥签一张自签证书 —— 就是 Cloudflare 用来识别设备的客户端证书。
 fn self_signed_client_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, Vec<u8>)> {
     let key_der = signing_key
         .to_pkcs8_der()
@@ -633,7 +557,6 @@ fn self_signed_client_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, Vec<u8>
 
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
         .context("warp: build certificate params")?;
-    // 有效期只是形式：端点靠钉扎与设备登记识别，不看签发时间
     params.not_before = rcgen::date_time_ymd(2020, 1, 1);
     params.not_after = rcgen::date_time_ymd(2035, 1, 1);
     let cert = params
@@ -643,19 +566,14 @@ fn self_signed_client_cert(signing_key: &SigningKey) -> Result<(Vec<u8>, Vec<u8>
     Ok((cert.der().to_vec(), key_der.as_bytes().to_vec()))
 }
 
-/// 从 X.509 证书里取出 `SubjectPublicKeyInfo` 的完整 DER（含外层 SEQUENCE）。
 fn extract_spki(cert: &[u8]) -> Option<&[u8]> {
-    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
     let (cert_body, _) = read_tlv(cert)?;
-    // TBSCertificate ::= SEQUENCE { [0] version, serialNumber, signature,
-    //                               issuer, validity, subject, subjectPublicKeyInfo, ... }
     let (tbs, _) = read_tlv(cert_body)?;
     let mut cursor = tbs;
     if cursor.first() == Some(&0xA0) {
         let (_, rest) = read_tlv(cursor)?;
         cursor = rest;
     }
-    // serialNumber / signature / issuer / validity / subject
     for _ in 0..5 {
         let (_, rest) = read_tlv(cursor)?;
         cursor = rest;
@@ -664,12 +582,9 @@ fn extract_spki(cert: &[u8]) -> Option<&[u8]> {
     Some(&cursor[..cursor.len() - rest.len()])
 }
 
-/// 读一个 DER TLV，返回（内容，剩余字节）。
 fn read_tlv(buf: &[u8]) -> Option<(&[u8], &[u8])> {
-    // tag
     let first = *buf.first()?;
     if first & 0x1F == 0x1F {
-        // 高 tag number 形式：我们只处理单字节 tag
         return None;
     }
     let (len, len_bytes) = read_der_len(buf.get(1..)?)?;
@@ -685,7 +600,6 @@ fn read_der_len(buf: &[u8]) -> Option<(usize, usize)> {
     }
     let count = (first & 0x7F) as usize;
     if count == 0 || count > 4 {
-        // 不定长或超长长度都不该出现在证书里
         return None;
     }
     let mut len = 0usize;
@@ -747,7 +661,6 @@ impl ServerCertVerifier for SpkiPinVerifier {
     }
 }
 
-/// `insecure_skip_verify = true` 时使用：只保留 TLS 1.3 的签名校验。
 #[derive(Debug)]
 struct AcceptAnyCert {
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
@@ -832,10 +745,6 @@ mod tests {
         assert_eq!(read_der_len(&[0x85, 0, 0, 0, 0, 0]), None);
     }
 
-    // -----------------------------------------------------------------
-    // 回环 QUIC 上的端到端测试：一个最小的 H3 CONNECT 服务端
-    // -----------------------------------------------------------------
-
     async fn spawn_server(status: u16) -> (quinn::Endpoint, SocketAddr, Vec<u8>) {
         let (cert, key) = server_cert();
         let spki = extract_spki(&cert).unwrap().to_vec();
@@ -863,8 +772,6 @@ mod tests {
                     if let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         serve_connect(&mut send, &mut recv, status).await;
                     }
-                    // 必须保持连接，直到客户端自己关掉：提前 drop 掉 Connection
-                    // 会让 quinn 立刻用 code 0 关闭连接，刚写出去的数据就丢了。
                     let _ = conn.closed().await;
                 });
             }
@@ -874,14 +781,12 @@ mod tests {
     }
 
     async fn serve_connect(send: &mut SendStream, recv: &mut RecvStream, status: u16) {
-        // 请求头：只要看到 CONNECT 的 authority 就算通过
         let mut buf = BytesMut::new();
         let (ty, payload) = match read_frame(recv, &mut buf).await {
             Some(frame) => frame,
             None => return,
         };
         assert_eq!(ty, h3::FRAME_HEADERS);
-        // `:method: CONNECT` 用的是静态表索引，块里能看到的是字面量 authority
         assert!(
             payload.windows(15).any(|w| w == b"example.com:443"),
             "authority missing from request headers"
@@ -891,7 +796,7 @@ mod tests {
         let mut head = BytesMut::new();
         head.put_u8(0);
         head.put_u8(0);
-        head.put_u8(0xC0 | code); // :status 200 / 400
+        head.put_u8(0xC0 | code);
         if send
             .write_all(&frame_bytes(h3::FRAME_HEADERS, &head))
             .await
@@ -903,7 +808,6 @@ mod tests {
             return;
         }
 
-        // 把 DATA 载荷原样回显
         loop {
             match read_frame(recv, &mut buf).await {
                 Some((h3::FRAME_DATA, payload)) => {
@@ -927,7 +831,6 @@ mod tests {
         out
     }
 
-    /// 读一个完整的帧，返回（类型，载荷）；对端 FIN 时返回 `None`。
     async fn read_frame(recv: &mut RecvStream, buf: &mut BytesMut) -> Option<(u64, Vec<u8>)> {
         loop {
             if let Some((ty, len, used)) = h3::get_frame_header(buf) {
@@ -974,7 +877,6 @@ mod tests {
         stream.send.write_frames(&frames).await.unwrap();
         stream.send.shutdown().await.unwrap();
 
-        // 服务端把 DATA 载荷原样回显
         let mut got = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -1009,7 +911,6 @@ mod tests {
     #[tokio::test]
     async fn wrong_pinned_key_fails_the_handshake() {
         let (server, addr, _spki) = spawn_server(200).await;
-        // 换一个不相干的 SPKI 作为钉扎目标
         let wrong = device_key().verifying_key().to_public_key_der().unwrap();
         let (endpoint, cfg) = client_config(addr, Some(wrong.as_bytes().to_vec()));
 

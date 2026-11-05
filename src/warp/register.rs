@@ -1,13 +1,3 @@
-//! Cloudflare WARP 设备注册与凭据持久化。
-//!
-//! 流程与官方客户端（以及 usque）一致：
-//!
-//! 1. `POST /reg` —— 用一个一次性生成的 WireGuard 公钥完成账号注册，拿到
-//!    `id` / `token` 以及设备地址；
-//! 2. `PATCH /reg/{id}` —— 把设备切换到 MASQUE 模式，同时登记我们真正的
-//!    secp256r1 公钥（TLS 客户端证书就是用它签的）；
-//! 3. 把私钥、端点公钥（用于指纹钉扎）和连接参数落盘，下次启动直接复用。
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,23 +14,16 @@ const API_VERSION: &str = "v0a4471";
 const CLIENT_VERSION: &str = "a-6.35-4471";
 const USER_AGENT: &str = "WARP for Android";
 
-/// 注册时使用的默认设备型号 / 语言，与官方客户端保持一致。
 pub(crate) const DEFAULT_MODEL: &str = "PC";
 pub(crate) const DEFAULT_LOCALE: &str = "en_US";
 
-/// 注册 / 登记请求的超时时间。
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 落盘的凭据。字段名与 usque 的 `config.json` 兼容，方便直接复用已有文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WarpCredentials {
-    /// 设备 ID
     pub id: String,
-    /// API 访问令牌
     pub access_token: String,
-    /// base64(PKCS#8 DER) —— TLS 客户端证书私钥
     pub private_key: String,
-    /// base64(SubjectPublicKeyInfo DER) —— 端点证书公钥，用于钉扎
     pub endpoint_pub_key: String,
     #[serde(default)]
     pub ipv4: String,
@@ -53,7 +36,6 @@ pub(crate) struct WarpCredentials {
 }
 
 impl WarpCredentials {
-    /// 还原 TLS 客户端私钥。
     pub(crate) fn signing_key(&self) -> Result<SigningKey> {
         let der = B64
             .decode(self.private_key.as_bytes())
@@ -61,10 +43,6 @@ impl WarpCredentials {
         SigningKey::from_pkcs8_der(&der).context("warp: private_key is not a PKCS#8 EC key")
     }
 
-    /// 还原端点公钥（SPKI DER），用于证书钉扎。
-    ///
-    /// Cloudflare 的 enrollment 响应给的是 PEM（`-----BEGIN PUBLIC KEY-----`），
-    /// 早期实现（含 usque）里也见过裸 base64，两种都接受。
     pub(crate) fn endpoint_spki(&self) -> Result<Vec<u8>> {
         let raw = self.endpoint_pub_key.trim();
         if raw.starts_with("-----BEGIN") {
@@ -81,31 +59,26 @@ impl WarpCredentials {
     }
 }
 
-/// 注册时用到的可选项。
 pub(crate) struct RegisterOptions<'a> {
     pub model: &'a str,
     pub locale: &'a str,
 }
 
-/// 读凭据；文件不存在或内容损坏时自动重新注册并写回。
 pub(crate) async fn load_or_register(
     path: &Path,
     opts: &RegisterOptions<'_>,
 ) -> Result<WarpCredentials> {
     match tokio::fs::read(path).await {
         Ok(raw) => match serde_json::from_slice::<WarpCredentials>(&raw) {
-            Ok(creds) => {
-                // 私钥坏了就当作没有配置：宁可重新注册，也不要在第一次拨号时才炸掉
-                match creds.signing_key() {
-                    Ok(_) => {
-                        info!(path = %path.display(), id = %creds.id, "warp: loaded credentials");
-                        return Ok(creds);
-                    }
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e, "warp: unusable credentials")
-                    }
+            Ok(creds) => match creds.signing_key() {
+                Ok(_) => {
+                    info!(path = %path.display(), id = %creds.id, "warp: loaded credentials");
+                    return Ok(creds);
                 }
-            }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "warp: unusable credentials")
+                }
+            },
             Err(e) => warn!(path = %path.display(), error = %e, "warp: malformed credentials"),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -115,7 +88,6 @@ pub(crate) async fn load_or_register(
     }
 
     let creds = register(opts).await?;
-    // 写不进去不影响本次运行，下次启动重新注册即可
     if let Err(e) = save(path, &creds).await {
         warn!(path = %path.display(), error = %e, "warp: failed to persist credentials");
     }
@@ -139,15 +111,12 @@ async fn save(path: &Path, creds: &WarpCredentials) -> Result<()> {
     Ok(())
 }
 
-/// 注册账号并把设备登记成 MASQUE 模式。
 async fn register(opts: &RegisterOptions<'_>) -> Result<WarpCredentials> {
     let client = wreq::Client::builder()
         .no_proxy()
         .build()
         .context("warp: build http client")?;
 
-    // 第一步：用一个一次性的 curve25519 公钥注册，只是为了让请求形状与
-    // 官方客户端一致；这个私钥我们不保存，之后也不会用到。
     let mut wg_key = [0u8; 32];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut wg_key);
     let mut serial = [0u8; 8];
@@ -173,7 +142,6 @@ async fn register(opts: &RegisterOptions<'_>) -> Result<WarpCredentials> {
         bail!("warp: registration response did not contain a token");
     }
 
-    // 第二步：生成 MASQUE 用的 EC 密钥，并把公钥登记到设备上。
     let (signing_key, spki) = generate_device_key()?;
     let pkcs8 = signing_key
         .to_pkcs8_der()
@@ -217,12 +185,10 @@ async fn register(opts: &RegisterOptions<'_>) -> Result<WarpCredentials> {
     Ok(creds)
 }
 
-/// 生成 secp256r1 设备密钥，返回私钥与 SPKI 公钥（DER）。
 pub(crate) fn generate_device_key() -> Result<(SigningKey, Vec<u8>)> {
     for _ in 0..16 {
         let mut scalar = [0u8; 32];
         rand::Rng::fill_bytes(&mut rand::rng(), &mut scalar);
-        // 极少数随机值会超出曲线阶，重来一次即可
         let Ok(signing_key) = SigningKey::from_slice(&scalar) else {
             continue;
         };
@@ -237,10 +203,6 @@ pub(crate) fn generate_device_key() -> Result<(SigningKey, Vec<u8>)> {
     bail!("warp: failed to generate a device key");
 }
 
-/// 去掉注册响应里的端口，只留 IP 字面量。
-///
-/// 真实响应长这样：`"162.159.198.2"`、`"[2606:4700:103::2]"`，也可能带端口。
-/// 裸 IPv6（含多个冒号）不能按最后一个冒号切，否则会被截断。
 fn strip_port(addr: &str) -> String {
     let addr = addr.trim();
     if let Some(rest) = addr.strip_prefix('[')
@@ -269,7 +231,6 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// `2026-11-02T07:00:00.000+00:00`
 fn cf_time_string() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -279,7 +240,6 @@ fn cf_time_string() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.000+00:00")
 }
 
-/// Unix 秒 → 公历 UTC（Howard Hinnant 的 civil_from_days）。
 fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
@@ -365,7 +325,6 @@ fn json_body(value: &serde_json::Value) -> Result<wreq::Body> {
     Ok(wreq::Body::from(serde_json::to_vec(value)?))
 }
 
-/// 补上官方客户端那套固定请求头，发出请求并解析响应。
 async fn send(req: wreq::RequestBuilder, stage: &str) -> Result<AccountData> {
     let req = req
         .header("User-Agent", USER_AGENT)
@@ -401,7 +360,6 @@ async fn send(req: wreq::RequestBuilder, stage: &str) -> Result<AccountData> {
     serde_json::from_slice(&body).with_context(|| format!("warp: cannot parse {stage} response"))
 }
 
-/// 凭据文件默认路径。
 pub(crate) fn default_path() -> PathBuf {
     PathBuf::from("warp.json")
 }
@@ -412,7 +370,6 @@ mod tests {
 
     #[test]
     fn time_string_matches_cloudflare_format() {
-        // 2026-11-02T07:00:00Z
         let (y, mo, d, h, mi, s) = civil_from_unix(1_793_602_800);
         assert_eq!((y, mo, d, h, mi, s), (2026, 11, 2, 7, 0, 0));
     }
@@ -426,9 +383,7 @@ mod tests {
         assert_eq!(strip_port("162.159.192.1:500"), "162.159.192.1");
         assert_eq!(strip_port("162.159.192.1"), "162.159.192.1");
         assert_eq!(strip_port("[2606:4700::1]:500"), "[2606:4700::1]");
-        // 真实响应里的形状
         assert_eq!(strip_port("[2606:4700:103::2]"), "[2606:4700:103::2]");
-        // 裸 IPv6 不能被最后一个冒号截断
         assert_eq!(strip_port("2606:4700:103::2"), "2606:4700:103::2");
     }
 

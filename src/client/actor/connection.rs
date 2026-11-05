@@ -35,13 +35,11 @@ impl ClientConnectionActor {
         let http_client = Arc::clone(&self.http_client);
         let state = Arc::clone(&self.state);
         let (mut read_half, mut write_half) = socket.into_split();
-        // 浏览器 CONNECT 头通常只有几百字节，先给小缓冲，按需增长
         let mut buf = BytesMut::with_capacity(PROXY_BUF_INITIAL_CAPACITY);
 
         let Some((method, header_len, url)) =
             read_request_head(&mut read_half, &mut write_half, &mut buf, &state).await?
         else {
-            // 已回过 407 并关闭连接，等客户端带认证头重连
             return Ok(());
         };
 
@@ -51,7 +49,6 @@ impl ClientConnectionActor {
             read_early_data(&mut read_half, &mut buf).await;
         }
 
-        // 只解析一次请求目标：同时得到上游地址和需要写回请求行的 origin-form
         let (target_host, origin_form) = proxy::resolve_request(&method, &url)?;
         tracing::Span::current().record("target", target_host.as_str());
 
@@ -72,11 +69,6 @@ impl ClientConnectionActor {
     }
 }
 
-/// 读取并校验代理请求头。
-///
-/// 入站代理连接不做 keep-alive：认证失败时回一个 `Connection: close` 的 407 并
-/// 关闭连接，客户端自然会带认证头重开一条，因此这里不需要在同一条 TCP 上循环
-/// 等待下一个请求。返回 `Ok(None)` 表示已经拒绝并关闭。
 async fn read_request_head(
     read_half: &mut OwnedReadHalf,
     write_half: &mut OwnedWriteHalf,
@@ -103,7 +95,6 @@ async fn read_request_head(
     Ok(Some((request.method, request.header_len, request.target)))
 }
 
-/// 回 407 并优雅关闭连接。
 async fn reject_unauthorized(
     read_half: &mut OwnedReadHalf,
     write_half: &mut OwnedWriteHalf,
@@ -111,8 +102,6 @@ async fn reject_unauthorized(
     write_half.write_all(PROXY_AUTH_REQUIRED_RESPONSE).await?;
     let _ = write_half.shutdown().await;
 
-    // 先发 FIN，再把对端已经在途的数据读掉：直接 close 往往触发 RST，
-    // 客户端可能还没读到 407 就收到连接重置。
     let _ = tokio::time::timeout(AUTH_REJECT_DRAIN_WINDOW, async {
         let mut sink = [0u8; 512];
         loop {
@@ -126,8 +115,6 @@ async fn reject_unauthorized(
     Ok(())
 }
 
-/// CONNECT 之后浏览器往往已经把 TLS ClientHello 发过来了，先尽力读一段，
-/// 让上游建连与首包发送重叠。
 async fn read_early_data(read_half: &mut OwnedReadHalf, buf: &mut BytesMut) {
     let deadline = tokio::time::Instant::now() + EARLY_READ_WINDOW;
     loop {
@@ -135,8 +122,6 @@ async fn read_early_data(read_half: &mut OwnedReadHalf, buf: &mut BytesMut) {
         if remaining == 0 {
             break;
         }
-        // read_buf 在空闲容量为 0 时会返回 0（伪 EOF），必须显式预留；
-        // 分块预留，避免为一个只发了几字节的连接一次性吃掉 16 KiB。
         buf.reserve(remaining.min(EARLY_READ_CHUNK));
         match tokio::time::timeout_at(deadline, read_half.read_buf(buf)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
@@ -234,7 +219,6 @@ mod tests {
             Some(bypass_loopback()),
         );
 
-        // 第一次：不带认证头，应该只收到 407 + Connection: close，然后连接被关闭
         let (server_side, mut client) = tcp_pair().await;
         let http_client = test_client();
         let state1 = Arc::clone(&state);
@@ -277,7 +261,6 @@ mod tests {
             .expect("actor task must not panic");
         assert!(joined.is_ok(), "407 是正常流程，不应上报错误");
 
-        // 第二次：新连接带上认证头，请求应被正常转发
         let (server_side, mut client) = tcp_pair().await;
         let http_client = test_client();
         let actor = tokio::spawn(async move {
@@ -387,7 +370,6 @@ mod tests {
         );
         let req = b"GET http://example.com/ HTTP/1.1\r\nHost: x\r\n\r\n";
 
-        // 连续多条未认证连接都应该被立刻关闭，不会被留在这里反复占用
         for _ in 0..3 {
             let (server_side, mut client) = tcp_pair().await;
             let http_client = test_client();

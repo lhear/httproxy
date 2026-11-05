@@ -8,8 +8,6 @@ fn deserialize_upstream<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Socket
 }
 
 impl DnsConfig {
-    /// `[warp]` 打开但没写 `[dns]` 时的兜底解析器：Cloudflare 自己的 1.1.1.1，
-    /// 查询会经 WARP 出去（53 端口落成 DNS-over-TCP）。
     pub fn public_default() -> Self {
         Self {
             upstream: SocketAddr::from(([1, 1, 1, 1], 53)),

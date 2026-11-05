@@ -25,7 +25,6 @@ use crate::warp::WarpClient;
 
 static ROOT_CERT_STORE: OnceLock<Arc<RootCertStore>> = OnceLock::new();
 
-/// 查询里声明的 EDNS UDP 载荷为 1232 字节，接收缓冲取 2 KiB 足够。
 const UDP_RECV_BUF: usize = 2048;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,7 +33,6 @@ const TLS_TIMEOUT: Duration = Duration::from_secs(5);
 type PendingMap = Arc<Mutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>>>>>>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// 建一条 DNS 传输连接的工厂。每次重连都调用一次。
 type Connector = Arc<dyn Fn() -> BoxFuture<Result<DnsStream>> + Send + Sync>;
 
 async fn assign_id_and_register(
@@ -69,7 +67,6 @@ impl UdpTransport {
         let id: u16 = rand::random();
         data[0..2].copy_from_slice(&id.to_be_bytes());
         socket.send(data).await?;
-        // OPT 记录里声明的 UDP 载荷是 1232 字节，2 KiB 缓冲足够且不必每次清 64 KiB
         let mut buf = [0u8; UDP_RECV_BUF];
         let len = timeout(Duration::from_secs(2), socket.recv(&mut buf))
             .await
@@ -78,7 +75,6 @@ impl UdpTransport {
     }
 }
 
-/// DNS 传输用到的字节流：直连 TCP、TLS，或一条承载在 MASQUE CONNECT 上的流。
 pub(super) struct DnsStream(Box<dyn DnsStreamInner>);
 
 trait DnsStreamInner: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -118,10 +114,6 @@ impl AsyncWrite for DnsStream {
     }
 }
 
-/// 基于「长度前缀 + 可复用连接」的 DNS 传输（DNS-over-TCP 与 DoT 共用）。
-///
-/// 一个 actor 持有连接，按报文 ID 把响应分发给等待者；连接断了就清空所有
-/// 等待者，下次查询重新连接。
 pub(super) struct StreamTransport {
     tx: mpsc::Sender<(Vec<u8>, u16)>,
     pending: PendingMap,
@@ -261,12 +253,6 @@ impl Transport {
     }
 }
 
-/// 按配置挑一条 DNS 传输。
-///
-/// 上游是公网地址且启用了 WARP 时，查询本身也走 WARP：CONNECT 只能承载 TCP，
-/// 所以 `protocol = "udp"`（端口 53）会退化成 DNS-over-TCP，`protocol = "dot"`
-/// 则是 TLS-over-CONNECT。上游是私网/回环地址时保持直连 —— WARP 到不了内网，
-/// 把内网解析器塞进隧道只会让所有查询失败。
 pub(super) fn build_transport(
     config: &DnsConfig,
     warp: Option<&Arc<WarpClient>>,
@@ -416,7 +402,6 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_secs(2));
     }
 
-    /// DNS-over-TCP（`protocol = "udp"` 经 WARP 时的实际形态）：长度前缀分帧。
     #[tokio::test]
     async fn stream_transport_uses_length_prefixed_framing() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -428,7 +413,6 @@ mod tests {
             let len = u16::from_be_bytes(len_buf) as usize;
             let mut msg = vec![0u8; len];
             socket.read_exact(&mut msg).await.unwrap();
-            // 原样回显，保留同样的 ID
             socket.write_all(&len_buf).await.unwrap();
             socket.write_all(&msg).await.unwrap();
             socket.flush().await.unwrap();

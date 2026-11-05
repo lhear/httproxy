@@ -27,7 +27,6 @@ pub struct ClientTopConfig {
     pub traffic_shaping: TrafficConfig,
     #[serde(default)]
     pub bypass: BypassConfig,
-    /// `[[redirect]]` 本地端口转发（等价于 ssh -L）
     #[serde(default)]
     pub redirect: Vec<RedirectSection>,
 }
@@ -35,9 +34,7 @@ pub struct ClientTopConfig {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RedirectSection {
-    /// 本地监听地址，必须是 `ip:port`
     pub listen: String,
-    /// 隧道另一端的 `host:port`
     pub target: String,
 }
 
@@ -140,7 +137,6 @@ bypass_suffixes = ["corp.local"]
         let cfg: ServerTopConfig = toml::from_str(toml_str).unwrap();
         let warp = cfg.warp.as_ref().unwrap();
         assert!(warp.enabled);
-        // 未写的键走默认值
         assert!(warp.bypass_private);
         assert_eq!(warp.port, None);
         assert_eq!(warp.endpoint.as_deref(), Some("162.159.192.1"));

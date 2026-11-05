@@ -52,7 +52,6 @@ pub struct DnsClient {
 }
 
 impl DnsClient {
-    /// 直连传输（不经过 WARP）。
     pub async fn new(config: &DnsConfig) -> Result<Self> {
         let transport = transport::build_transport(config, None)?;
         Ok(Self::with_transport(config, transport))
@@ -266,9 +265,6 @@ impl DnsClient {
         Ok((ips, ttl))
     }
 
-    /// 解析域名（A + AAAA），返回洗牌后交替排列的地址。
-    ///
-    /// IP 字面量直接返回，不查上游 —— 上游查询本身可能经 WARP 走，没必要绕一圈。
     pub async fn resolve(self: &Arc<Self>, host: &str, ecs: Option<IpAddr>) -> Result<Vec<IpAddr>> {
         if let Ok(ip) = IpAddr::from_str(host) {
             debug!("host is an IP address: {}, no lookup needed", ip);

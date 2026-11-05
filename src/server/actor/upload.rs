@@ -41,7 +41,6 @@ pub struct UploadActor {
     phase: UploadPhase,
     upstream: Option<UpstreamWrite>,
     last_activity: Instant,
-    /// 复用的一次性写批次，避免每次补齐空档都分配
     run_buf: Vec<Bytes>,
 }
 
@@ -118,8 +117,6 @@ impl UploadActor {
                     return false;
                 }
                 if seq == *next_seq {
-                    // 「刚到的这一帧 + 重排序缓冲里紧随其后的连续帧」合成一段，
-                    // 用向量写一次吐出去：补齐空档时原来是每帧一次系统调用。
                     let mut head = data;
                     loop {
                         self.run_buf.clear();
@@ -247,7 +244,6 @@ impl UploadActor {
     }
 }
 
-/// 把一段连续帧写进上游。返回 `false` 表示写失败/超时，调用方需要收尾。
 async fn write_run(upstream: &mut Option<UpstreamWrite>, frames: &[Bytes]) -> bool {
     let Some(upstream) = upstream.as_mut() else {
         return false;
@@ -472,7 +468,6 @@ mod tests {
         handle.await.unwrap();
     }
 
-    /// 一次补齐跨越多次向量写的大空档：帧顺序必须完全保持。
     #[tokio::test]
     async fn large_gap_fill_keeps_order_across_write_runs() {
         let (mut client_read, server_write) = tcp_pair().await;
@@ -481,7 +476,6 @@ mod tests {
         let actor = UploadActor::new(rx, server_write, 0);
         let handle = tokio::spawn(async move { actor.run().await });
 
-        // 先发 1..total，最后补上 0：一次补齐整段，超过单次向量写上限
         for seq in 1..total as u64 {
             tx.send(UploadCmd::Frame {
                 seq,

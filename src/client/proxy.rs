@@ -4,23 +4,15 @@ use http::uri::Authority;
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-/// 头部解析上限，同时也是缓冲区允许增长的上限。
 const MAX_HEADER_LEN: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
-/// 每次读之前先保证有这么多空闲容量：`AsyncReadExt::read_buf` 在缓冲区剩余
-/// 可变容量为 0 时会直接返回 0（看起来像对端关闭），必须提前 reserve。
 const READ_RESERVE: usize = 4 * 1024;
-/// `HTTP/1.1` 走的是 8 字节，留出余量给少见版本号，超出则直接拒绝。
 const MAX_VERSION_LEN: usize = 16;
 
-/// 解析完成的一个代理请求。
 pub struct ProxyRequest {
     pub method: String,
-    /// 请求头（含空行）在缓冲区中的长度。
     pub header_len: usize,
-    /// CONNECT 的 authority，或普通请求的绝对 URI。
     pub target: String,
-    /// 代理认证是否通过（未开启认证时恒为 true）。
     pub authorized: bool,
 }
 
@@ -30,8 +22,6 @@ pub async fn parse_proxy_request(
     expected_auth: Option<&str>,
 ) -> Result<ProxyRequest> {
     loop {
-        // 先解析已缓冲的数据：认证失败重试时下一个请求往往已经在缓冲区里，
-        // 先读会白白阻塞到客户端再发一次。
         if let Some(request) = try_parse_head(buffer, expected_auth)? {
             return Ok(request);
         }
@@ -46,7 +36,6 @@ pub async fn parse_proxy_request(
     }
 }
 
-/// 尝试解析已缓冲的请求头；数据还不完整时返回 `Ok(None)`。
 fn try_parse_head(buffer: &BytesMut, expected_auth: Option<&str>) -> Result<Option<ProxyRequest>> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut headers);
@@ -69,7 +58,6 @@ fn try_parse_head(buffer: &BytesMut, expected_auth: Option<&str>) -> Result<Opti
     }
 }
 
-/// 直接在字节层面比对 `Proxy-Authorization`，避免为每个请求分配一个 String。
 fn auth_matches(headers: &[httparse::Header<'_>], expected: &str) -> bool {
     let Some(header) = headers
         .iter()
@@ -115,9 +103,6 @@ fn resolve_connect_host(authority: &str) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-/// 从绝对 URI 中提取 origin-form（`/path?query`）。
-///
-/// 请求行里的 fragment 按 RFC 7230 不应转发给上游，这里直接丢弃。
 fn origin_form(url: &Url) -> String {
     let path = url.path();
     let query_len = url.query().map_or(0, |q| q.len() + 1);
@@ -134,9 +119,6 @@ fn origin_form(url: &Url) -> String {
     s
 }
 
-/// 解析一次请求目标，同时得到上游 `host:port` 和需要写回请求行的 origin-form。
-///
-/// 非 CONNECT 请求只做一次 `Url::parse`，避免“解析目标 + 重写请求行”各解析一遍。
 pub fn resolve_request(method: &str, target: &str) -> Result<(String, Option<String>)> {
     if method == "CONNECT" {
         return Ok((resolve_connect_host(target)?, None));
@@ -152,7 +134,6 @@ pub fn resolve_target_host(method: &str, url_str: &str) -> Result<String> {
     resolve_request(method, url_str).map(|(host, _)| host)
 }
 
-/// 就地把请求行改写成 origin-form，不产生临时 `String`。
 pub fn rewrite_request_line(
     buf: &mut BytesMut,
     header_len: usize,
@@ -179,8 +160,6 @@ pub fn rewrite_request_line(
     version_buf[..version_bytes.len()].copy_from_slice(version_bytes);
     let version = &version_buf[..version_bytes.len()];
 
-    // origin-form 一定是绝对 URI 的子串，所以新请求行不会比旧的长；
-    // 此时把尾部整体前移即可，避免 split_off/unsplit 拷贝整个头部和 body。
     let new_line_len = method.len() + 1 + origin_path.len() + 1 + version.len() + 2;
     if new_line_len <= old_line_len {
         let total = buf.len();
@@ -191,7 +170,6 @@ pub fn rewrite_request_line(
         return Ok(());
     }
 
-    // 兜底路径：URL 被规范化后变长时走原来的拼接方式
     let mut new_line = Vec::with_capacity(new_line_len);
     new_line.extend_from_slice(method.as_bytes());
     new_line.push(b' ');
@@ -403,7 +381,6 @@ mod tests {
             .unwrap();
         assert!(!req.authorized);
 
-        // 未开启认证时不需要头
         let mut buf = BytesMut::new();
         let mut reader = &bad[..];
         let req = parse_proxy_request(&mut reader, &mut buf, None)
@@ -415,7 +392,6 @@ mod tests {
     #[tokio::test]
     async fn parse_proxy_request_handles_split_reads() {
         use bytes::BytesMut;
-        // 一次只吐 8 字节的读取器，模拟头部跨多次 read 到达
         struct Choppy(Vec<u8>, usize);
         impl tokio::io::AsyncRead for Choppy {
             fn poll_read(

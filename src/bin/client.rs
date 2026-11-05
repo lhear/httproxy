@@ -10,7 +10,6 @@ use tracing::{Instrument, debug, error_span, info, warn};
 
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
-/// accept 出现非瞬态错误（如 fd 耗尽）后的退避时间，避免 CPU 空转。
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Parser, Debug)]
@@ -60,7 +59,6 @@ async fn main() -> anyhow::Result<()> {
 
     let conn_sem = Arc::new(Semaphore::new(state.max_connections));
 
-    // [[redirect]]：本地端口转发，与 HTTP 代理入站共用同一个连接数上限
     for rule in httproxy::client::redirect::RedirectRule::parse_all(&config.redirect)? {
         httproxy::client::redirect::spawn(
             rule,
@@ -75,8 +73,6 @@ async fn main() -> anyhow::Result<()> {
         let (socket, peer) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                // EMFILE / ENFILE 这类资源耗尽会让 accept 立刻再次失败，
-                // 无条件 continue 会变成 100% CPU 的忙等，必须退让一下。
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::ConnectionAborted

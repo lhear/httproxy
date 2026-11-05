@@ -20,11 +20,6 @@ use crate::server::stream_registry::StreamRegistry;
 use crate::server::upstream::{UpstreamRead, UpstreamWrite};
 use crate::shaper::{FrameCipher, ResolvedShaperConfig, TrafficShaper};
 
-/// 隧道控制面命令。
-///
-/// 上传数据帧不从这里过：请求处理器拿着 `SessionHandle::upload_tx` 直接投递给
-/// `UploadActor`，少一次 channel 跳转和一次任务唤醒，也避免隧道 actor 成为
-/// 同一条流上所有并发上传 POST 的串行瓶颈。
 pub enum TunnelCmd {
     Continue {
         reply: oneshot::Sender<Option<SegmentStream>>,
@@ -41,29 +36,23 @@ enum Phase {
 }
 
 type ShaperStream = Pin<Box<TrafficShaper<UpstreamRead>>>;
-/// shaper 的交接槽：同一时刻只有一个下载段持有 shaper。
 type ShaperSlot = Arc<StdMutex<Option<ShaperStream>>>;
 
-/// 一段下载响应体：直接由 hyper 从 shaper 拉取，不再经过"额外任务 + 每帧 mpsc 投递"。
 pub type SegmentStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 #[inline]
 fn slot_lock(slot: &ShaperSlot) -> MutexGuard<'_, Option<ShaperStream>> {
-    // 槽位只做"取/放"，临界区里不会 panic；中毒就直接取回内部值
     slot.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 一段下载：持有 shaper，按 `max_bytes` 停下来把 shaper 还给槽位。
 struct Segment {
     slot: ShaperSlot,
     shaper: Option<ShaperStream>,
     sent: u64,
     max_bytes: Option<u64>,
     activity: Arc<AtomicU64>,
-    /// 本段结束（正常/异常/被丢弃）时通知隧道 actor
     done_tx: Option<mpsc::Sender<()>>,
     cancelled: Arc<AtomicBool>,
-    /// 到达 `max_bytes`：shaper 要还给下一段，而不是丢弃
     pause_on_drop: bool,
     ended: bool,
 }
@@ -102,7 +91,6 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        // 先把 shaper 交还，再通知 actor，保证 actor 看到的是一个自洽的槽位
         self.release();
         if let Some(tx) = self.done_tx.take() {
             let _ = tx.try_send(());
@@ -156,7 +144,6 @@ pub struct TunnelActor {
     upload_tx: Option<mpsc::Sender<UploadCmd>>,
     upload_handle: Option<tokio::task::JoinHandle<()>>,
     shaper_slot: Option<ShaperSlot>,
-    /// 是否有一段响应体正被 hyper 拉取（shaper 被它持有）
     segment_active: bool,
     pending_continue: Vec<oneshot::Sender<Option<SegmentStream>>>,
     segment_done_tx: mpsc::Sender<()>,
@@ -232,7 +219,6 @@ impl TunnelActor {
         self.phase = Phase::Active;
     }
 
-    /// 取出一段可以直接交给 hyper 的响应体；槽位为空（上游已结束）时返回 `None`。
     pub fn take_segment(&mut self) -> Option<SegmentStream> {
         let slot = Arc::clone(self.shaper_slot.as_ref()?);
         let segment = Segment::new(
@@ -277,7 +263,6 @@ impl TunnelActor {
                         break;
                     }
                     self.segment_active = false;
-                    // 本段结束：shaper 还在槽位里说明只是到达轮转阈值，可以继续
                     let alive = self.shaper_alive();
                     if alive {
                         self.phase = Phase::Rotating;
@@ -332,7 +317,6 @@ impl TunnelActor {
             .is_some_and(|slot| slot_lock(slot).is_some())
     }
 
-    /// 把排队中的 `Continue` 尽量都兑现。
     fn serve_pending_continue(&mut self, alive: bool) {
         let pending = std::mem::take(&mut self.pending_continue);
         for reply in pending {
@@ -340,7 +324,6 @@ impl TunnelActor {
                 let _ = reply.send(None);
                 continue;
             }
-            // 请求方可能已经放弃（预取超时/连接断开），别为它把 shaper 取出来
             if reply.is_closed() {
                 continue;
             }
@@ -376,7 +359,6 @@ impl TunnelActor {
                     }
                 }
                 Phase::Active if self.segment_active => {
-                    // 预取提前到达：等本段结束后再兑现
                     self.pending_continue.push(reply);
                 }
                 _ => {
@@ -390,7 +372,6 @@ impl TunnelActor {
     async fn cleanup(&mut self) {
         self.phase = Phase::Closed;
         self.consume_stream();
-        // 让仍在被 hyper 拉取的段立刻收尾
         self.cancelled.store(true, Ordering::Release);
         if let Some(slot) = self.shaper_slot.take() {
             slot_lock(&slot).take();
@@ -461,7 +442,6 @@ mod tests {
         )
     }
 
-    /// 把一段响应体读干净，返回收到的字节数。
     async fn drain_segment(mut segment: SegmentStream) -> usize {
         let mut total = 0;
         while let Some(item) = segment.next().await {
@@ -470,7 +450,6 @@ mod tests {
         total
     }
 
-    /// 只取第一块数据（段还没到轮转阈值时不能读到结束）。
     async fn first_chunk_len(segment: &mut SegmentStream) -> usize {
         match segment.next().await {
             Some(Ok(data)) => data.len(),
@@ -501,7 +480,6 @@ mod tests {
             "first segment must stop at the limit, got {sent}"
         );
 
-        // 到达阈值后 shaper 应该还在，Continue 能接着开下一段
         let (reply_tx, reply_rx) = oneshot::channel();
         cmd_tx
             .send(TunnelCmd::Continue { reply: reply_tx })
@@ -533,7 +511,6 @@ mod tests {
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
 
-        // 本段还在读的时候就来 Continue（预取），应该被排队
         let (reply_tx, reply_rx) = oneshot::channel();
         cmd_tx
             .send(TunnelCmd::Continue { reply: reply_tx })
@@ -645,7 +622,6 @@ mod tests {
 
         upstream_write.write_all(&[0u8; 100]).await.unwrap();
         tokio::task::yield_now().await;
-        // 模拟客户端中断：直接丢掉响应体
         drop(segment);
 
         tokio::time::timeout(std::time::Duration::from_secs(5), handle)

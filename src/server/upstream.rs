@@ -1,9 +1,3 @@
-//! 出站连接抽象。
-//!
-//! 服务端有两种上游：直连的 `TcpStream`，以及走 Cloudflare WARP 的 MASQUE
-//! CONNECT 流。隧道 actor 只关心「可读的字节流」和「可写的字节流」，所以这里
-//! 用两个枚举把差异收住，避免把 `Box<dyn AsyncWrite>` 引入热路径。
-
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -66,10 +60,6 @@ pub(crate) enum UpstreamWrite {
 }
 
 impl UpstreamWrite {
-    /// 把一段连续帧写进上游。
-    ///
-    /// TCP 走 `write_vectored`（一次系统调用写多帧）；WARP 走 `write_all_chunks`
-    /// （`Bytes` 直接挂到 QUIC 流上，不拷贝载荷）。
     pub async fn write_frames(&mut self, frames: &[Bytes]) -> io::Result<()> {
         match self {
             UpstreamWrite::Direct(write) => write_tcp_frames(write, frames).await,
@@ -77,7 +67,6 @@ impl UpstreamWrite {
         }
     }
 
-    /// 半关闭：让对端看到 EOF。
     pub async fn shutdown(&mut self) -> io::Result<()> {
         match self {
             UpstreamWrite::Direct(write) => write.shutdown().await,
@@ -94,13 +83,11 @@ impl From<OwnedWriteHalf> for UpstreamWrite {
 
 async fn write_tcp_frames(write: &mut OwnedWriteHalf, frames: &[Bytes]) -> io::Result<()> {
     if frames.len() == 1 {
-        // 单帧是常态，走普通 write，省掉 iov 装配
         return write.write_all(&frames[0]).await;
     }
     write_vectored_all(write, frames).await
 }
 
-/// 一段连续帧一次系统调用写出去；部分写时按帧/帧内偏移推进。
 async fn write_vectored_all(write: &mut OwnedWriteHalf, frames: &[Bytes]) -> io::Result<()> {
     use std::io::IoSlice;
 

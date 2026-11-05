@@ -1,11 +1,3 @@
-//! 可选的服务端 WARP 出站（MASQUE / Cloudflare WARP）。
-//!
-//! 打开后，所有**非私网**目标的出站 TCP 连接都会先落到 Cloudflare WARP，
-//! 再从 WARP 侧发起；私网地址、回环地址等仍然直连，避免把内网访问绕出公网。
-//!
-//! 没有可用凭据时会自动向 Cloudflare 注册一台 MASQUE 设备，并把结果写进
-//! `warp.json`（路径可配），后续启动直接复用。
-
 pub(crate) mod h3;
 pub(crate) mod masque;
 pub(crate) mod register;
@@ -23,64 +15,44 @@ use tracing::{debug, info, warn};
 
 use masque::{MasqueConfig, MasqueConn, MasqueStream};
 
-/// MASQUE 端点的 SNI。注意与 `CONNECT-IP` 模式
-/// (`consumer-masque.cloudflareclient.com`) 不同：L4 TCP 转发走的是 `-proxy`
-/// 这一套。
 const DEFAULT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 const DEFAULT_PORT: u16 = 443;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(25);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// 注册响应里没有端点地址时的兜底值
 const FALLBACK_ENDPOINT: &str = "162.159.192.1";
 
-/// 服务端 `[warp]` 配置。
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct WarpSection {
-    /// 设为 false 等同于不写这一段
     #[serde(default = "yes")]
     pub enabled: bool,
-    /// 凭据文件路径，缺省 `./warp.json`；文件不存在时自动注册
     #[serde(default)]
     pub config_path: Option<String>,
-    /// 覆盖注册响应里的 WARP 端点地址（IPv4）
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// 覆盖注册响应里的 WARP 端点地址（IPv6）
     #[serde(default)]
     pub endpoint_v6: Option<String>,
-    /// 端点端口，缺省 443
     #[serde(default)]
     pub port: Option<u16>,
-    /// 覆盖 SNI
     #[serde(default)]
     pub sni: Option<String>,
-    /// 建立 QUIC 连接的超时（秒）
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
-    /// QUIC keepalive 间隔（秒），用于在 NAT 上保活
     #[serde(default)]
     pub keepalive_secs: Option<u64>,
-    /// QUIC 空闲超时（秒）
     #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
-    /// 注册时上报的设备型号 / 语言
     #[serde(default)]
     pub register_model: Option<String>,
     #[serde(default)]
     pub register_locale: Option<String>,
-    /// 关闭端点证书钉扎（仅排障用，会接受任意服务端证书）
     #[serde(default)]
     pub insecure_skip_verify: bool,
-    /// 私网 / 回环 / 链路本地地址直连（默认开启）
     #[serde(default = "yes")]
     pub bypass_private: bool,
-    /// 额外需要直连的网段
     #[serde(default)]
     pub bypass_cidrs: Vec<String>,
-    /// 需要直连的域名后缀（例如 `corp.local`）。内网域名无法在 WARP 侧解析，
-    /// 这类目标必须在本地出网。
     #[serde(default)]
     pub bypass_suffixes: Vec<String>,
 }
@@ -89,7 +61,6 @@ fn yes() -> bool {
     true
 }
 
-/// 运行时状态：一条共享的 QUIC 连接 + 一条复用的设备凭据。
 pub struct WarpClient {
     endpoint: quinn::Endpoint,
     masque: MasqueConfig,
@@ -99,7 +70,6 @@ pub struct WarpClient {
 }
 
 impl WarpClient {
-    /// 按配置初始化：必要时自动注册，然后建好 QUIC 端点。
     pub async fn init(section: &WarpSection) -> Result<Arc<Self>> {
         let path = section
             .config_path
@@ -177,19 +147,14 @@ impl WarpClient {
         }))
     }
 
-    /// 这个地址是否应该绕过 WARP 直连。
     pub(crate) fn is_direct_ip(&self, ip: IpAddr) -> bool {
         self.bypass.contains(ip)
     }
 
-    /// 这个域名是否被配置成直连（`localhost` 或 `bypass_suffixes`）。
     pub(crate) fn is_direct_name(&self, host: &str) -> bool {
         self.bypass.name_is_direct(host)
     }
 
-    /// 在 WARP 上打开一条到 `ip:port` 的 TCP 隧道。
-    ///
-    /// 只接受 IP：域名必须先由 DNS 模块解析，不能让 WARP 去解析。
     pub(crate) async fn dial(&self, ip: IpAddr, port: u16) -> Result<MasqueStream> {
         let authority = authority(ip, port);
         let mut last_error = None;
@@ -210,8 +175,6 @@ impl WarpClient {
                         "warp: CONNECT failed"
                     );
                     last_error = Some(e);
-                    // 只有连接已经失效才值得换一条重试；被网关明确拒绝
-                    // （4xx）时重连不会有不同的结果
                     if !stale {
                         break;
                     }
@@ -221,7 +184,6 @@ impl WarpClient {
         Err(last_error.unwrap_or_else(|| anyhow!("warp: CONNECT failed")))
     }
 
-    /// 取一条可用连接，必要时重新握手。
     async fn connection(&self) -> Result<Arc<MasqueConn>> {
         if let Some(conn) = self.cached.read().await.as_ref()
             && conn.is_usable()
@@ -229,7 +191,6 @@ impl WarpClient {
             return Ok(Arc::clone(conn));
         }
 
-        // 同一时刻只允许一个握手，避免连接抖动时打出成批的 QUIC 握手
         let _guard = self.establishing.lock().await;
         if let Some(conn) = self.cached.read().await.as_ref()
             && conn.is_usable()
@@ -255,8 +216,6 @@ impl WarpClient {
 }
 
 fn resolve_endpoint(section: &WarpSection, creds: &register::WarpCredentials) -> Result<IpAddr> {
-    // 显式配置 > 注册响应的 IPv4 > 注册响应的 IPv6 > 兜底。
-    // 默认走 IPv4：注册响应基本总会带 IPv6 端点，但主机未必有 IPv6 出口。
     let raw = section
         .endpoint_v6
         .as_deref()
@@ -270,7 +229,6 @@ fn resolve_endpoint(section: &WarpSection, creds: &register::WarpCredentials) ->
     IpAddr::from_str(trimmed).with_context(|| format!("warp: invalid endpoint address `{raw}`"))
 }
 
-/// `ip:port`，IPv6 补上方括号。
 fn authority(ip: IpAddr, port: u16) -> String {
     match ip {
         IpAddr::V4(v4) => format!("{v4}:{port}"),
@@ -281,7 +239,6 @@ fn authority(ip: IpAddr, port: u16) -> String {
 struct Bypass {
     private: bool,
     networks: Vec<ip_network::IpNetwork>,
-    /// 小写、不带前导点
     suffixes: Vec<String>,
 }
 
@@ -351,7 +308,6 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_multicast()
         || ip.is_documentation()
-        // 100.64.0.0/10 —— 运营商级 NAT
         || (octets[0] == 100 && (64..128).contains(&octets[1]))
 }
 
@@ -370,7 +326,6 @@ mod tests {
         }
     }
 
-    /// 与 `connect_upstream` 一致的判定：IP 看网段，域名只看后缀。
     fn direct(b: &Bypass, host: &str) -> bool {
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         match IpAddr::from_str(bare) {
@@ -504,14 +459,12 @@ mod tests {
             "162.159.192.9".parse::<IpAddr>().unwrap()
         );
 
-        // 注册响应同时带 v4/v6 时默认走 v4（主机不一定有 IPv6 出口）
         let c = creds("162.159.192.7", "2606:4700:d0::1");
         assert_eq!(
             resolve_endpoint(&section(), &c).unwrap(),
             "162.159.192.7".parse::<IpAddr>().unwrap()
         );
 
-        // 显式配置 v6 时优先 v6
         let explicit_v6 = WarpSection {
             endpoint_v6: Some("2606:4700:d0::9".into()),
             ..section()
@@ -521,7 +474,6 @@ mod tests {
             "2606:4700:d0::9".parse::<IpAddr>().unwrap()
         );
 
-        // 全空时兜底
         let c = creds("", "");
         assert_eq!(
             resolve_endpoint(&section(), &c).unwrap(),

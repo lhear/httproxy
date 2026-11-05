@@ -10,15 +10,8 @@ use crate::dns::DnsClient;
 use crate::server::upstream::Upstream;
 use crate::warp::WarpClient;
 
-/// 一个域名最多尝试几个解析结果，避免在黑洞地址上耗掉整个连接超时。
 const MAX_ADDRESS_ATTEMPTS: usize = 4;
 
-/// 建立到 `host:port` 的上游连接。
-///
-/// 启用 WARP 后，域名**必须先由 DNS 模块解析成 IP 再交给 WARP**：CONNECT 的
-/// `:authority` 始终是 IP 字面量，Cloudflare 侧不参与域名解析。解析结果里属于
-/// 私网的地址（以及命中 `bypass_suffixes` 的域名）仍然直连。没开 WARP 时保持
-/// 原有路径：DNS 模块解析 + Happy Eyeballs / SOCKS5 / 直连。
 pub(crate) async fn connect_upstream(
     warp: Option<&Arc<WarpClient>>,
     dns_client: Option<&Arc<DnsClient>>,
@@ -56,7 +49,6 @@ pub(crate) async fn connect_upstream(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no address to connect for {host}")))
 }
 
-/// 把目标解析成 IP：IP 字面量直接用，域名交给 DNS 模块。
 async fn resolve_target(
     dns_client: Option<&Arc<DnsClient>>,
     client_subnet: Option<IpAddr>,
@@ -65,7 +57,6 @@ async fn resolve_target(
     if let Ok(ip) = IpAddr::from_str(host) {
         return Ok(vec![ip]);
     }
-    // localhost 不需要（也不该）去问上游
     if host.eq_ignore_ascii_case("localhost") {
         return Ok(vec![
             IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -78,7 +69,6 @@ async fn resolve_target(
     dns.resolve(host, client_subnet).await
 }
 
-/// 直连一个已经解析好的地址（必要时经 SOCKS5）。
 async fn connect_ip(
     socks5_proxy: Option<&Arc<str>>,
     ip: IpAddr,
@@ -98,7 +88,6 @@ async fn connect_ip(
     Ok(stream)
 }
 
-/// 没有 WARP 时的老路径：DNS 模块解析 + Happy Eyeballs（或 SOCKS5 / 直连）。
 async fn connect_direct(
     dns_client: Option<&Arc<DnsClient>>,
     client_subnet: Option<IpAddr>,

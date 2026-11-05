@@ -1,8 +1,3 @@
-//! `[[redirect]]`：本地端口转发。
-//!
-//! 监听一个本地端口，把进来的原始 TCP 字节直接送进隧道，等价于 `ssh -L`。
-//! 与 HTTP 代理入站的区别只有一点：这里不做任何协议解析，连上来就建隧道。
-
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -15,14 +10,11 @@ use crate::client::connection::open_tunnel;
 use crate::client::state::SharedState;
 use crate::config::RedirectSection;
 
-/// accept 出现非瞬态错误（如 fd 耗尽）后的退避，避免 CPU 空转。
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// 校验通过的一条转发规则。
 #[derive(Clone, Debug)]
 pub struct RedirectRule {
     pub listen: SocketAddr,
-    /// 上游 `host:port`，原样作为隧道的目标地址
     pub target: String,
 }
 
@@ -63,8 +55,6 @@ impl RedirectRule {
     }
 }
 
-/// 绑定端口并开始接受连接，返回实际绑定的地址
-/// （`listen` 写成 `127.0.0.1:0` 时方便拿到系统分配的端口）。
 pub async fn spawn(
     rule: RedirectRule,
     http_client: Arc<wreq::Client>,
@@ -98,7 +88,6 @@ pub async fn spawn(
                 }
             };
 
-            // 与 HTTP 代理入站共享同一个连接数上限
             let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
@@ -144,7 +133,6 @@ async fn serve(
     socket.set_nodelay(true).ok();
     let (read_half, write_half) = socket.into_split();
     info!(target = %target, "redirect connection accepted");
-    // 没有首包：连接建立后隧道两端各自等数据
     open_tunnel(
         read_half,
         write_half,

@@ -17,9 +17,6 @@ use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// 客户端对外使用的浏览器指纹。
-///
-/// 集中在这里，升级指纹只需要改这一处（wreq-util 的 `Profile` 枚举）。
 pub fn chrome_emulation() -> wreq_util::Emulation {
     wreq_util::Emulation::builder()
         .profile(wreq_util::Profile::Chrome149)

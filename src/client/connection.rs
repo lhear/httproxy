@@ -14,10 +14,6 @@ use crate::client::{
     utils,
 };
 
-/// 建立一条到 `target_host` 的隧道，并把 `payload`（可能为空）作为首包发出去。
-///
-/// HTTP 代理入站（解析出 CONNECT/绝对 URI 之后）和 `[[redirect]]` 端口转发
-/// 共用这一条路径：差別只在于前者带着已读到的请求字节，后者什么都不带。
 pub(crate) async fn open_tunnel(
     read_half: OwnedReadHalf,
     write_half: OwnedWriteHalf,
@@ -133,7 +129,6 @@ pub async fn handle_connection_actor(
     actor.run().await
 }
 
-/// 直接连目标（bypass 命中时），双向原样搬运。
 async fn handle_bypass_direct(
     mut read_half: OwnedReadHalf,
     mut write_half: OwnedWriteHalf,
