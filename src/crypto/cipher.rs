@@ -1,8 +1,5 @@
-use aes_gcm::{
-    Aes256Gcm, Nonce, Tag,
-    aead::{AeadInOut, KeyInit},
-};
 use anyhow::{Result, anyhow};
+use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use rand::Rng;
 use std::io;
 use zeroize::Zeroizing;
@@ -11,7 +8,6 @@ use crate::shaper::FrameCipher;
 
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
-const EMPTY_AAD: &[u8] = b"";
 
 #[inline]
 fn random_nonce() -> [u8; NONCE_LEN] {
@@ -21,54 +17,62 @@ fn random_nonce() -> [u8; NONCE_LEN] {
 }
 
 #[inline]
-fn encrypt_with_cipher(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>> {
+fn make_key(key_z: &Zeroizing<[u8; 32]>) -> Result<LessSafeKey> {
+    let unbound =
+        UnboundKey::new(&AES_256_GCM, &**key_z).map_err(|_| anyhow!("invalid key length"))?;
+    Ok(LessSafeKey::new(unbound))
+}
+
+#[inline]
+fn encrypt_with_cipher(cipher: &LessSafeKey, plaintext: &[u8]) -> Result<Vec<u8>> {
     let nonce_bytes = random_nonce();
     let mut out = Vec::with_capacity(NONCE_LEN + plaintext.len() + TAG_LEN);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(plaintext);
 
     let tag = cipher
-        .encrypt_inout_detached(
-            &Nonce::from(nonce_bytes),
-            EMPTY_AAD,
-            (&mut out[NONCE_LEN..]).into(),
+        .seal_in_place_separate_tag(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::empty(),
+            &mut out[NONCE_LEN..],
         )
-        .map_err(|e| anyhow!("encryption error: {e}"))?;
+        .map_err(|_| anyhow!("encryption error"))?;
     out.extend_from_slice(tag.as_ref());
     Ok(out)
 }
 
 #[inline]
-fn decrypt_with_cipher(cipher: &Aes256Gcm, data: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_with_cipher(cipher: &LessSafeKey, data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < NONCE_LEN + TAG_LEN {
         return Err(anyhow!("ciphertext too short"));
     }
-    let ct_end = data.len() - TAG_LEN;
-    let mut plaintext = data[NONCE_LEN..ct_end].to_vec();
-    let nonce = Nonce::try_from(&data[..NONCE_LEN]).map_err(|_| anyhow!("invalid nonce length"))?;
-    let tag = Tag::try_from(&data[ct_end..]).map_err(|_| anyhow!("invalid tag length"))?;
+    let nonce = Nonce::try_assume_unique_for_key(&data[..NONCE_LEN])
+        .map_err(|_| anyhow!("invalid nonce length"))?;
 
-    cipher
-        .decrypt_inout_detached(&nonce, EMPTY_AAD, (&mut plaintext[..]).into(), &tag)
-        .map_err(|e| anyhow!("decryption error: {e}"))?;
+    let mut plaintext = data[NONCE_LEN..].to_vec();
+    let pt_len = cipher
+        .open_in_place(nonce, Aad::empty(), &mut plaintext[..])
+        .map_err(|_| anyhow!("decryption error"))?
+        .len();
+    plaintext.truncate(pt_len);
     Ok(plaintext)
 }
 
 #[inline]
 pub fn encrypt_bytes(key_z: &Zeroizing<[u8; 32]>, data: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(&**key_z).map_err(|_| anyhow!("invalid key length"))?;
+    let cipher = make_key(key_z)?;
     encrypt_with_cipher(&cipher, data)
 }
 
 #[inline]
 pub fn decrypt_bytes(key_z: &Zeroizing<[u8; 32]>, data: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(&**key_z).map_err(|_| anyhow!("invalid key length"))?;
+    let cipher = make_key(key_z)?;
     decrypt_with_cipher(&cipher, data)
 }
 
 pub struct AesFrameCipher {
     key: Zeroizing<[u8; 32]>,
-    cipher: Aes256Gcm,
+    cipher: LessSafeKey,
 }
 
 impl Clone for AesFrameCipher {
@@ -82,7 +86,7 @@ impl AesFrameCipher {
     #[inline]
     pub fn new(key_z: &Zeroizing<[u8; 32]>) -> Self {
         let key = Zeroizing::new(**key_z);
-        let cipher = Aes256Gcm::new_from_slice(&**key_z).expect("32 bytes is valid for Aes256Gcm");
+        let cipher = make_key(key_z).expect("32 bytes is valid for AES-256-GCM");
         Self { key, cipher }
     }
 }
@@ -107,12 +111,12 @@ impl FrameCipher for AesFrameCipher {
         out.extend_from_slice(data);
         let tag = self
             .cipher
-            .encrypt_inout_detached(
-                &Nonce::from(nonce_bytes),
-                EMPTY_AAD,
-                (&mut out[ct_start..]).into(),
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::empty(),
+                &mut out[ct_start..],
             )
-            .map_err(|e| io::Error::other(anyhow!("encryption error: {e}")))?;
+            .map_err(|_| io::Error::other("encryption error"))?;
         out.extend_from_slice(tag.as_ref());
         Ok(())
     }
@@ -125,16 +129,17 @@ impl FrameCipher for AesFrameCipher {
                 "ciphertext too short",
             ));
         }
-        let ct_end = data.len() - TAG_LEN;
-        let ct_len = ct_end - NONCE_LEN;
-        out.reserve(ct_len);
+        let nonce = Nonce::try_assume_unique_for_key(&data[..NONCE_LEN])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid nonce length"))?;
+        out.reserve(data.len() - NONCE_LEN);
         let pt_start = out.len();
-        out.extend_from_slice(&data[NONCE_LEN..ct_end]);
-        let nonce = Nonce::try_from(&data[..NONCE_LEN]).map_err(io::Error::other)?;
-        let tag = Tag::try_from(&data[ct_end..]).map_err(io::Error::other)?;
-        self.cipher
-            .decrypt_inout_detached(&nonce, EMPTY_AAD, (&mut out[pt_start..]).into(), &tag)
-            .map_err(|e| io::Error::other(anyhow!("decryption error: {e}")))?;
+        out.extend_from_slice(&data[NONCE_LEN..]);
+        let pt_len = self
+            .cipher
+            .open_in_place(nonce, Aad::empty(), &mut out[pt_start..])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decryption error"))?
+            .len();
+        out.truncate(pt_start + pt_len);
         Ok(())
     }
 
@@ -149,12 +154,12 @@ impl FrameCipher for AesFrameCipher {
         out[nonce_start..ct_start].copy_from_slice(&nonce_bytes);
         let tag = self
             .cipher
-            .encrypt_inout_detached(
-                &Nonce::from(nonce_bytes),
-                EMPTY_AAD,
-                (&mut out[ct_start..]).into(),
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::empty(),
+                &mut out[ct_start..],
             )
-            .map_err(|e| io::Error::other(anyhow!("encryption error: {e}")))?;
+            .map_err(|_| io::Error::other("encryption error"))?;
         out.extend_from_slice(tag.as_ref());
         Ok(())
     }
@@ -211,5 +216,20 @@ mod tests {
         let c2 = AesFrameCipher::new(&key2);
         let ct = c1.encrypt(b"secret data").unwrap();
         assert!(c2.decrypt(&ct).is_err());
+    }
+
+    #[test]
+    fn encrypt_into_matches_encrypt() {
+        let key = random_key();
+        let cipher = AesFrameCipher::new(&key);
+        let plain = b"in-place frame payload";
+
+        let mut out = bytes::BytesMut::new();
+        cipher.encrypt_into(plain, &mut out).unwrap();
+        assert_eq!(out.len(), NONCE_LEN + plain.len() + TAG_LEN);
+
+        let mut pt = bytes::BytesMut::new();
+        cipher.decrypt_into(&out, &mut pt).unwrap();
+        assert_eq!(&pt[..], plain);
     }
 }

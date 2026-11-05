@@ -12,8 +12,6 @@ pub use keys::{
     private_key_to_b64, public_key_to_b64,
 };
 
-pub type AesKey = aes_gcm::Key<aes_gcm::Aes256Gcm>;
-
 pub type ConnectionKeys = (
     zeroize::Zeroizing<[u8; 32]>,
     zeroize::Zeroizing<[u8; 32]>,

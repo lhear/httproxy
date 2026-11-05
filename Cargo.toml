@@ -20,8 +20,8 @@ panic = "abort"
 strip = true
 
 [dependencies]
-aes-gcm = "0.11.0"
 anyhow = "1.0.104"
+aws-lc-rs = "1.19.0"
 axum = {version = "0.8.9", features = ["http2", "macros"]}
 base122-fast = "0.1.5"
 base64 = "0.23.1"
