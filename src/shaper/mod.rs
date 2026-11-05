@@ -401,14 +401,12 @@ pub fn encode_frame(
 
 #[derive(Debug)]
 pub enum DecodedFrame {
-    InScratch { seq: u64, start: usize, end: usize },
     InJsonScratch { seq: u64, start: usize, end: usize },
     Owned { seq: u64, data: Bytes },
 }
 
 pub fn decode_frame(
     src: &mut BytesMut,
-    scratch: &mut BytesMut,
     json_scratch: &mut Vec<u8>,
     cipher: Option<&dyn FrameCipher>,
     encoding: EncodingType,
@@ -430,18 +428,19 @@ pub fn decode_frame(
                 return Ok(None);
             }
             src.advance(2);
-            let view = src.split_to(frame_len);
+            let mut view = src.split_to(frame_len);
 
-            if let Some(c) = cipher {
-                scratch.clear();
-                c.decrypt_into(&view, scratch)?;
-                let (seq, start, end) = extract_frame_range(scratch)?;
-                Ok(Some(DecodedFrame::InScratch { seq, start, end }))
-            } else {
-                let (seq, start, end) = extract_frame_range(&view)?;
-                let data = view.freeze().slice(start..end);
-                Ok(Some(DecodedFrame::Owned { seq, data }))
-            }
+            let offset = match cipher {
+                Some(c) => {
+                    let range = c.decrypt_in_place(&mut view)?;
+                    range.start
+                }
+                None => 0,
+            };
+
+            let (seq, start, end) = extract_frame_range(&view[offset..])?;
+            let data = view.freeze().slice(offset + start..offset + end);
+            Ok(Some(DecodedFrame::Owned { seq, data }))
         }
 
         EncodingType::Json => {
@@ -500,13 +499,8 @@ pub fn decode_from_buffer(
     cipher: Option<&dyn FrameCipher>,
     encoding: EncodingType,
 ) -> Result<Option<(u64, Bytes)>, Error> {
-    let mut scratch = BytesMut::new();
     let mut json_scratch = Vec::new();
-    match decode_frame(src, &mut scratch, &mut json_scratch, cipher, encoding)? {
-        Some(DecodedFrame::InScratch { seq, start, end }) => {
-            let plain = scratch.split().freeze();
-            Ok(Some((seq, plain.slice(start..end))))
-        }
+    match decode_frame(src, &mut json_scratch, cipher, encoding)? {
         Some(DecodedFrame::InJsonScratch { seq, start, end }) => {
             let plain = Bytes::from(std::mem::take(&mut json_scratch));
             Ok(Some((seq, plain.slice(start..end))))
@@ -824,16 +818,8 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u16(100u16);
         buf.put_u8(0xAA);
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
-        let result = decode_frame(
-            &mut buf,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Binary,
-        )
-        .unwrap();
+        let result = decode_frame(&mut buf, &mut json_scratch, None, EncodingType::Binary).unwrap();
         assert!(result.is_none());
     }
 
@@ -842,15 +828,8 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u16((MAX_RAW_PAYLOAD + 1000) as u16);
         buf.resize(2 + MAX_RAW_PAYLOAD + 1000, 0u8);
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
-        let result = decode_frame(
-            &mut buf,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Binary,
-        );
+        let result = decode_frame(&mut buf, &mut json_scratch, None, EncodingType::Binary);
         assert!(result.is_err());
     }
 
@@ -903,17 +882,10 @@ mod tests {
         let data = b"plain payload";
         let frame = encode_frame(data, 9, None, 16384, [0, 0], EncodingType::Binary).unwrap();
         let mut src = BytesMut::from(&frame[..]);
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
-        match decode_frame(
-            &mut src,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Binary,
-        )
-        .unwrap()
-        .unwrap()
+        match decode_frame(&mut src, &mut json_scratch, None, EncodingType::Binary)
+            .unwrap()
+            .unwrap()
         {
             DecodedFrame::Owned { seq, data } => {
                 assert_eq!(seq, 9);
@@ -925,7 +897,34 @@ mod tests {
     }
 
     #[test]
-    fn decode_frame_cipher_into_scratch() {
+    fn decode_frame_binary_is_zero_copy() {
+        use crate::crypto::AesFrameCipher;
+        use zeroize::Zeroizing;
+
+        let cipher = AesFrameCipher::new(&Zeroizing::new([7u8; 32]));
+        let ciphers: [Option<&dyn FrameCipher>; 2] = [None, Some(&cipher)];
+        for c in ciphers {
+            let frame = encode_frame(b"payload", 0, c, 0, [0, 0], EncodingType::Binary).unwrap();
+            let mut src = BytesMut::from(&frame[..]);
+            let base = src.as_ptr() as usize;
+            let limit = base + src.capacity();
+            let mut json_scratch = Vec::new();
+            let Some(DecodedFrame::Owned { data, .. }) =
+                decode_frame(&mut src, &mut json_scratch, c, EncodingType::Binary).unwrap()
+            else {
+                panic!("expected Owned frame");
+            };
+            let start = data.as_ptr() as usize;
+            assert_eq!(&data[..], b"payload");
+            assert!(
+                start >= base && start + data.len() <= limit,
+                "decoded payload must alias the input buffer, not a copy"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_frame_cipher_in_place() {
         use crate::crypto::AesFrameCipher;
         use zeroize::Zeroizing;
 
@@ -943,11 +942,9 @@ mod tests {
         )
         .unwrap();
         let mut src = BytesMut::from(&frame[..]);
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         match decode_frame(
             &mut src,
-            &mut scratch,
             &mut json_scratch,
             Some(&cipher),
             EncodingType::Binary,
@@ -955,17 +952,17 @@ mod tests {
         .unwrap()
         .unwrap()
         {
-            DecodedFrame::InScratch { seq, start, end } => {
+            DecodedFrame::Owned { seq, data } => {
                 assert_eq!(seq, 42);
-                assert_eq!(&scratch[start..end], b"secret payload");
+                assert_eq!(&data[..], b"secret payload");
             }
-            _ => panic!("expected InScratch frame"),
+            _ => panic!("expected Owned frame"),
         }
         assert!(src.is_empty());
     }
 
     #[test]
-    fn decode_frame_scratch_reused_across_frames() {
+    fn decode_frame_cipher_multiple_frames() {
         use crate::crypto::AesFrameCipher;
         use zeroize::Zeroizing;
 
@@ -994,13 +991,11 @@ mod tests {
             combined.extend_from_slice(&frame);
         }
 
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut expected_seq = 0u64;
         while !combined.is_empty() {
             match decode_frame(
                 &mut combined,
-                &mut scratch,
                 &mut json_scratch,
                 Some(&cipher),
                 EncodingType::Binary,
@@ -1008,10 +1003,10 @@ mod tests {
             .unwrap()
             .unwrap()
             {
-                DecodedFrame::InScratch { seq, start, end } => {
+                DecodedFrame::Owned { seq, data } => {
                     assert_eq!(seq, expected_seq);
                     assert_eq!(
-                        &scratch[start..end],
+                        &data[..],
                         [
                             b"first".as_slice(),
                             b"second".as_slice(),
@@ -1020,7 +1015,7 @@ mod tests {
                     );
                     expected_seq += 1;
                 }
-                _ => panic!("expected InScratch frame"),
+                _ => panic!("expected Owned frame"),
             }
         }
         assert_eq!(expected_seq, 3);
@@ -1031,17 +1026,10 @@ mod tests {
         let frame =
             encode_frame(b"json payload", 3, None, 16384, [0, 0], EncodingType::Json).unwrap();
         let mut src = BytesMut::from(&frame[..]);
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
-        match decode_frame(
-            &mut src,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Json,
-        )
-        .unwrap()
-        .unwrap()
+        match decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json)
+            .unwrap()
+            .unwrap()
         {
             DecodedFrame::InJsonScratch { seq, start, end } => {
                 assert_eq!(seq, 3);
@@ -1060,20 +1048,13 @@ mod tests {
                 encode_frame(msg, i as u64, None, 16384, [0, 0], EncodingType::Json).unwrap();
             src.extend_from_slice(&frame);
         }
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut cap_after_first = 0usize;
         for i in 0..2u64 {
-            match decode_frame(
-                &mut src,
-                &mut scratch,
-                &mut json_scratch,
-                None,
-                EncodingType::Json,
-            )
-            .unwrap()
-            .unwrap()
+            match decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json)
+                .unwrap()
+                .unwrap()
             {
                 DecodedFrame::InJsonScratch { seq, start, end } => {
                     assert_eq!(seq, i);
@@ -1113,11 +1094,9 @@ mod tests {
         )
         .unwrap();
         let mut src = BytesMut::from(&frame[..]);
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         match decode_frame(
             &mut src,
-            &mut scratch,
             &mut json_scratch,
             Some(&cipher),
             EncodingType::Json,
@@ -1163,14 +1142,12 @@ mod tests {
             }
             assert!(frames >= 4, "expected multiple frames, got {frames}");
 
-            let mut scratch = BytesMut::new();
             let mut json_scratch = Vec::new();
             let mut decoded = Vec::new();
             let mut buf = out;
             while !buf.is_empty() {
                 match decode_frame(
                     &mut buf,
-                    &mut scratch,
                     &mut json_scratch,
                     cipher_for_decode.as_deref(),
                     EncodingType::Json,
@@ -1178,9 +1155,6 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 {
-                    DecodedFrame::InScratch { start, end, .. } => {
-                        decoded.extend_from_slice(&scratch[start..end]);
-                    }
                     DecodedFrame::InJsonScratch { start, end, .. } => {
                         decoded.extend_from_slice(&json_scratch[start..end]);
                     }
@@ -1217,20 +1191,13 @@ mod tests {
 
         assert_eq!(seqs, vec![0, 1, 2]);
 
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut frame_idx = 0usize;
         while !out.is_empty() {
-            match decode_frame(
-                &mut out,
-                &mut scratch,
-                &mut json_scratch,
-                None,
-                EncodingType::Binary,
-            )
-            .unwrap()
-            .unwrap()
+            match decode_frame(&mut out, &mut json_scratch, None, EncodingType::Binary)
+                .unwrap()
+                .unwrap()
             {
                 DecodedFrame::Owned { seq, data } => {
                     assert_eq!(seq, seqs[frame_idx]);
@@ -1258,11 +1225,9 @@ mod tests {
 
         let cipher_for_decode = Arc::clone(&cipher);
         let decode_append = |src: &mut BytesMut, out: &mut Vec<u8>| {
-            let mut scratch = BytesMut::new();
             let mut json_scratch = Vec::new();
             match decode_frame(
                 src,
-                &mut scratch,
                 &mut json_scratch,
                 Some(cipher_for_decode.as_ref()),
                 EncodingType::Binary,
@@ -1270,10 +1235,8 @@ mod tests {
             .unwrap()
             .unwrap()
             {
-                DecodedFrame::InScratch { start, end, .. } => {
-                    out.extend_from_slice(&scratch[start..end]);
-                }
-                _ => panic!("expected InScratch frame"),
+                DecodedFrame::Owned { data, .. } => out.extend_from_slice(&data),
+                _ => panic!("expected Owned frame"),
             }
         };
 
@@ -1332,14 +1295,12 @@ mod tests {
         let mut out = BytesMut::new();
         let seqs = seal_all(shaper, &mut out);
 
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut frame_idx = 0usize;
         while !out.is_empty() {
             match decode_frame(
                 &mut out,
-                &mut scratch,
                 &mut json_scratch,
                 Some(cipher_for_decode.as_ref()),
                 EncodingType::Binary,
@@ -1347,12 +1308,12 @@ mod tests {
             .unwrap()
             .unwrap()
             {
-                DecodedFrame::InScratch { seq, start, end } => {
+                DecodedFrame::Owned { seq, data } => {
                     assert_eq!(seq, seqs[frame_idx]);
                     frame_idx += 1;
-                    decoded.extend_from_slice(&scratch[start..end]);
+                    decoded.extend_from_slice(&data);
                 }
-                _ => panic!("expected InScratch frame"),
+                _ => panic!("expected Owned frame"),
             }
         }
         assert_eq!(decoded, data);
@@ -1398,20 +1359,12 @@ mod tests {
         let mut out = BytesMut::new();
         let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
         assert!(matches!(result, Ok(Some(42))));
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
-        let frame = decode_frame(
-            &mut out,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Binary,
-        )
-        .unwrap()
-        .expect("frame");
+        let frame = decode_frame(&mut out, &mut json_scratch, None, EncodingType::Binary)
+            .unwrap()
+            .expect("frame");
         match frame {
             DecodedFrame::Owned { seq, .. } => assert_eq!(seq, 42),
-            DecodedFrame::InScratch { seq, .. } => assert_eq!(seq, 42),
             DecodedFrame::InJsonScratch { seq, .. } => assert_eq!(seq, 42),
         }
     }
@@ -1491,7 +1444,6 @@ mod tests {
 
     #[test]
     fn decode_frame_json_rejects_malformed_lines() {
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::new();
 
@@ -1499,30 +1451,12 @@ mod tests {
             b"
 ",
         );
-        assert!(
-            decode_frame(
-                &mut src,
-                &mut scratch,
-                &mut json_scratch,
-                None,
-                EncodingType::Json
-            )
-            .is_err()
-        );
+        assert!(decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json).is_err());
 
         let mut long = BytesMut::new();
         long.extend_from_slice(b"{\"data\":\"");
         long.resize(MAX_JSON_LINE_LEN + 2, b'x');
-        assert!(
-            decode_frame(
-                &mut long,
-                &mut scratch,
-                &mut json_scratch,
-                None,
-                EncodingType::Json
-            )
-            .is_err()
-        );
+        assert!(decode_frame(&mut long, &mut json_scratch, None, EncodingType::Json).is_err());
 
         let mut unclosed = BytesMut::new();
         unclosed.extend_from_slice(b"{\"data\":\"abc");
@@ -1530,21 +1464,11 @@ mod tests {
             b"
 ",
         );
-        assert!(
-            decode_frame(
-                &mut unclosed,
-                &mut scratch,
-                &mut json_scratch,
-                None,
-                EncodingType::Json
-            )
-            .is_err()
-        );
+        assert!(decode_frame(&mut unclosed, &mut json_scratch, None, EncodingType::Json).is_err());
     }
 
     #[test]
     fn decode_frame_json_rejects_invalid_utf8() {
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::new();
         src.extend_from_slice(b"{\"data\":\"");
@@ -1553,15 +1477,6 @@ mod tests {
             b"\"}
 ",
         );
-        assert!(
-            decode_frame(
-                &mut src,
-                &mut scratch,
-                &mut json_scratch,
-                None,
-                EncodingType::Json
-            )
-            .is_err()
-        );
+        assert!(decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json).is_err());
     }
 }

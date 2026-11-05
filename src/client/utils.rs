@@ -215,24 +215,14 @@ mod tests {
             encode_initial_payload(&Bytes::from(data.clone()), usize::MAX, None, &cfg).unwrap();
         assert!(remaining.is_empty());
         let mut src = BytesMut::from(&body[..]);
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut count = 0u64;
-        while let Some(frame) = decode_frame(
-            &mut src,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Json,
-        )
-        .unwrap()
+        while let Some(frame) =
+            decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json).unwrap()
         {
             match frame {
                 DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
-                DecodedFrame::InScratch { start, end, .. } => {
-                    decoded.extend_from_slice(&scratch[start..end])
-                }
                 DecodedFrame::InJsonScratch { start, end, .. } => {
                     decoded.extend_from_slice(&json_scratch[start..end])
                 }

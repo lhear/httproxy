@@ -339,18 +339,11 @@ mod tests {
     }
 
     fn decode_all(received: &[u8]) -> Vec<u8> {
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::from(received);
         let mut decoded = Vec::new();
-        while let Some(frame) = decode_frame(
-            &mut src,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Binary,
-        )
-        .unwrap()
+        while let Some(frame) =
+            decode_frame(&mut src, &mut json_scratch, None, EncodingType::Binary).unwrap()
         {
             match frame {
                 DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
@@ -433,18 +426,11 @@ mod tests {
 
         let _ = stop_tx.send(());
         let received = collector.await.unwrap();
-        let mut scratch = BytesMut::new();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::from(&received[..]);
         let mut seqs = Vec::new();
-        while let Some(frame) = decode_frame(
-            &mut src,
-            &mut scratch,
-            &mut json_scratch,
-            None,
-            EncodingType::Binary,
-        )
-        .unwrap()
+        while let Some(frame) =
+            decode_frame(&mut src, &mut json_scratch, None, EncodingType::Binary).unwrap()
         {
             match frame {
                 DecodedFrame::Owned { seq, .. } => seqs.push(seq),

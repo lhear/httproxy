@@ -13,7 +13,6 @@ pin_project! {
         #[pin]
         inner: S,
         buf: BytesMut,
-        scratch: BytesMut,
         json_scratch: Vec<u8>,
         cipher: Option<Arc<dyn FrameCipher>>,
         encoding: EncodingType,
@@ -35,7 +34,6 @@ where
         Self {
             inner,
             buf: BytesMut::new(),
-            scratch: BytesMut::new(),
             json_scratch: Vec::new(),
             cipher,
             encoding,
@@ -57,19 +55,9 @@ where
         loop {
             let cipher_ref: Option<&dyn FrameCipher> =
                 this.cipher.as_ref().map(|c| c.as_ref() as &dyn FrameCipher);
-            match shaper::decode_frame(
-                this.buf,
-                this.scratch,
-                this.json_scratch,
-                cipher_ref,
-                *this.encoding,
-            ) {
+            match shaper::decode_frame(this.buf, this.json_scratch, cipher_ref, *this.encoding) {
                 Ok(Some(frame)) => {
                     let (seq, data) = match frame {
-                        DecodedFrame::InScratch { seq, start, end } => {
-                            let plain = this.scratch.split().freeze();
-                            (seq, plain.slice(start..end))
-                        }
                         DecodedFrame::InJsonScratch { seq, start, end } => {
                             let plain = Bytes::from(std::mem::take(this.json_scratch));
                             (seq, plain.slice(start..end))
@@ -105,10 +93,13 @@ where
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     if this.buf.is_empty() {
-                        *this.buf = match chunk.try_into_mut() {
-                            Ok(chunk_mut) => chunk_mut,
-                            Err(chunk) => BytesMut::from(&chunk[..]),
-                        };
+                        match chunk.try_into_mut() {
+                            Ok(chunk_mut) => *this.buf = chunk_mut,
+                            Err(chunk) => {
+                                this.buf.clear();
+                                this.buf.extend_from_slice(&chunk);
+                            }
+                        }
                     } else {
                         this.buf.extend_from_slice(&chunk);
                     }

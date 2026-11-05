@@ -49,7 +49,6 @@ pub struct DownloadLoopActor {
 
 struct DecodeBuffers {
     input: BytesMut,
-    scratch: BytesMut,
     json_scratch: Vec<u8>,
     pending: VecDeque<Bytes>,
     pending_bytes: usize,
@@ -59,7 +58,6 @@ impl DecodeBuffers {
     fn new() -> Self {
         Self {
             input: BytesMut::with_capacity(DECODE_BUF_CAPACITY),
-            scratch: BytesMut::new(),
             json_scratch: Vec::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
@@ -73,54 +71,43 @@ impl DecodeBuffers {
         encoding: EncodingType,
         expected_seq: &mut u64,
     ) -> Result<()> {
-        let mut src = if self.input.is_empty() {
+        if self.input.is_empty() {
             match chunk.try_into_mut() {
-                Ok(chunk_mut) => chunk_mut,
+                Ok(chunk_mut) => self.input = chunk_mut,
                 Err(chunk) => {
+                    self.input.clear();
                     self.input.extend_from_slice(&chunk);
-                    std::mem::take(&mut self.input)
                 }
             }
         } else {
             self.input.extend_from_slice(&chunk);
-            std::mem::take(&mut self.input)
-        };
-
-        while let Some(frame) = shaper::decode_frame(
-            &mut src,
-            &mut self.scratch,
-            &mut self.json_scratch,
-            cipher,
-            encoding,
-        )? {
-            self.push_frame(frame, expected_seq)?;
         }
 
-        self.input = src;
-        Ok(())
-    }
+        let Self {
+            input,
+            json_scratch,
+            pending,
+            pending_bytes,
+            ..
+        } = self;
 
-    #[inline]
-    fn push_frame(&mut self, frame: DecodedFrame, expected_seq: &mut u64) -> Result<()> {
-        let (seq, data) = match frame {
-            DecodedFrame::Owned { seq, data } => (seq, data),
-            DecodedFrame::InScratch { seq, start, end } => {
-                let plain = std::mem::replace(&mut self.scratch, BytesMut::new());
-                (seq, plain.freeze().slice(start..end))
+        while let Some(frame) = shaper::decode_frame(input, json_scratch, cipher, encoding)? {
+            let (seq, data) = match frame {
+                DecodedFrame::Owned { seq, data } => (seq, data),
+                DecodedFrame::InJsonScratch { seq, start, end } => {
+                    let plain = Bytes::from(std::mem::take(json_scratch));
+                    (seq, plain.slice(start..end))
+                }
+            };
+            if seq != *expected_seq {
+                return Err(anyhow!(
+                    "download frame seq {seq} out of order, expected {expected_seq}"
+                ));
             }
-            DecodedFrame::InJsonScratch { seq, start, end } => {
-                let plain = std::mem::take(&mut self.json_scratch);
-                (seq, Bytes::from(plain).slice(start..end))
-            }
-        };
-        if seq != *expected_seq {
-            return Err(anyhow!(
-                "download frame seq {seq} out of order, expected {expected_seq}"
-            ));
+            *expected_seq += 1;
+            *pending_bytes += data.len();
+            pending.push_back(data);
         }
-        *expected_seq += 1;
-        self.pending_bytes += data.len();
-        self.pending.push_back(data);
         Ok(())
     }
 
@@ -557,7 +544,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(queued(&bufs), plain);
-        assert!(bufs.scratch.is_empty());
+        assert!(bufs.input.is_empty());
     }
 
     #[test]
