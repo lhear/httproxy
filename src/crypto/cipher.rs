@@ -164,7 +164,7 @@ impl FrameCipher for AesFrameCipher {
     #[inline]
     fn seal_in_place(
         &self,
-        out: &mut bytes::BytesMut,
+        out: &mut Vec<u8>,
         nonce_start: usize,
         ct_start: usize,
     ) -> io::Result<()> {

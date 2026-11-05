@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use rand::RngExt;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -54,7 +54,7 @@ pub fn encode_initial_payload(
     };
     let frame_count = data_to_send.len().div_ceil(raw_payload_limit.max(1));
     let mut body =
-        BytesMut::with_capacity(frame_count * shaper::max_encoded_frame_len(config.encoding_type));
+        Vec::with_capacity(frame_count * shaper::max_encoded_frame_len(config.encoding_type));
     let mut offset = 0;
     let mut seq: u64 = 0;
 
@@ -75,7 +75,7 @@ pub fn encode_initial_payload(
         seq += 1;
     }
 
-    Ok((body.freeze(), remaining, seq))
+    Ok((shaper::pooled_frame_bytes(body), remaining, seq))
 }
 
 pub async fn race_upload_download<F: Future<Output = Result<()>>>(

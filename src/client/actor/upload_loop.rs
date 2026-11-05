@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use crate::shaper::{self, SealInto};
 type ShaperStream = Pin<Box<dyn SealInto + Send>>;
 
 enum Phase {
-    Batching { batch_buf: BytesMut },
+    Batching { batch_buf: Vec<u8> },
     Draining { inflight: usize },
     Done,
 }
@@ -75,7 +75,7 @@ impl UploadLoopActor {
             max_in_flight_bytes,
             tasks: JoinSet::new(),
             phase: Phase::Batching {
-                batch_buf: BytesMut::with_capacity(BATCH_BUF_INITIAL_CAPACITY.min(max_batch_bytes)),
+                batch_buf: shaper::take_buf(BATCH_BUF_INITIAL_CAPACITY.min(max_batch_bytes)),
             },
         }
     }
@@ -96,12 +96,12 @@ impl UploadLoopActor {
     fn poll_seal(
         &mut self,
         cx: &mut TaskContext<'_>,
-        batch_buf: &mut BytesMut,
+        batch_buf: &mut Vec<u8>,
     ) -> Poll<io::Result<Option<u64>>> {
         self.shaped.as_mut().poll_seal_into(cx, batch_buf)
     }
 
-    async fn do_batching(&mut self, mut batch_buf: BytesMut) -> Result<Phase> {
+    async fn do_batching(&mut self, mut batch_buf: Vec<u8>) -> Result<Phase> {
         let mut stream_ended = false;
 
         if batch_buf.is_empty() {
@@ -161,7 +161,7 @@ impl UploadLoopActor {
             .acquire_many_owned(permit_bytes)
             .await
             .map_err(|_| anyhow!("bytes semaphore closed"))?;
-        let body = batch_buf.freeze();
+        let body = shaper::pooled_frame_bytes(batch_buf);
         let http_client = Arc::clone(&self.http_client);
         let state_ref = Arc::clone(&self.state);
         let stream_id = self.stream_id;
@@ -186,9 +186,7 @@ impl UploadLoopActor {
             })
         } else {
             Ok(Phase::Batching {
-                batch_buf: BytesMut::with_capacity(
-                    BATCH_BUF_INITIAL_CAPACITY.min(self.max_batch_bytes),
-                ),
+                batch_buf: shaper::take_buf(BATCH_BUF_INITIAL_CAPACITY.min(self.max_batch_bytes)),
             })
         }
     }
@@ -246,6 +244,7 @@ mod tests {
         DecodedFrame, EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig,
         decode_frame,
     };
+    use bytes::BytesMut;
     use std::net::SocketAddr;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};

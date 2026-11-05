@@ -2,19 +2,34 @@ use bytes::Bytes;
 use std::cell::RefCell;
 
 const MAX_FREE: usize = 64;
-const MAX_KEEP: usize = 256 * 1024;
+const MAX_BUFFER: usize = 4 * 1024 * 1024;
+const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+struct Free {
+    bufs: Vec<Vec<u8>>,
+    bytes: usize,
+}
 
 thread_local! {
-    static FREE: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static FREE: RefCell<Free> = const { RefCell::new(Free { bufs: Vec::new(), bytes: 0 }) };
 }
 
 pub fn take(min_capacity: usize) -> Vec<u8> {
     let reused = FREE.with(|free| {
         let mut free = free.borrow_mut();
-        let pos = free
-            .iter()
-            .position(|buf| buf.capacity() >= min_capacity && buf.capacity() <= MAX_KEEP)?;
-        Some(free.swap_remove(pos))
+        let mut best: Option<usize> = None;
+        for (i, buf) in free.bufs.iter().enumerate() {
+            if buf.capacity() < min_capacity {
+                continue;
+            }
+            if best.is_none_or(|b| buf.capacity() < free.bufs[b].capacity()) {
+                best = Some(i);
+            }
+        }
+        let idx = best?;
+        let buf = free.bufs.swap_remove(idx);
+        free.bytes -= buf.capacity();
+        Some(buf)
     });
     match reused {
         Some(mut buf) => {
@@ -25,15 +40,19 @@ pub fn take(min_capacity: usize) -> Vec<u8> {
     }
 }
 
-fn put(buf: Vec<u8>) {
-    if buf.capacity() < 1024 || buf.capacity() > MAX_KEEP {
+fn put(mut buf: Vec<u8>) {
+    let cap = buf.capacity();
+    if !(1024..=MAX_BUFFER).contains(&cap) {
         return;
     }
+    buf.clear();
     let _ = FREE.try_with(|free| {
         let mut free = free.borrow_mut();
-        if free.len() < MAX_FREE {
-            free.push(buf);
+        if free.bufs.len() >= MAX_FREE || free.bytes + cap > MAX_BYTES {
+            return;
         }
+        free.bytes += cap;
+        free.bufs.push(buf);
     });
 }
 
@@ -81,11 +100,15 @@ mod tests {
     }
 
     #[test]
-    fn oversized_request_allocates_fresh() {
+    fn take_prefers_the_smallest_fitting_buffer() {
         let small = take(4 * 1024);
+        let small_ptr = small.as_ptr();
+        let large = take(1024 * 1024);
+        put(large);
         put(small);
-        let large = take(MAX_KEEP + 1);
-        assert!(large.capacity() > MAX_KEEP);
+
+        let picked = take(2 * 1024);
+        assert_eq!(picked.as_ptr(), small_ptr, "best fit must win");
     }
 
     #[test]
@@ -101,10 +124,18 @@ mod tests {
     }
 
     #[test]
+    fn oversized_requests_allocate_fresh() {
+        let huge = take(MAX_BUFFER + 1);
+        assert!(huge.capacity() > MAX_BUFFER);
+    }
+
+    #[test]
     fn oversized_buffers_are_not_pooled() {
-        let huge = Vec::with_capacity(MAX_KEEP + 1);
+        let huge = Vec::with_capacity(MAX_BUFFER + 1);
+        let ptr = huge.as_ptr();
         put(huge);
-        let buf = take(MAX_KEEP + 1);
-        assert!(buf.capacity() > MAX_KEEP);
+
+        let again = take(MAX_BUFFER + 1);
+        assert_ne!(again.as_ptr(), ptr, "oversized buffer must not be reused");
     }
 }

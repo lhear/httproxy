@@ -21,6 +21,7 @@ use crate::crypto::{NONCE_LEN, TAG_LEN};
 mod bufpool;
 
 pub use bufpool::frame_bytes as pooled_frame_bytes;
+pub use bufpool::take as take_buf;
 
 pub const MAX_RAW_PAYLOAD: usize = 16 * 1024;
 
@@ -201,14 +202,16 @@ pub trait FrameCipher: Send + Sync {
 
     fn seal_in_place(
         &self,
-        out: &mut BytesMut,
+        out: &mut Vec<u8>,
         nonce_start: usize,
         ct_start: usize,
     ) -> Result<(), Error> {
         debug_assert!(ct_start >= nonce_start);
         let plain = out.split_off(ct_start);
         out.truncate(nonce_start);
-        self.encrypt_into(&plain, out)
+        let encrypted = self.encrypt(&plain)?;
+        out.extend_from_slice(&encrypted);
+        Ok(())
     }
 }
 
@@ -316,7 +319,7 @@ pub fn encode_frame_into(
     padding_threshold: usize,
     padding_range: [usize; 2],
     encoding: EncodingType,
-    out: &mut BytesMut,
+    out: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     let raw_len = data.len();
     let raw_limit = frame_raw_limit(cipher, encoding);
@@ -390,7 +393,7 @@ pub fn encode_frame(
     padding_range: [usize; 2],
     encoding: EncodingType,
 ) -> std::io::Result<Vec<u8>> {
-    let mut frame = BytesMut::with_capacity(max_encoded_frame_len(encoding));
+    let mut frame = Vec::with_capacity(max_encoded_frame_len(encoding));
     encode_frame_into(
         data,
         seq,
@@ -400,7 +403,7 @@ pub fn encode_frame(
         encoding,
         &mut frame,
     )?;
-    Ok(frame.to_vec())
+    Ok(frame)
 }
 
 #[derive(Debug)]
@@ -517,47 +520,11 @@ pub fn decode_from_buffer(
     }
 }
 
-trait FrameBuf: BufMut {
-    fn len(&self) -> usize;
-    fn reserve(&mut self, additional: usize);
-    fn as_bytes_mut(&mut self) -> Option<&mut BytesMut>;
-}
-
-impl FrameBuf for BytesMut {
-    #[inline]
-    fn len(&self) -> usize {
-        BytesMut::len(self)
-    }
-    #[inline]
-    fn reserve(&mut self, additional: usize) {
-        BytesMut::reserve(self, additional);
-    }
-    #[inline]
-    fn as_bytes_mut(&mut self) -> Option<&mut BytesMut> {
-        Some(self)
-    }
-}
-
-impl FrameBuf for Vec<u8> {
-    #[inline]
-    fn len(&self) -> usize {
-        Vec::len(self)
-    }
-    #[inline]
-    fn reserve(&mut self, additional: usize) {
-        Vec::reserve(self, additional);
-    }
-    #[inline]
-    fn as_bytes_mut(&mut self) -> Option<&mut BytesMut> {
-        None
-    }
-}
-
 pub trait SealInto {
     fn poll_seal_into(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        out: &mut BytesMut,
+        out: &mut Vec<u8>,
     ) -> Poll<std::io::Result<Option<u64>>>;
 }
 
@@ -568,7 +535,7 @@ pin_project! {
         reader: R,
 
         raw_buf: BytesMut,
-        enc_buf: BytesMut,
+        enc_buf: Vec<u8>,
         json_buf: Vec<u8>,
 
         #[pin]
@@ -613,7 +580,7 @@ impl<R> TrafficShaper<R> {
         Self {
             reader,
             raw_buf: BytesMut::with_capacity(READ_HIGH_WATER),
-            enc_buf: BytesMut::new(),
+            enc_buf: Vec::new(),
             json_buf: Vec::new(),
             flush_timer: tokio::time::sleep_until(Instant::now()),
             timer_armed: false,
@@ -663,7 +630,7 @@ impl<R> TrafficShaper<R> {
     }
 
     #[inline]
-    fn seal_into<B: FrameBuf>(this: &mut Proj<'_, R>, out: &mut B) -> Result<u64, Error> {
+    fn seal_into(this: &mut Proj<'_, R>, out: &mut Vec<u8>) -> Result<u64, Error> {
         let raw_len = this.raw_buf.len().min(*this.seal_threshold);
         debug_assert!(raw_len > 0);
         debug_assert!(raw_len <= MAX_RAW_PAYLOAD);
@@ -689,10 +656,7 @@ impl<R> TrafficShaper<R> {
                 if padding_len > 0 {
                     out.put_bytes(0u8, padding_len);
                 }
-                let buf = out.as_bytes_mut().ok_or_else(|| {
-                    Error::new(ErrorKind::InvalidInput, "binary framing requires BytesMut")
-                })?;
-                cipher.seal_in_place(buf, nonce_start, ct_start)?;
+                cipher.seal_in_place(out, nonce_start, ct_start)?;
             }
             (None, EncodingType::Binary) => {
                 out.reserve(2 + payload_len);
@@ -732,10 +696,10 @@ impl<R> TrafficShaper<R> {
 }
 
 impl<R: AsyncRead> TrafficShaper<R> {
-    fn poll_fill_and_seal<B: FrameBuf>(
+    fn poll_fill_and_seal(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        out: &mut B,
+        out: &mut Vec<u8>,
     ) -> Poll<std::io::Result<Option<u64>>> {
         let mut this = self.project();
 
@@ -799,7 +763,7 @@ impl<R: AsyncRead> SealInto for TrafficShaper<R> {
     fn poll_seal_into(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        out: &mut BytesMut,
+        out: &mut Vec<u8>,
     ) -> Poll<std::io::Result<Option<u64>>> {
         self.poll_fill_and_seal(cx, out)
     }
@@ -810,20 +774,9 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let capacity = self.as_ref().get_ref().frame_capacity;
-        if matches!(self.as_ref().get_ref().encoding, EncodingType::Json) {
-            let mut frame = bufpool::take(capacity);
-            return match self.poll_fill_and_seal(cx, &mut frame) {
-                Poll::Ready(Ok(Some(seq))) => {
-                    Poll::Ready(Some(Ok((seq, bufpool::frame_bytes(frame)))))
-                }
-                Poll::Ready(Ok(None)) => Poll::Ready(None),
-                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-                Poll::Pending => Poll::Pending,
-            };
-        }
-        let mut frame = BytesMut::with_capacity(capacity);
+        let mut frame = bufpool::take(capacity);
         match self.poll_fill_and_seal(cx, &mut frame) {
-            Poll::Ready(Ok(Some(seq))) => Poll::Ready(Some(Ok((seq, frame.freeze())))),
+            Poll::Ready(Ok(Some(seq))) => Poll::Ready(Some(Ok((seq, bufpool::frame_bytes(frame))))),
             Poll::Ready(Ok(None)) => Poll::Ready(None),
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
             Poll::Pending => Poll::Pending,
@@ -1185,7 +1138,7 @@ mod tests {
             let resolved = ResolvedShaperConfig::resolve(&config);
             let data = vec![0xAAu8; 64 * 1024];
             let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &resolved, cipher, 0);
-            let mut out = BytesMut::new();
+            let mut out = Vec::new();
             seal_all(shaper, &mut out);
 
             let mut frames = 0;
@@ -1201,7 +1154,7 @@ mod tests {
 
             let mut json_scratch = Vec::new();
             let mut decoded = Vec::new();
-            let mut buf = out;
+            let mut buf = BytesMut::from(&out[..]);
             while !buf.is_empty() {
                 match decode_frame(
                     &mut buf,
@@ -1222,7 +1175,7 @@ mod tests {
         }
     }
 
-    fn seal_all(shaper: TrafficShaper<Cursor<Vec<u8>>>, out: &mut BytesMut) -> Vec<u64> {
+    fn seal_all(shaper: TrafficShaper<Cursor<Vec<u8>>>, out: &mut Vec<u8>) -> Vec<u64> {
         let mut shaper = std::pin::pin!(shaper);
         let mut seqs = Vec::new();
         loop {
@@ -1243,11 +1196,12 @@ mod tests {
         let config = ResolvedShaperConfig::resolve(&test_config());
         let data = vec![0xABu8; 40_000];
         let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, None, 0);
-        let mut out = BytesMut::new();
+        let mut out = Vec::new();
         let seqs = seal_all(shaper, &mut out);
 
         assert_eq!(seqs, vec![0, 1, 2]);
 
+        let mut out = BytesMut::from(&out[..]);
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut frame_idx = 0usize;
@@ -1315,11 +1269,12 @@ mod tests {
 
         let shaper_seal =
             TrafficShaper::with_seq(Cursor::new(data.clone()), &config, Some(cipher), 0);
-        let mut out = BytesMut::new();
+        let mut out = Vec::new();
         let seqs = seal_all(shaper_seal, &mut out);
+        let mut out_buf = BytesMut::from(&out[..]);
         let mut seal_payload = Vec::new();
-        while !out.is_empty() {
-            decode_append(&mut out, &mut seal_payload);
+        while !out_buf.is_empty() {
+            decode_append(&mut out_buf, &mut seal_payload);
         }
 
         assert_eq!(seqs, stream_seqs);
@@ -1349,9 +1304,10 @@ mod tests {
         let config = ResolvedShaperConfig::resolve(&test_config());
         let data = vec![0x3Du8; 20_000];
         let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, Some(cipher), 0);
-        let mut out = BytesMut::new();
+        let mut out = Vec::new();
         let seqs = seal_all(shaper, &mut out);
 
+        let mut out = BytesMut::from(&out[..]);
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut frame_idx = 0usize;
@@ -1402,7 +1358,7 @@ mod tests {
         let reader = std::io::Cursor::new(Vec::<u8>::new());
         let cfg = ResolvedShaperConfig::resolve(&test_config());
         let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 0));
-        let mut out = BytesMut::new();
+        let mut out = Vec::new();
         let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
         assert!(matches!(result, Ok(None)));
     }
@@ -1413,9 +1369,10 @@ mod tests {
         let reader = std::io::Cursor::new(data);
         let cfg = ResolvedShaperConfig::resolve(&test_config());
         let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 42));
-        let mut out = BytesMut::new();
+        let mut out = Vec::new();
         let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
         assert!(matches!(result, Ok(Some(42))));
+        let mut out = BytesMut::from(&out[..]);
         let mut json_scratch = Vec::new();
         let frame = decode_frame(&mut out, &mut json_scratch, None, EncodingType::Binary)
             .unwrap()
@@ -1432,7 +1389,7 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
         let cfg = ResolvedShaperConfig::resolve(&test_config());
         let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 0));
-        let mut out = BytesMut::new();
+        let mut out = Vec::new();
 
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1483,7 +1440,7 @@ mod tests {
         let resolved = ResolvedShaperConfig::resolve(&cfg);
         let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
         let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &resolved, None, 0));
-        let mut out = BytesMut::new();
+        let mut out = Vec::new();
         let mut sizes = Vec::new();
         for _ in 0..4 {
             writer.write_all(&[0x44u8; 1000]).await.unwrap();
