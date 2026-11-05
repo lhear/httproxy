@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::{Instrument, info};
@@ -9,7 +9,7 @@ use tracing::{Instrument, info};
 use crate::client::state::ClientPqFsm;
 use crate::client::{
     actor::{download_loop::DownloadLoopActor, upload_loop::UploadLoopActor},
-    constants::DOWNLOAD_CONNECT_TIMEOUT,
+    constants::{DOWNLOAD_CONNECT_TIMEOUT, WRITE_STALL_TIMEOUT},
     state::SharedState,
     utils,
 };
@@ -143,17 +143,17 @@ async fn handle_bypass_direct(
     info!(target = %target, initial_bytes = %initial_payload.len(), "bypass connected");
 
     if !initial_payload.is_empty() {
-        remote.write_all(&initial_payload).await?;
+        write_with_timeout(&mut remote, &initial_payload).await?;
     }
     drop(initial_payload);
     let (mut remote_read, mut remote_write) = remote.into_split();
     let up = async {
-        let res = tokio::io::copy(&mut read_half, &mut remote_write).await;
+        let res = copy_with_write_timeout(&mut read_half, &mut remote_write).await;
         let _ = remote_write.shutdown().await;
         res
     };
     let down = async {
-        let res = tokio::io::copy(&mut remote_read, &mut write_half).await;
+        let res = copy_with_write_timeout(&mut remote_read, &mut write_half).await;
         let _ = write_half.shutdown().await;
         res
     };
@@ -162,4 +162,47 @@ async fn handle_bypass_direct(
     down_res.context("bypass remote->client")?;
     info!(target = %target, "bypass connection closed");
     Ok(())
+}
+
+const COPY_BUF_SIZE: usize = 64 * 1024;
+
+#[inline]
+async fn write_with_timeout<W>(writer: &mut W, data: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut off = 0;
+    while off < data.len() {
+        match tokio::time::timeout(WRITE_STALL_TIMEOUT, writer.write(&data[off..])).await {
+            Ok(Ok(0)) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(Ok(n)) => off += n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "write stalled",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn copy_with_write_timeout<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; COPY_BUF_SIZE];
+    let mut copied = 0u64;
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+        write_with_timeout(writer, &buf[..n]).await?;
+        copied += n as u64;
+    }
+    Ok(copied)
 }

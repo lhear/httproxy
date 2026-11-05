@@ -9,6 +9,7 @@ pub const EARLY_READ_WINDOW: Duration = Duration::from_millis(2);
 pub const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const PROXY_REQUEST_PARSE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const PROXY_BUF_INITIAL_CAPACITY: usize = 2048;
 pub const EARLY_READ_CHUNK: usize = 2048;

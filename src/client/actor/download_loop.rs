@@ -5,7 +5,8 @@ use http_body_util::BodyExt;
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::oneshot;
 use tracing::{Instrument, warn};
@@ -14,7 +15,7 @@ use uuid::Uuid;
 use super::super::state::SharedState;
 use crate::client::constants::{
     DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, MAX_WRITE_IOV, PREFETCH_LEAD_BYTES,
-    PREFETCH_ROTATE_TIMEOUT, WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT,
+    PREFETCH_ROTATE_TIMEOUT, WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT, WRITE_STALL_TIMEOUT,
 };
 use crate::client::utils;
 use crate::crypto::AesFrameCipher;
@@ -121,7 +122,10 @@ impl DecodeBuffers {
         self.pending_bytes >= WRITE_BUF_CAPACITY
     }
 
-    async fn flush(&mut self, write_half: &mut OwnedWriteHalf) -> Result<()> {
+    async fn flush<W>(&mut self, write_half: &mut W, timeout: Duration) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         while !self.pending.is_empty() {
             let written = {
                 let mut slices: [IoSlice<'_>; MAX_WRITE_IOV] =
@@ -136,7 +140,17 @@ impl DecodeBuffers {
                         break;
                     }
                 }
-                write_half.write_vectored(&slices[..count]).await?
+                match tokio::time::timeout(timeout, write_half.write_vectored(&slices[..count]))
+                    .await
+                {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "local socket write stalled for {}s",
+                            timeout.as_secs()
+                        ));
+                    }
+                }
             };
             if written == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
@@ -289,14 +303,14 @@ impl DownloadLoopActor {
                         .ingest(chunk, self.cipher.as_deref(), self.encoding, &mut expected_seq)?;
 
                     if self.buffers.needs_flush() {
-                        self.buffers.flush(&mut self.write_half).await?;
+                        self.buffers.flush(&mut self.write_half, WRITE_STALL_TIMEOUT).await?;
                         flush_deadline
                             .as_mut()
                             .reset(tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT);
                     }
                 }
                 _ = &mut flush_deadline, if self.buffers.has_pending() => {
-                    self.buffers.flush(&mut self.write_half).await?;
+                    self.buffers.flush(&mut self.write_half, WRITE_STALL_TIMEOUT).await?;
                     flush_deadline
                         .as_mut()
                         .reset(tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT);
@@ -304,7 +318,9 @@ impl DownloadLoopActor {
             }
         }
 
-        self.buffers.flush(&mut self.write_half).await?;
+        self.buffers
+            .flush(&mut self.write_half, WRITE_STALL_TIMEOUT)
+            .await?;
 
         if !self.buffers.input.is_empty() {
             warn!(
@@ -605,5 +621,46 @@ mod tests {
             assert!(!bufs.has_pending());
         }
         assert_eq!(expected_seq, 8);
+    }
+
+    struct StalledWriter;
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_times_out_when_local_socket_stalls() {
+        let mut bufs = buffers();
+        bufs.pending.push_back(Bytes::from_static(b"blocked"));
+        bufs.pending_bytes = 7;
+
+        let mut writer = StalledWriter;
+        let err = bufs
+            .flush(&mut writer, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+        assert_eq!(bufs.pending_bytes, 7, "unwritten data stays queued");
     }
 }
