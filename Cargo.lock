@@ -1211,7 +1211,6 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
- "crypto-common",
  "dashmap",
  "domain",
  "fst",
@@ -1224,7 +1223,6 @@ dependencies = [
  "ip_network",
  "ip_network_table",
  "memchr",
- "ml-kem",
  "moka",
  "p256",
  "pin-project-lite",
@@ -1262,7 +1260,6 @@ version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
- "ctutils",
  "subtle",
  "typenum",
  "zeroize",
@@ -1550,26 +1547,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keccak"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8f198d1db720e4940b5a493201d199d9f24f568f8f746bd13706243a2f71598"
-dependencies = [
- "cfg-if",
- "cpufeatures",
-]
-
-[[package]]
-name = "kem"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01737161ba802849cfd486b5bd209d38ba4943494c249a8126005170c7621edd"
-dependencies = [
- "crypto-common",
- "rand_core",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1685,34 +1662,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ml-kem"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84ca78b66f46050d49fa21693ae8adab2081d8101b65d8067316b6b70b64a0d1"
-dependencies = [
- "hybrid-array",
- "kem",
- "module-lattice",
- "pkcs8",
- "rand_core",
- "sha3",
- "shake",
- "zeroize",
-]
-
-[[package]]
-name = "module-lattice"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4a1e412c8ee83a1c678f427806219c49c96b2511b9f07497514f0e43fb26155"
-dependencies = [
- "ctutils",
- "hybrid-array",
- "num-traits",
- "zeroize",
 ]
 
 [[package]]
@@ -2355,28 +2304,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha3"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
-dependencies = [
- "digest",
- "keccak",
- "sponge-cursor",
-]
-
-[[package]]
-name = "shake"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
-dependencies = [
- "digest",
- "keccak",
- "sponge-cursor",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2464,12 +2391,6 @@ dependencies = [
  "base64ct",
  "der",
 ]
-
-[[package]]
-name = "sponge-cursor"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "stable_deref_trait"

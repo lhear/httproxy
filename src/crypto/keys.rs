@@ -1,11 +1,7 @@
 use anyhow::{Result, anyhow};
+use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_768};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use crypto_common::Key;
-use ml_kem::{
-    Ciphertext, DecapsulationKey, EncapsulationKey, MlKem768,
-    kem::{Decapsulate, Encapsulate},
-};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
@@ -62,33 +58,40 @@ pub fn diffie_hellman(our_sk: &StaticSecret, their_pk: &PublicKey) -> Zeroizing<
     Zeroizing::new(*our_sk.diffie_hellman(their_pk).as_bytes())
 }
 
-pub fn bytes_to_encapsulation_key(bytes: &[u8]) -> Result<EncapsulationKey<MlKem768>> {
-    let key: Key<EncapsulationKey<MlKem768>> = bytes
-        .try_into()
-        .map_err(|_| anyhow!("invalid encapsulation key length"))?;
-    EncapsulationKey::new(&key).map_err(|_| anyhow!("invalid encapsulation key"))
+pub fn generate_mlkem_keypair() -> Result<(DecapsulationKey, EncapsulationKey)> {
+    let sk = DecapsulationKey::generate(&ML_KEM_768)
+        .map_err(|_| anyhow!("ML-KEM key generation failed"))?;
+    let pk = sk
+        .encapsulation_key()
+        .map_err(|_| anyhow!("ML-KEM encapsulation key unavailable"))?;
+    Ok((sk, pk))
 }
 
-pub fn generate_mlkem_keypair() -> (DecapsulationKey<MlKem768>, EncapsulationKey<MlKem768>) {
-    use ml_kem::kem::Kem;
-    <MlKem768 as Kem>::generate_keypair_from_rng(&mut rand::rng())
+pub fn mlkem_public_key_bytes(pk: &EncapsulationKey) -> Result<Vec<u8>> {
+    let bytes = pk
+        .key_bytes()
+        .map_err(|_| anyhow!("ML-KEM public key export failed"))?;
+    Ok(bytes.as_ref().to_vec())
+}
+
+pub fn bytes_to_encapsulation_key(bytes: &[u8]) -> Result<EncapsulationKey> {
+    EncapsulationKey::new(&ML_KEM_768, bytes).map_err(|_| anyhow!("invalid encapsulation key"))
 }
 
 pub fn mlkem_encapsulate(
-    pk: &EncapsulationKey<MlKem768>,
-) -> (Ciphertext<MlKem768>, Zeroizing<Vec<u8>>) {
-    let (ct, ss) = pk.encapsulate_with_rng(&mut rand::rng());
-    let ss_bytes: &[u8] = &ss;
-    (ct, Zeroizing::new(ss_bytes.to_vec()))
+    pk: &EncapsulationKey,
+) -> Result<(Ciphertext<'static>, Zeroizing<Vec<u8>>)> {
+    let (ct, ss) = pk
+        .encapsulate()
+        .map_err(|_| anyhow!("ML-KEM encapsulation failed"))?;
+    Ok((ct, Zeroizing::new(ss.as_ref().to_vec())))
 }
 
-pub fn mlkem_decapsulate(
-    sk: &DecapsulationKey<MlKem768>,
-    ct: &Ciphertext<MlKem768>,
-) -> Zeroizing<Vec<u8>> {
-    let ss = sk.decapsulate(ct);
-    let ss_bytes: &[u8] = &ss;
-    Zeroizing::new(ss_bytes.to_vec())
+pub fn mlkem_decapsulate(sk: &DecapsulationKey, ct: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let ss = sk
+        .decapsulate(Ciphertext::from(ct))
+        .map_err(|_| anyhow!("ML-KEM decapsulation failed"))?;
+    Ok(Zeroizing::new(ss.as_ref().to_vec()))
 }
 
 #[cfg(test)]
@@ -121,10 +124,27 @@ mod tests {
 
     #[test]
     fn mlkem_roundtrip() {
-        let (sk, pk) = generate_mlkem_keypair();
-        let (ct, ss_enc) = mlkem_encapsulate(&pk);
-        let ss_dec = mlkem_decapsulate(&sk, &ct);
+        let (sk, pk) = generate_mlkem_keypair().unwrap();
+        let bytes = mlkem_public_key_bytes(&pk).unwrap();
+        assert_eq!(bytes.len(), 1184);
+
+        let pk2 = bytes_to_encapsulation_key(&bytes).unwrap();
+        let (ct, ss_enc) = mlkem_encapsulate(&pk2).unwrap();
+        assert_eq!(ct.as_ref().len(), 1088);
+
+        let ss_dec = mlkem_decapsulate(&sk, ct.as_ref()).unwrap();
         assert_eq!(*ss_enc, *ss_dec);
+    }
+
+    #[test]
+    fn mlkem_rejects_bad_public_key() {
+        assert!(bytes_to_encapsulation_key(&[0u8; 17]).is_err());
+    }
+
+    #[test]
+    fn mlkem_rejects_bad_ciphertext() {
+        let (sk, _) = generate_mlkem_keypair().unwrap();
+        assert!(mlkem_decapsulate(&sk, &[0u8; 17]).is_err());
     }
 
     #[test]

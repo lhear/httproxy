@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
-use crypto_common::KeyExport;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use rand::RngExt;
@@ -146,8 +145,8 @@ pub async fn perform_pq_handshake(
     let handshake_key = crypto::derive_handshake_key(&x25519_shared_a);
     let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
-    let (kem_sk, kem_pk) = crypto::generate_mlkem_keypair();
-    let kem_pk_bytes = kem_pk.to_bytes();
+    let (kem_sk, kem_pk) = crypto::generate_mlkem_keypair()?;
+    let kem_pk_bytes = crypto::mlkem_public_key_bytes(&kem_pk)?;
 
     let (eph_sk_b, eph_pk_b) = crypto::generate_keypair();
     let eph_pk_b_bytes = eph_pk_b.to_bytes().to_vec();
@@ -230,14 +229,11 @@ pub async fn perform_pq_handshake(
         .context("invalid session_id")?
         .to_owned();
     let ct_bytes = &server_hello_data[ct_start..ct_end];
-    let ct: ml_kem::Ciphertext<ml_kem::MlKem768> = ct_bytes
-        .try_into()
-        .map_err(|_| anyhow!("invalid ct: wrong length"))?;
     let server_eph_pk_bytes: [u8; 32] = server_hello_data[ct_end..ct_end + 32].try_into().unwrap();
     let server_eph_pk = x25519_dalek::PublicKey::from(server_eph_pk_bytes);
 
     let master = {
-        let ss_mlkem = crypto::mlkem_decapsulate(&kem_sk, &ct);
+        let ss_mlkem = crypto::mlkem_decapsulate(&kem_sk, ct_bytes)?;
         let ss_x25519 = crypto::diffie_hellman(&eph_sk_b, &server_eph_pk);
         crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
     };

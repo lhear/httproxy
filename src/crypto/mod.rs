@@ -9,7 +9,7 @@ pub use handshake::{
 pub use keys::{
     b64_to_private_key, b64_to_public_key, bytes_to_encapsulation_key, diffie_hellman,
     generate_keypair, generate_mlkem_keypair, mlkem_decapsulate, mlkem_encapsulate,
-    private_key_to_b64, public_key_to_b64,
+    mlkem_public_key_bytes, private_key_to_b64, public_key_to_b64,
 };
 
 pub type ConnectionKeys = (

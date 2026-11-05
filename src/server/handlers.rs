@@ -615,7 +615,8 @@ async fn handle_fresh_handshake(
         .map_err(|_| ServerError::bad_request("invalid client x25519 pk length"))?;
     let client_eph_pk_b = x25519_dalek::PublicKey::from(eph_pk_b);
 
-    let (ct, ss_mlkem) = crypto::mlkem_encapsulate(&kem_pk);
+    let (ct, ss_mlkem) = crypto::mlkem_encapsulate(&kem_pk)
+        .map_err(|e| ServerError::internal(format!("ML-KEM encapsulation failed: {e}")))?;
     let (server_eph_sk, server_eph_pk) = crypto::generate_keypair();
 
     let master = {
@@ -631,10 +632,10 @@ async fn handle_fresh_handshake(
     info!(session_id = %session_id, "handshake: master key derived");
 
     let sid_bytes = session_id.as_bytes();
-    let mut server_hello = Vec::with_capacity(2 + sid_bytes.len() + ct.len() + 32);
+    let mut server_hello = Vec::with_capacity(2 + sid_bytes.len() + ct.as_ref().len() + 32);
     server_hello.extend_from_slice(&(sid_bytes.len() as u16).to_be_bytes());
     server_hello.extend_from_slice(sid_bytes);
-    server_hello.extend_from_slice(&ct);
+    server_hello.extend_from_slice(ct.as_ref());
     server_hello.extend_from_slice(server_eph_pk.as_bytes());
 
     let server_hello_frame = shaper::encode_frame(
