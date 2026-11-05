@@ -38,15 +38,13 @@ pub fn traffic(binary: bool, max_download_bytes: Option<u64>) -> TrafficConfig {
 }
 
 pub fn make_token(user: &str, exp: u64) -> String {
-    jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
+    httproxy::server::token::issue(
+        &httproxy::server::token::key_from_secret(SECRET.as_bytes()),
         &httproxy::server::Claims {
             sub: user.to_string(),
             exp,
         },
-        &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
     )
-    .unwrap()
 }
 
 pub fn valid_token() -> String {

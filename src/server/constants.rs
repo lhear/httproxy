@@ -18,11 +18,9 @@ pub const MASTER_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// 一次向量写最多带多少帧（补齐空档时把连续帧合并成少数几次系统调用）
 pub const MAX_WRITE_IOV: usize = 64;
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 每个下载段结束时通知隧道 actor 的通道容量（每段一条消息）
 pub const SEGMENT_DONE_CHANNEL_CAPACITY: usize = 2;
 pub const TUNNEL_CMD_CHANNEL_CAPACITY: usize = 32;
 pub const UPLOAD_CMD_CHANNEL_CAPACITY: usize = 8;
@@ -31,10 +29,8 @@ pub const MAX_TUNNELS: usize = 1024;
 
 pub const MASTER_EXPIRY: Duration = Duration::from_secs(1200);
 
-/// 已校验通过的 JWT 缓存时长。只在 `exp` 还够远时才写入缓存，因此缓存
-/// 永远不会让过期 token 通过校验。
-pub const JWT_CACHE_TTL: Duration = Duration::from_secs(60);
-pub const JWT_CACHE_CAPACITY: u64 = 2048;
+pub const TOKEN_CACHE_TTL: Duration = Duration::from_secs(60);
+pub const TOKEN_CACHE_CAPACITY: u64 = 2048;
 
 pub const PADDING_POOL: &[u8] = b"padding=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 

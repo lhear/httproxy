@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod janitor;
 pub mod stream;
 pub mod stream_registry;
+pub mod token;
 pub mod upstream;
 pub mod utils;
 
@@ -15,11 +16,10 @@ use crate::shaper::{EncodingType, FrameCipher, ResolvedShaperConfig, TrafficConf
 use crate::warp::WarpClient;
 
 use anyhow::Context;
+use aws_lc_rs::aead::LessSafeKey;
 use axum::serve::ListenerExt;
 use axum::{Router, body::Body, routing::post};
 use dashmap::DashMap;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
@@ -37,11 +37,11 @@ use zeroize::Zeroizing;
 
 use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
-use crate::server::constants::{JWT_CACHE_CAPACITY, JWT_CACHE_TTL, MAX_TUNNELS};
+use crate::server::constants::{MAX_TUNNELS, TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
 
 pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Claims {
     pub sub: String,
     pub exp: u64,
@@ -49,9 +49,7 @@ pub struct Claims {
 
 #[derive(Clone)]
 pub struct SessionHandle {
-    /// 控制面：`Continue` / `Shutdown`
     pub cmd_tx: mpsc::Sender<TunnelCmd>,
-    /// 数据面：请求帧与 EOS 直接投递给上传 actor，不必再经隧道 actor 中转
     pub upload_tx: mpsc::Sender<UploadCmd>,
     pub upload_cipher: Option<Arc<dyn FrameCipher>>,
     pub encoding: EncodingType,
@@ -59,8 +57,7 @@ pub struct SessionHandle {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub decoding_key: DecodingKey,
-    pub jwt_validation: Validation,
+    pub token_key: Arc<LessSafeKey>,
     pub socks5_proxy: Option<Arc<str>>,
     pub dns_client: Option<Arc<DnsClient>>,
     pub warp: Option<Arc<WarpClient>>,
@@ -73,9 +70,7 @@ pub struct AppState {
     pub actors: Arc<DashMap<Uuid, SessionHandle>>,
     pub tunnel_semaphore: Arc<Semaphore>,
     pub stream_id_counter: Arc<AtomicU64>,
-    /// 已校验 JWT 的短时缓存：明文模式下每个上传 POST 都要查一次，没必要每次
-    /// 都重做一遍 HMAC 校验和 JSON 解析
-    pub jwt_cache: moka::future::Cache<Box<str>, Arc<str>>,
+    pub token_cache: moka::future::Cache<Box<str>, Arc<str>>,
 }
 
 pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<AppState>> {
@@ -84,7 +79,6 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         .validate()
         .context("invalid traffic_shaping config")?;
 
-    // WARP 先建：DNS 传输要按它的判定决定查询是否也走隧道
     let warp = match config.warp.as_ref() {
         Some(section) if section.enabled => Some(
             WarpClient::init(section)
@@ -98,8 +92,6 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         None => None,
     };
 
-    // WARP 打开后域名必须由 DNS 模块解析（不能交给 WARP），所以没配 [dns] 时
-    // 用 Cloudflare 的解析器兜底，并且同样经 WARP 出去。
     let mut dns_config = config.dns.clone();
     if dns_config.is_none() && warp.is_some() {
         warn!("warp: no [dns] section, resolving names via 1.1.1.1:53 over WARP");
@@ -123,12 +115,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
     let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
 
     Ok(Arc::new(AppState {
-        decoding_key: DecodingKey::from_secret(config.auth.secret.as_bytes()),
-        jwt_validation: {
-            let mut v = Validation::new(Algorithm::HS256);
-            v.validate_exp = true;
-            v
-        },
+        token_key: Arc::new(token::key_from_secret(config.auth.secret.as_bytes())),
         socks5_proxy: config
             .proxy
             .as_ref()
@@ -145,9 +132,9 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         actors: Arc::new(DashMap::new()),
         tunnel_semaphore: Arc::new(Semaphore::new(max_tunnels)),
         stream_id_counter: Arc::new(AtomicU64::new(1)),
-        jwt_cache: moka::future::Cache::builder()
-            .max_capacity(JWT_CACHE_CAPACITY)
-            .time_to_live(JWT_CACHE_TTL)
+        token_cache: moka::future::Cache::builder()
+            .max_capacity(TOKEN_CACHE_CAPACITY)
+            .time_to_live(TOKEN_CACHE_TTL)
             .build(),
     }))
 }

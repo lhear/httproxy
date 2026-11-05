@@ -32,11 +32,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::GenToken { secret, user, exp } => {
-                let token = jsonwebtoken::encode(
-                    &jsonwebtoken::Header::default(),
+                let token = httproxy::server::token::issue(
+                    &httproxy::server::token::key_from_secret(secret.as_bytes()),
                     &httproxy::server::Claims { sub: user, exp },
-                    &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
-                )?;
+                );
                 println!("{token}");
                 return Ok(());
             }

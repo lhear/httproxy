@@ -1,8 +1,8 @@
+use aws_lc_rs::aead::LessSafeKey;
 use axum::{body::Body, extract::State, http::HeaderMap, response::Response};
 use base64::Engine;
 use bytes::BytesMut;
 use futures::StreamExt;
-use jsonwebtoken::{DecodingKey, Validation};
 use std::io;
 use std::sync::Arc;
 use tracing::{Instrument, info, warn};
@@ -15,7 +15,7 @@ use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
 use crate::server::connection::connect_upstream;
 use crate::server::constants::{
-    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, JWT_CACHE_TTL, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE,
+    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE, TOKEN_CACHE_TTL,
     TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream::FrameDecoder;
@@ -196,7 +196,6 @@ async fn setup_tunnel_response(
             download_cipher,
             0,
         );
-        // 响应体直接从 shaper 拉取，不再经过"额外任务 + 每帧 mpsc"
         Body::from_stream(
             actor
                 .take_segment()
@@ -499,13 +498,7 @@ async fn handle_plaintext_tunnel(
     span: tracing::Span,
     stream_id_opt: Option<Uuid>,
 ) -> Result<Response, ServerError> {
-    let user = validate_jwt_if_needed(
-        &headers,
-        &state.decoding_key,
-        &state.jwt_validation,
-        &state.jwt_cache,
-    )
-    .await?;
+    let user = validate_token_if_needed(&headers, &state.token_key, &state.token_cache).await?;
     span.record("user", &*user);
 
     let target = headers
@@ -547,13 +540,7 @@ async fn handle_fresh_handshake(
     body: Body,
     span: tracing::Span,
 ) -> Result<Response, ServerError> {
-    let user = validate_jwt_if_needed(
-        &headers,
-        &state.decoding_key,
-        &state.jwt_validation,
-        &state.jwt_cache,
-    )
-    .await?;
+    let user = validate_token_if_needed(&headers, &state.token_key, &state.token_cache).await?;
     span.record("user", &*user);
 
     info!("handshake: received ClientHello");
@@ -674,10 +661,9 @@ async fn handle_fresh_handshake(
     Ok(resp)
 }
 
-pub async fn validate_jwt_if_needed(
+pub async fn validate_token_if_needed(
     headers: &HeaderMap,
-    key: &DecodingKey,
-    validation: &Validation,
+    key: &LessSafeKey,
     cache: &moka::future::Cache<Box<str>, Arc<str>>,
 ) -> Result<Arc<str>, ServerError> {
     let auth_header = headers
@@ -699,17 +685,14 @@ pub async fn validate_jwt_if_needed(
         return Ok(user);
     }
 
-    let claims = jsonwebtoken::decode::<super::Claims>(token, key, validation)
-        .map(|td| td.claims)
-        .map_err(|e| {
-            warn!("rejected: invalid token - {:?}", e);
-            ServerError::unauthorized("invalid token")
-        })?;
+    let claims = crate::server::token::open(key, token).map_err(|e| {
+        warn!("rejected: invalid token - {e}");
+        ServerError::unauthorized("invalid token")
+    })?;
 
     let user: Arc<str> = Arc::from(claims.sub);
-    // 只在 token 剩余寿命明显长于缓存 TTL 时才缓存，避免缓存把过期时间往后拖
     let now = crate::unix_now_secs();
-    if claims.exp > now.saturating_add(JWT_CACHE_TTL.as_secs()) {
+    if claims.exp > now.saturating_add(TOKEN_CACHE_TTL.as_secs()) {
         cache
             .insert(token.to_owned().into_boxed_str(), Arc::clone(&user))
             .await;
@@ -754,15 +737,13 @@ mod tests {
     }
 
     fn valid_token() -> String {
-        jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
+        crate::server::token::issue(
+            &crate::server::token::key_from_secret(b"test-secret"),
             &crate::server::Claims {
                 sub: "user".to_string(),
                 exp: 4_102_444_800,
             },
-            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
         )
-        .unwrap()
     }
 
     fn bearer(token: &str) -> HeaderMap {
@@ -772,15 +753,13 @@ mod tests {
     }
 
     fn token_with_exp(exp: u64) -> String {
-        jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
+        crate::server::token::issue(
+            &crate::server::token::key_from_secret(b"test-secret"),
             &crate::server::Claims {
                 sub: "user".to_string(),
                 exp,
             },
-            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
         )
-        .unwrap()
     }
 
     #[tokio::test]
@@ -789,31 +768,20 @@ mod tests {
         let token = valid_token();
         let headers = bearer(&token);
 
-        let first = validate_jwt_if_needed(
-            &headers,
-            &state.decoding_key,
-            &state.jwt_validation,
-            &state.jwt_cache,
-        )
-        .await
-        .unwrap();
+        let first = validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+            .await
+            .unwrap();
         assert_eq!(&*first, "user");
         let cached = state
-            .jwt_cache
+            .token_cache
             .get(token.as_str())
             .await
             .expect("valid token must be cached");
         assert_eq!(&*cached, "user");
 
-        // 第二次命中缓存，返回同一个 Arc，不再做一次签名校验
-        let second = validate_jwt_if_needed(
-            &headers,
-            &state.decoding_key,
-            &state.jwt_validation,
-            &state.jwt_cache,
-        )
-        .await
-        .unwrap();
+        let second = validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+            .await
+            .unwrap();
         assert!(
             Arc::ptr_eq(&first, &second),
             "cache hit must reuse the entry"
@@ -823,38 +791,26 @@ mod tests {
     #[tokio::test]
     async fn invalid_tokens_are_never_cached() {
         let state = test_state().await;
-        let headers = bearer("not-a-jwt");
+        let headers = bearer("not-a-token");
         assert!(
-            validate_jwt_if_needed(
-                &headers,
-                &state.decoding_key,
-                &state.jwt_validation,
-                &state.jwt_cache
-            )
-            .await
-            .is_err()
+            validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+                .await
+                .is_err()
         );
-        assert!(state.jwt_cache.get("not-a-jwt").await.is_none());
+        assert!(state.token_cache.get("not-a-token").await.is_none());
     }
 
     #[tokio::test]
     async fn token_close_to_expiry_is_not_cached() {
         let state = test_state().await;
-        // 5 秒后过期：仍能通过校验（默认 60s leeway），但不能进缓存，
-        // 否则缓存 TTL 会把过期时间往后拖。
         let token = token_with_exp(crate::unix_now_secs() + 5);
         let headers = bearer(&token);
         assert!(
-            validate_jwt_if_needed(
-                &headers,
-                &state.decoding_key,
-                &state.jwt_validation,
-                &state.jwt_cache
-            )
-            .await
-            .is_ok()
+            validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+                .await
+                .is_ok()
         );
-        assert!(state.jwt_cache.get(token.as_str()).await.is_none());
+        assert!(state.token_cache.get(token.as_str()).await.is_none());
     }
 
     #[tokio::test]
@@ -892,7 +848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_rejects_bad_jwt_with_target() {
+    async fn dispatch_rejects_bad_token_with_target() {
         let state = test_state().await;
         let mut headers = HeaderMap::new();
         headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
@@ -904,7 +860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_bad_gateway_on_unreachable_target_with_valid_jwt() {
+    async fn dispatch_bad_gateway_on_unreachable_target_with_valid_token() {
         let state = test_state().await;
         let mut headers = HeaderMap::new();
         headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
@@ -930,17 +886,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_routes_expired_jwt_to_handshake_cookie_path() {
+    async fn dispatch_routes_expired_token_to_handshake_cookie_path() {
         let state = test_state().await;
-        let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::default(),
+        let token = crate::server::token::issue(
+            &crate::server::token::key_from_secret(b"test-secret"),
             &crate::server::Claims {
                 sub: "user".to_string(),
                 exp: 1,
             },
-            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap();
+        );
         let mut headers = HeaderMap::new();
         headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
         headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
