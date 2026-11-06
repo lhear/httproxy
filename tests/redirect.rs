@@ -1,6 +1,3 @@
-//! `[[redirect]]` 本地端口转发的端到端测试：这里的目标是一个原始 TCP 回显服务，
-//! 不是 HTTP —— 正好验证转发路径完全不依赖协议解析。
-
 mod common;
 
 use std::net::SocketAddr;
@@ -8,7 +5,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// 原始 TCP 回显服务（收到什么原样回什么）。
 async fn spawn_tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -32,9 +28,6 @@ async fn spawn_tcp_echo() -> SocketAddr {
     addr
 }
 
-/// 起 server + client，并在 client 上加一条指向 echo 的 redirect。
-///
-/// `keys` 为 `(服务端私钥, 客户端公钥)`：两边必须用同一对密钥。
 async fn spawn_redirect(
     traffic: httproxy::shaper::TrafficConfig,
     keys: Option<(String, String)>,
@@ -80,7 +73,6 @@ async fn redirect_handles_many_roundtrips() {
     let redirect = spawn_redirect(common::traffic(true, None), None).await;
     let mut stream = TcpStream::connect(redirect).await.unwrap();
 
-    // 同一条连接上来回多次，确认隧道不是一次性的
     for i in 0..8u8 {
         let payload = [i; 32];
         stream.write_all(&payload).await.unwrap();
@@ -99,7 +91,6 @@ async fn redirect_forwards_large_bidirectional_stream() {
     let redirect = spawn_redirect(common::traffic(true, None), None).await;
     let stream = TcpStream::connect(redirect).await.unwrap();
 
-    // 256 KiB 上行 + 256 KiB 下行，覆盖多次封帧/轮转
     let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
     let (mut read_half, mut write_half) = stream.into_split();

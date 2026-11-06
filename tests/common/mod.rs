@@ -1,4 +1,3 @@
-// 共享的测试辅助：每个测试二进制都会编译一份，难免有用不到的项。
 #![allow(dead_code)]
 
 use httproxy::config::{
@@ -142,7 +141,6 @@ pub async fn spawn_client(cfg: ClientTopConfig, server_addr: SocketAddr) -> Sock
     spawn_client_with_redirects(cfg, server_addr).await.0
 }
 
-/// 启动客户端，同时返回 `[[redirect]]` 实际绑定的端口。
 pub async fn spawn_client_with_redirects(
     mut cfg: ClientTopConfig,
     server_addr: SocketAddr,

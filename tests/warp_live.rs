@@ -1,13 +1,3 @@
-//! 真实 Cloudflare WARP 的连通性验证（默认忽略，需要出网 + 会注册一台设备）。
-//!
-//! ```bash
-//! cargo test --test warp_live -- --ignored --nocapture
-//! ```
-//!
-//! 它跑的是完整链路：本机 httproxy client → httproxy server → 自动注册 / 读取
-//! `warp.json` → DNS(1.1.1.1:53 经 WARP，落成 DNS-over-TCP) → CONNECT 到解析出的
-//! IP:80 → 真实站点返回页面。凭据写在系统临时目录，复跑不会重复注册。
-
 mod common;
 
 use common::*;

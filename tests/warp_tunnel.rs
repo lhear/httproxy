@@ -1,10 +1,3 @@
-//! 端到端验证：服务端开启 `[warp]` 后，出站流量确实经过 MASQUE。
-//!
-//! 这里用一个只跑在回环上的极简 HTTP/3 CONNECT 代理冒充 Cloudflare WARP：
-//! 它接受 CONNECT `<authority>`，把 DATA 载荷原样搬给真正的 TCP 上游，再把
-//! 上游的响应包回 DATA 帧。这样整条链路（客户端 → httproxy → MASQUE →
-//! 上游）都被真实地跑了一遍。
-
 mod common;
 
 use std::net::SocketAddr;
@@ -22,9 +15,7 @@ const ALPN: &[u8] = b"h3";
 const FRAME_DATA: u64 = 0x00;
 const FRAME_HEADERS: u64 = 0x01;
 
-/// 一次性的 P-256 私钥（PKCS#8 DER，base64）。测试专用，不代表任何真实设备。
 const TEST_PRIVATE_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdJ+Fw3esExD3TV3VMUP+VR7Wh9oK2UklqfGm7o4/ZmGhRANCAAQqiPmOneK+zI4dYmlgPefw2W9SF/OYT/UR7WAwX657T8CSdBzx83+0yCnj9jlJJYe0Dfq9xCO1N4YZdoo3IhzG";
-/// 与此私钥无关的公钥占位：测试走 `insecure_skip_verify`，不做钉扎。
 const TEST_PEER_KEY: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKoj5jp3ivsyOHWJpYD3n8NlvUhfzmE/1Ee1gMF+ue0/AknQc8fN/tMgp4/Y5SSWHtA36vcQjtTeGGXaKNyIcxg==";
 
 fn put_varint(out: &mut Vec<u8>, value: u64) {
@@ -60,7 +51,6 @@ fn frame(ty: u64, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// QPACK 前缀整数（RFC 9204 §4.1.1）。
 fn get_prefixed_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
     let first = *buf.first()?;
     let mask = ((1u16 << prefix_bits) - 1) as u8;
@@ -81,8 +71,6 @@ fn get_prefixed_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
     }
 }
 
-/// 从请求字段块里取出 `:authority`。编码是固定的
-/// `[0,0, :method CONNECT, :authority 字面量]`。
 fn request_authority(block: &[u8]) -> String {
     assert_eq!(block[0], 0, "insert count");
     assert_eq!(block[1], 0, "delta base");
@@ -93,7 +81,6 @@ fn request_authority(block: &[u8]) -> String {
     String::from_utf8(block[start..start + len as usize].to_vec()).unwrap()
 }
 
-/// 读一个完整的 H3 帧。
 async fn read_frame(recv: &mut quinn::RecvStream, buf: &mut Vec<u8>) -> Option<(u64, Vec<u8>)> {
     loop {
         if let Some((ty, n)) = get_varint(buf)
@@ -125,13 +112,11 @@ async fn serve_stream(
     let authority = request_authority(&block);
     connects.fetch_add(1, Ordering::SeqCst);
 
-    // 关键约束：服务端必须先解析，交给 WARP 的 authority 只能是 IP:port
     let target: SocketAddr = authority
         .parse()
         .unwrap_or_else(|_| panic!("CONNECT authority must be an IP literal, got `{authority}`"));
 
     let Ok(upstream) = TcpStream::connect(target).await else {
-        // 上游不可达：回一个错误状态让调用方看到失败
         let _ = send
             .write_all(&frame(FRAME_HEADERS, &[0, 0, 0xC0 | 30]))
             .await;
@@ -177,7 +162,6 @@ async fn serve_stream(
     tokio::join!(upload, download);
 }
 
-/// 启动一个回环上的“假 WARP”：返回端点与计数的 CONNECT 次数。
 async fn spawn_masque_proxy() -> (SocketAddr, Arc<AtomicUsize>) {
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let key = rcgen::KeyPair::generate().unwrap();
@@ -218,7 +202,6 @@ async fn spawn_masque_proxy() -> (SocketAddr, Arc<AtomicUsize>) {
         }
     });
 
-    // `driver` 是同一个端点的克隆，负责让 accept 循环继续活着
     (addr, connects)
 }
 
@@ -230,7 +213,6 @@ fn credentials_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("httproxy-warp-{}-{stamp}.json", std::process::id()))
 }
 
-/// 启动「假 WARP + 开了 `[warp]` 的 httproxy」，返回（上游地址，本地代理地址，CONNECT 计数）。
 async fn start_with_warp() -> (SocketAddr, SocketAddr, Arc<AtomicUsize>) {
     start_with_warp_and_dns(None).await
 }
@@ -275,7 +257,6 @@ async fn start_with_warp_and_dns(
         register_model: None,
         register_locale: None,
         insecure_skip_verify: true,
-        // 回环目标也要走 WARP，否则这条用例只会测到直连
         bypass_private: false,
         bypass_cidrs: vec![],
         bypass_suffixes: vec![],
@@ -291,7 +272,6 @@ async fn start_with_warp_and_dns(
     (upstream, client, connects)
 }
 
-/// 一个只认 `warp.test` 的 DNS-over-TCP 服务器（RFC 7766 长度前缀分帧）。
 async fn spawn_dns_tcp_server(zone: &'static str, hits: Arc<AtomicUsize>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -328,22 +308,21 @@ fn dns_response(query: &[u8], zone: &str, ip: std::net::Ipv4Addr) -> Vec<u8> {
     assert!(query.len() >= 12, "query too short");
     assert_eq!(question_name(query), zone, "unexpected qname");
 
-    // 问题段结束位置：名字 + type(2) + class(2)
     let qend = question_end(query);
     let qtype = u16::from_be_bytes([query[qend - 4], query[qend - 3]]);
 
-    let answer = qtype == 1; // 只对 A 查询给记录，AAAA 回空答案
+    let answer = qtype == 1;
     let mut resp = Vec::with_capacity(qend + 16);
-    resp.extend_from_slice(&query[0..2]); // ID 原样返回
-    resp.extend_from_slice(&[0x81, 0x80]); // QR=1, RD=1, RA=1, NOERROR
-    resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
+    resp.extend_from_slice(&query[0..2]);
+    resp.extend_from_slice(&[0x81, 0x80]);
+    resp.extend_from_slice(&[0x00, 0x01]);
     resp.extend_from_slice(&if answer { [0x00, 0x01] } else { [0x00, 0x00] });
-    resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NSCOUNT / ARCOUNT
-    resp.extend_from_slice(&query[12..qend]); // 原样回显问题段
+    resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    resp.extend_from_slice(&query[12..qend]);
     if answer {
-        resp.extend_from_slice(&[0xC0, 0x0C]); // 指向问题里的名字
-        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // TYPE=A, CLASS=IN
-        resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL=60
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        resp.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
         resp.extend_from_slice(&[0x00, 0x04]);
         resp.extend_from_slice(&ip.octets());
     }
@@ -371,20 +350,17 @@ fn question_end(query: &[u8]) -> usize {
     loop {
         let len = query[i] as usize;
         if len == 0 {
-            return i + 5; // 结束字节 + TYPE(2) + CLASS(2)
+            return i + 5;
         }
         i += 1 + len;
     }
 }
 
-/// 域名必须由 DNS 模块解析：交给 WARP 的 authority 是 IP，而 DNS 查询本身
-/// 也经 WARP（53 端口落成 DNS-over-TCP）。
 #[tokio::test]
 async fn hostname_is_resolved_locally_and_dns_goes_through_warp() {
     common::init_logging();
     let hits = Arc::new(AtomicUsize::new(0));
     let dns_addr = spawn_dns_tcp_server("warp.test", Arc::clone(&hits)).await;
-    // 回环目标也走 WARP（bypass_private = false），所以 DNS 上游同样被送进隧道
     let (upstream, client, connects) = start_with_warp_and_dns(Some(dns_addr)).await;
 
     let (status, body) = raw_exchange(
@@ -480,6 +456,5 @@ async fn concurrent_streams_share_one_quic_connection() {
         assert_eq!(status, 200);
         assert_eq!(body, b"hello upstream");
     }
-    // 每条隧道一个 CONNECT 流，但底层共用同一条 QUIC 连接
     assert!(connects.load(Ordering::SeqCst) >= 4);
 }
