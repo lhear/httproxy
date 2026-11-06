@@ -12,7 +12,7 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
-    #[command(about = "Generate a JWT token")]
+    #[command(about = "Generate a tunnel token")]
     GenToken {
         #[arg(short, long, help = "Secret key for signing")]
         secret: String,
