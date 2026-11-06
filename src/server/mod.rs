@@ -51,7 +51,7 @@ pub struct Claims {
 pub struct SessionHandle {
     pub cmd_tx: mpsc::Sender<TunnelCmd>,
     pub upload_tx: mpsc::Sender<UploadCmd>,
-    pub upload_cipher: Option<Arc<dyn FrameCipher>>,
+    pub upload_cipher: Arc<dyn FrameCipher>,
     pub encoding: EncodingType,
 }
 
@@ -64,7 +64,7 @@ pub struct AppState {
     pub client_subnet: Option<IpAddr>,
     pub traffic_config: Arc<TrafficConfig>,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
-    pub private_key: Option<x25519_dalek::StaticSecret>,
+    pub private_key: x25519_dalek::StaticSecret,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
     pub stream_registry: Arc<StreamRegistry>,
     pub actors: Arc<DashMap<Uuid, SessionHandle>>,
@@ -105,12 +105,8 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         None => (None, None),
     };
 
-    let private_key = config
-        .server
-        .private_key
-        .as_deref()
-        .map(crypto::b64_to_private_key)
-        .transpose()?;
+    let private_key = crypto::b64_to_private_key(&config.server.private_key)
+        .context("invalid server.private_key")?;
 
     let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
 
@@ -207,7 +203,9 @@ mod tests {
             server: ServerSection {
                 listen: "0.0.0.0:0".into(),
                 path: "/t".into(),
-                private_key: None,
+                private_key: crate::crypto::private_key_to_b64(
+                    &crate::crypto::generate_keypair().0,
+                ),
                 max_tunnels: None,
             },
             auth: AuthSection {
@@ -229,7 +227,9 @@ mod tests {
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         let state = rt.block_on(build_state(&mut cfg)).unwrap();
-        assert!(state.private_key.is_none());
         assert!(state.dns_client.is_none());
+        let peer = crate::crypto::generate_keypair().1;
+        let shared = crate::crypto::diffie_hellman(&state.private_key, &peer);
+        assert_ne!(*shared, [0u8; 32]);
     }
 }

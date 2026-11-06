@@ -38,7 +38,7 @@ enum Phase {
 
 pub struct DownloadLoopActor {
     write_half: OwnedWriteHalf,
-    cipher: Option<Arc<dyn FrameCipher>>,
+    cipher: Arc<dyn FrameCipher>,
     encoding: EncodingType,
     stream_id: Uuid,
     http_client: Arc<wreq::Client>,
@@ -68,7 +68,7 @@ impl DecodeBuffers {
     fn ingest(
         &mut self,
         chunk: Bytes,
-        cipher: Option<&dyn FrameCipher>,
+        cipher: &dyn FrameCipher,
         encoding: EncodingType,
         expected_seq: &mut u64,
     ) -> Result<()> {
@@ -182,13 +182,13 @@ impl DownloadLoopActor {
     pub fn new(
         initial_response: wreq::Response,
         write_half: OwnedWriteHalf,
-        cipher: Option<Arc<AesFrameCipher>>,
+        cipher: Arc<AesFrameCipher>,
         stream_id: Uuid,
         http_client: Arc<wreq::Client>,
         state: Arc<SharedState>,
     ) -> Self {
         let encoding = state.traffic_config.encoding_type;
-        let cipher_dyn: Option<Arc<dyn FrameCipher>> = cipher.map(|c| c as Arc<dyn FrameCipher>);
+        let cipher_dyn: Arc<dyn FrameCipher> = cipher;
         let max_bytes = state.max_download_bytes;
         let rotate_enabled = max_bytes.is_some_and(|m| m > 0);
         let prefetch_at = max_bytes.map(|m| m.saturating_sub(PREFETCH_LEAD_BYTES));
@@ -300,7 +300,7 @@ impl DownloadLoopActor {
                     }
 
                     self.buffers
-                        .ingest(chunk, self.cipher.as_deref(), self.encoding, &mut expected_seq)?;
+                        .ingest(chunk, &*self.cipher, self.encoding, &mut expected_seq)?;
 
                     if self.buffers.needs_flush() {
                         self.buffers.flush(&mut self.write_half, WRITE_STALL_TIMEOUT).await?;
@@ -394,12 +394,9 @@ async fn send_continue_request(
 ) -> Result<wreq::Response> {
     let mut cookie = String::new();
     utils::build_stream_cookie(&mut cookie, stream_id);
-    let mut req = http_client
+    let req = http_client
         .post(state.remote_str.as_str())
         .header("Cookie", cookie);
-    if state.server_public_key.is_none() {
-        req = req.header("Authorization", state.auth_header.as_str());
-    }
     let resp = tokio::time::timeout(DOWNLOAD_CONNECT_TIMEOUT, req.send())
         .await
         .context("continuation timed out")?
@@ -446,6 +443,10 @@ mod tests {
     use crate::crypto::AesFrameCipher;
     use zeroize::Zeroizing;
 
+    fn test_cipher() -> AesFrameCipher {
+        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
+    }
+
     fn buffers() -> DecodeBuffers {
         DecodeBuffers::new()
     }
@@ -458,23 +459,27 @@ mod tests {
     }
 
     fn frame(data: &[u8], seq: u64) -> Bytes {
-        Bytes::from(shaper::encode_frame(data, seq, None, 0, [0, 0], EncodingType::Binary).unwrap())
+        Bytes::from(
+            shaper::encode_frame(data, seq, &test_cipher(), 0, [0, 0], EncodingType::Binary)
+                .unwrap(),
+        )
     }
 
     #[test]
     fn ingest_accepts_frames_in_order() {
+        let cipher = test_cipher();
         let mut bufs = buffers();
         let mut expected_seq = 0u64;
         bufs.ingest(
             frame(b"abc", 0),
-            None,
+            &cipher,
             EncodingType::Binary,
             &mut expected_seq,
         )
         .unwrap();
         bufs.ingest(
             frame(b"de", 1),
-            None,
+            &cipher,
             EncodingType::Binary,
             &mut expected_seq,
         )
@@ -487,34 +492,36 @@ mod tests {
     }
 
     #[test]
-    fn ingest_hands_over_plain_frames_without_copying() {
+    fn ingest_hands_over_frames_without_copying() {
+        let cipher = test_cipher();
         let mut bufs = buffers();
         let mut expected_seq = 0u64;
         let raw = frame(&[0xAB; 512], 0);
         let raw_ptr = raw.as_ptr();
-        bufs.ingest(raw, None, EncodingType::Binary, &mut expected_seq)
+        bufs.ingest(raw, &cipher, EncodingType::Binary, &mut expected_seq)
             .unwrap();
 
         let head = bufs.pending.front().expect("one pending chunk");
         assert_eq!(head.len(), 512);
         assert_eq!(
             head.as_ptr(),
-            raw_ptr.wrapping_add(12),
+            raw_ptr.wrapping_add(2 + crate::crypto::NONCE_LEN + 10),
             "payload must alias the input buffer, not a copy"
         );
     }
 
     #[test]
     fn ingest_handles_split_frames() {
+        let cipher = test_cipher();
         let mut bufs = buffers();
         let mut expected_seq = 0u64;
-        let raw =
-            shaper::encode_frame(b"hello world", 0, None, 0, [0, 0], EncodingType::Binary).unwrap();
+        let raw = shaper::encode_frame(b"hello world", 0, &cipher, 0, [0, 0], EncodingType::Binary)
+            .unwrap();
         let split = raw.len() / 2;
 
         bufs.ingest(
             Bytes::from(raw[..split].to_vec()),
-            None,
+            &cipher,
             EncodingType::Binary,
             &mut expected_seq,
         )
@@ -524,7 +531,7 @@ mod tests {
 
         bufs.ingest(
             Bytes::from(raw[split..].to_vec()),
-            None,
+            &cipher,
             EncodingType::Binary,
             &mut expected_seq,
         )
@@ -535,25 +542,16 @@ mod tests {
 
     #[test]
     fn ingest_queues_decrypted_frames_without_copy() {
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut *key);
-        let cipher = AesFrameCipher::new(&key);
+        let cipher = test_cipher();
         let plain: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
-        let raw = shaper::encode_frame(
-            &plain,
-            0,
-            Some(&cipher as &dyn FrameCipher),
-            0,
-            [0, 0],
-            EncodingType::Binary,
-        )
-        .unwrap();
+        let raw =
+            shaper::encode_frame(&plain, 0, &cipher, 0, [0, 0], EncodingType::Binary).unwrap();
 
         let mut bufs = buffers();
         let mut expected_seq = 0u64;
         bufs.ingest(
             Bytes::from(raw),
-            Some(&cipher as &dyn FrameCipher),
+            &cipher,
             EncodingType::Binary,
             &mut expected_seq,
         )
@@ -565,12 +563,13 @@ mod tests {
 
     #[test]
     fn ingest_rejects_out_of_order() {
+        let cipher = test_cipher();
         let mut bufs = buffers();
         let mut expected_seq = 0u64;
         assert!(
             bufs.ingest(
                 frame(b"x", 5),
-                None,
+                &cipher,
                 EncodingType::Binary,
                 &mut expected_seq
             )
@@ -578,6 +577,22 @@ mod tests {
         );
         assert!(!bufs.has_pending());
         assert_eq!(expected_seq, 0);
+    }
+
+    #[test]
+    fn ingest_rejects_undecryptable_frame() {
+        let cipher = test_cipher();
+        let other = AesFrameCipher::new(&Zeroizing::new([9u8; 32]));
+        let raw = Bytes::from(
+            shaper::encode_frame(b"secret", 0, &other, 0, [0, 0], EncodingType::Binary).unwrap(),
+        );
+
+        let mut bufs = buffers();
+        let mut expected_seq = 0u64;
+        assert!(
+            bufs.ingest(raw, &cipher, EncodingType::Binary, &mut expected_seq)
+                .is_err()
+        );
     }
 
     #[test]
@@ -602,12 +617,13 @@ mod tests {
 
     #[test]
     fn ingest_leaves_no_state_behind_across_chunks() {
+        let cipher = test_cipher();
         let mut bufs = buffers();
         let mut expected_seq = 0u64;
         for i in 0..8u64 {
             bufs.ingest(
                 frame(&[0xAA; 1024], i),
-                None,
+                &cipher,
                 EncodingType::Binary,
                 &mut expected_seq,
             )

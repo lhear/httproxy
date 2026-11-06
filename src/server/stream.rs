@@ -14,7 +14,7 @@ pin_project! {
         inner: S,
         buf: BytesMut,
         json_scratch: Vec<u8>,
-        cipher: Option<Arc<dyn FrameCipher>>,
+        cipher: Arc<dyn FrameCipher>,
         encoding: EncodingType,
         max_buf_size: usize,
         eos: bool,
@@ -27,7 +27,7 @@ where
 {
     pub fn new(
         inner: S,
-        cipher: Option<Arc<dyn FrameCipher>>,
+        cipher: Arc<dyn FrameCipher>,
         encoding: EncodingType,
         max_buf_size: usize,
     ) -> Self {
@@ -53,9 +53,12 @@ where
         let mut this = self.project();
 
         loop {
-            let cipher_ref: Option<&dyn FrameCipher> =
-                this.cipher.as_ref().map(|c| c.as_ref() as &dyn FrameCipher);
-            match shaper::decode_frame(this.buf, this.json_scratch, cipher_ref, *this.encoding) {
+            match shaper::decode_frame(
+                this.buf,
+                this.json_scratch,
+                this.cipher.as_ref(),
+                *this.encoding,
+            ) {
                 Ok(Some(frame)) => {
                     let (seq, data) = match frame {
                         DecodedFrame::InJsonScratch { seq, start, end } => {
@@ -122,14 +125,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::AesFrameCipher;
     use crate::shaper;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
+    use zeroize::Zeroizing;
+
+    fn test_cipher() -> AesFrameCipher {
+        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
+    }
 
     fn make_frame(data: &[u8], seq: u64) -> Bytes {
-        let frame =
-            shaper::encode_frame(data, seq, None, 16384, [0, 0], shaper::EncodingType::Binary)
-                .unwrap();
+        let frame = shaper::encode_frame(
+            data,
+            seq,
+            &test_cipher(),
+            16384,
+            [0, 0],
+            shaper::EncodingType::Binary,
+        )
+        .unwrap();
         Bytes::from(frame)
     }
 
@@ -137,8 +152,12 @@ mod tests {
     async fn single_frame_decoded() {
         let frame = make_frame(b"hello", 0);
         let byte_stream = stream::iter(vec![Ok(frame)]);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
         let (seq, data) = decoder.next().await.unwrap().unwrap();
         assert_eq!(seq, 0);
         assert_eq!(&data[..], b"hello");
@@ -152,8 +171,12 @@ mod tests {
         let bytes: Vec<io::Result<Bytes>> =
             vec![Ok(frame.slice(0..split_at)), Ok(frame.slice(split_at..))];
         let byte_stream = stream::iter(bytes);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
         let (seq, data) = decoder.next().await.unwrap().unwrap();
         assert_eq!(seq, 1);
         assert_eq!(&data[..], b"world");
@@ -168,8 +191,12 @@ mod tests {
         combined.extend_from_slice(&f0);
         combined.extend_from_slice(&f1);
         let byte_stream = stream::iter(vec![Ok(combined.freeze())]);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
 
         let (seq0, d0) = decoder.next().await.unwrap().unwrap();
         assert_eq!(seq0, 0);
@@ -185,8 +212,12 @@ mod tests {
     #[tokio::test]
     async fn trailing_data_errors() {
         let byte_stream = stream::iter(vec![Ok(Bytes::from_static(b"abcde"))]);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
         let result = decoder.next().await.unwrap();
         assert!(result.is_err());
     }
@@ -194,8 +225,12 @@ mod tests {
     #[tokio::test]
     async fn empty_stream_yields_none() {
         let byte_stream = stream::iter(vec![]);
-        let mut decoder: FrameDecoder<_> =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder: FrameDecoder<_> = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
         assert!(decoder.next().await.is_none());
     }
 
@@ -206,8 +241,12 @@ mod tests {
         buf.put_u16(50_000u16);
         buf.resize(2 + 50_000, 0u8);
         let byte_stream = stream::iter(vec![Ok(buf.freeze())]);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
         let result = decoder.next().await.unwrap();
         assert!(result.is_err());
     }
@@ -223,7 +262,12 @@ mod tests {
             Ok(chunk.clone().freeze()),
             Ok(chunk.clone().freeze()),
         ]);
-        let mut decoder = FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 512);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            512,
+        );
         let result = decoder.next().await.unwrap();
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -232,41 +276,58 @@ mod tests {
 
     #[tokio::test]
     async fn encrypted_frames_decoded_with_scratch() {
-        use crate::crypto::AesFrameCipher;
-        use zeroize::Zeroizing;
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut *key);
-        let cipher = Arc::new(AesFrameCipher::new(&key));
-
+        let cipher = Arc::new(test_cipher());
         let frame = shaper::encode_frame(
             b"encrypted hello",
             0,
-            Some(cipher.as_ref() as &dyn shaper::FrameCipher),
+            cipher.as_ref() as &dyn shaper::FrameCipher,
             16384,
             [0, 0],
             shaper::EncodingType::Binary,
         )
         .unwrap();
         let byte_stream = stream::iter(vec![Ok(Bytes::from(frame))]);
-        let mut decoder = FrameDecoder::new(
-            byte_stream,
-            Some(cipher),
-            shaper::EncodingType::Binary,
-            18_781,
-        );
+        let mut decoder =
+            FrameDecoder::new(byte_stream, cipher, shaper::EncodingType::Binary, 18_781);
         let (seq, data) = decoder.next().await.unwrap().unwrap();
         assert_eq!(seq, 0);
         assert_eq!(&data[..], b"encrypted hello");
     }
 
     #[tokio::test]
+    async fn tampered_frame_fails_decoding() {
+        let mut frame = make_frame(b"authentic", 0).to_vec();
+        let mid = frame.len() / 2;
+        frame[mid] ^= 0xFF;
+        let byte_stream = stream::iter(vec![Ok(Bytes::from(frame))]);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
+        assert!(decoder.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn json_encoded_frames_decoded() {
         let data = b"json payload data";
-        let frame =
-            shaper::encode_frame(data, 7, None, 16384, [0, 0], shaper::EncodingType::Json).unwrap();
+        let frame = shaper::encode_frame(
+            data,
+            7,
+            &test_cipher(),
+            16384,
+            [0, 0],
+            shaper::EncodingType::Json,
+        )
+        .unwrap();
         let byte_stream = stream::iter(vec![Ok(Bytes::from(frame))]);
-        let mut decoder = FrameDecoder::new(byte_stream, None, shaper::EncodingType::Json, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Json,
+            18_781,
+        );
         let (seq, decoded) = decoder.next().await.unwrap().unwrap();
         assert_eq!(seq, 7);
         assert_eq!(&decoded[..], data);
@@ -279,8 +340,12 @@ mod tests {
         let mut full = frame.to_vec();
         full.extend_from_slice(&[0x01, 0x02]);
         let byte_stream = stream::iter(vec![Ok(Bytes::from(full))]);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
         let (seq, data) = decoder.next().await.unwrap().unwrap();
         assert_eq!(seq, 0);
         assert_eq!(&data[..], b"complete");
@@ -294,8 +359,12 @@ mod tests {
             io::ErrorKind::BrokenPipe,
             "upstream read failed",
         ))]);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, None, shaper::EncodingType::Binary, 18_781);
+        let mut decoder = FrameDecoder::new(
+            byte_stream,
+            Arc::new(test_cipher()),
+            shaper::EncodingType::Binary,
+            18_781,
+        );
         let err = decoder.next().await.unwrap().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }

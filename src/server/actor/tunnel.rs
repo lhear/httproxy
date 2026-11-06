@@ -206,7 +206,7 @@ impl TunnelActor {
         read_half: UpstreamRead,
         write_half: Option<UpstreamWrite>,
         config: &ResolvedShaperConfig,
-        download_cipher: Option<Arc<dyn FrameCipher>>,
+        download_cipher: Arc<dyn FrameCipher>,
         initial_seq: u64,
     ) {
         let shaper = TrafficShaper::with_seq(read_half, config, download_cipher, initial_seq);
@@ -401,7 +401,14 @@ impl Drop for TunnelActor {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    fn test_cipher() -> Arc<dyn FrameCipher> {
+        Arc::new(crate::crypto::AesFrameCipher::new(
+            &zeroize::Zeroizing::new([7u8; 32]),
+        ))
+    }
     use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -467,7 +474,7 @@ mod tests {
             read_half.into(),
             Some(client_write.into()),
             &resolved_config(),
-            None,
+            test_cipher(),
             0,
         );
         let first = actor.take_segment().expect("first segment");
@@ -505,7 +512,7 @@ mod tests {
             read_half.into(),
             Some(client_write.into()),
             &resolved_config(),
-            None,
+            test_cipher(),
             0,
         );
         let first = actor.take_segment().expect("first segment");
@@ -547,7 +554,7 @@ mod tests {
             read_half.into(),
             Some(client_write.into()),
             &resolved_config(),
-            None,
+            test_cipher(),
             0,
         );
         let handle = tokio::spawn(async move { actor.run().await });
@@ -572,7 +579,7 @@ mod tests {
             read_half.into(),
             Some(client_write.into()),
             &resolved_config(),
-            None,
+            test_cipher(),
             0,
         );
         let first = actor.take_segment().expect("first segment");
@@ -614,7 +621,7 @@ mod tests {
             read_half.into(),
             Some(client_write.into()),
             &resolved_config(),
-            None,
+            test_cipher(),
             0,
         );
         let segment = actor.take_segment().expect("first segment");
@@ -677,7 +684,9 @@ mod timeout_tests {
             read_half.into(),
             Some(client_write.into()),
             &Arc::new(ResolvedShaperConfig::resolve(&cfg)),
-            None,
+            Arc::new(crate::crypto::AesFrameCipher::new(
+                &zeroize::Zeroizing::new([7u8; 32]),
+            )),
             0,
         );
         let mut segment = actor.take_segment().expect("first segment");

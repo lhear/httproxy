@@ -55,7 +55,7 @@ pub struct ProxySection {
 pub struct ServerSection {
     pub listen: String,
     pub path: String,
-    pub private_key: Option<String>,
+    pub private_key: String,
     #[serde(default)]
     pub max_tunnels: Option<usize>,
 }
@@ -66,8 +66,7 @@ pub struct ClientSection {
     pub listen: String,
     pub remote: String,
     pub address: Option<String>,
-    #[serde(default)]
-    pub public_key: Option<String>,
+    pub public_key: String,
     #[serde(default)]
     pub auth: Option<ClientProxyAuth>,
     #[serde(default)]
@@ -101,6 +100,7 @@ mod tests {
 [server]
 listen = "127.0.0.1:3000"
 path = "/secret"
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 [auth]
 secret = "key"
@@ -121,6 +121,7 @@ padding_threshold = 50
 [server]
 listen = "127.0.0.1:3000"
 path = "/secret"
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 [auth]
 secret = "key"
@@ -149,6 +150,7 @@ bypass_suffixes = ["corp.local"]
 [server]
 listen = "127.0.0.1:3000"
 path = "/secret"
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 [auth]
 secret = "key"
@@ -169,6 +171,7 @@ enable = true
 [client]
 listen = "127.0.0.1:8080"
 remote = "https://example.com/secret"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 [auth]
 token = "mytoken"
@@ -188,6 +191,7 @@ padding_threshold = 50
 [client]
 listen = "127.0.0.1:8080"
 remote = "https://example.com/secret"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 [auth]
 token = "mytoken"
@@ -209,5 +213,39 @@ target = "example.com:443"
         assert_eq!(cfg.redirect[0].listen, "127.0.0.1:2222");
         assert_eq!(cfg.redirect[0].target, "172.16.0.207:22");
         assert_eq!(cfg.redirect[1].target, "example.com:443");
+    }
+
+    #[test]
+    fn server_config_requires_private_key() {
+        let toml_str = r#"
+[server]
+listen = "127.0.0.1:3000"
+path = "/secret"
+
+[auth]
+secret = "key"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+"#;
+        assert!(toml::from_str::<ServerTopConfig>(toml_str).is_err());
+    }
+
+    #[test]
+    fn client_config_requires_public_key() {
+        let toml_str = r#"
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://example.com/secret"
+
+[auth]
+token = "mytoken"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+"#;
+        assert!(toml::from_str::<ClientTopConfig>(toml_str).is_err());
     }
 }

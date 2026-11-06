@@ -43,7 +43,7 @@ pub struct SharedState {
     pub traffic_config: TrafficConfig,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub bypass: Option<Arc<BypassRules>>,
-    pub server_public_key: Option<x25519_dalek::PublicKey>,
+    pub server_public_key: x25519_dalek::PublicKey,
     pub proxy_auth: Option<(String, String)>,
     pub initial_master: Mutex<Option<InitialMasterEntry>>,
     pub handshake_lock: Mutex<()>,
@@ -126,9 +126,7 @@ impl ClientPqFsm {
                             payload: resuming.payload,
                             read_half: rh,
                             write_half: wh,
-                            server_pk: state.server_public_key.ok_or_else(|| {
-                                anyhow::anyhow!("server public key not configured")
-                            })?,
+                            server_pk: state.server_public_key,
                         })
                     }
                     Err((_, e)) => {
@@ -234,6 +232,7 @@ mod tests {
     use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
 
     fn shared_state() -> Arc<SharedState> {
+        let (_, server_pk) = crate::crypto::generate_keypair();
         let traffic = TrafficConfig {
             global: PaddingConfig {
                 padding_threshold: 0,
@@ -249,7 +248,7 @@ mod tests {
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass: None,
-            server_public_key: None,
+            server_public_key: server_pk,
             proxy_auth: None,
             initial_master: Mutex::new(None),
             handshake_lock: Mutex::new(()),

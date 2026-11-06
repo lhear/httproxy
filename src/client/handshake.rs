@@ -12,7 +12,7 @@ use crate::client::actor::download_loop::DownloadLoopActor;
 use crate::client::actor::upload_loop::UploadLoopActor;
 use crate::client::utils;
 use crate::crypto::{self, AesFrameCipher};
-use crate::shaper::{self, FrameCipher, MAX_RAW_PAYLOAD};
+use crate::shaper::{self, MAX_RAW_PAYLOAD};
 
 use super::state::SharedState;
 use crate::client::constants::{
@@ -70,7 +70,7 @@ pub async fn try_pq_connect(
     let (early_data, remaining_payload, frames_sent) = utils::encode_initial_payload(
         &initial_payload,
         MAX_RAW_PAYLOAD,
-        Some(upload_cipher.as_ref() as &dyn FrameCipher),
+        upload_cipher.as_ref(),
         &state.traffic_config,
     )?;
 
@@ -114,7 +114,7 @@ pub async fn try_pq_connect(
         upload_state.clone(),
         remaining_payload,
         read_half,
-        Some(upload_cipher_clone),
+        upload_cipher_clone,
         stream_id,
         frames_sent,
     );
@@ -124,7 +124,7 @@ pub async fn try_pq_connect(
     let download_actor = DownloadLoopActor::new(
         response,
         write_half,
-        Some(download_cipher),
+        download_cipher,
         stream_id,
         Arc::clone(http_client),
         Arc::clone(state),
@@ -159,7 +159,7 @@ pub async fn perform_pq_handshake(
     let client_hello_frame = shaper::encode_frame(
         &client_hello,
         0,
-        Some(&handshake_cipher),
+        &handshake_cipher,
         state.traffic_config.global.padding_threshold,
         state.traffic_config.global.padding_range,
         state.traffic_config.encoding_type,
@@ -193,7 +193,6 @@ pub async fn perform_pq_handshake(
 
     let response = utils::check_response_status(response, "server rejected handshake").await?;
 
-    let handshake_cipher_ref: &dyn FrameCipher = &handshake_cipher;
     let mut body_buf = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
     let mut stream = response.into_data_stream();
     let server_hello_data = loop {
@@ -202,7 +201,7 @@ pub async fn perform_pq_handshake(
                 body_buf.extend_from_slice(&chunk);
                 if let Some((_, data)) = shaper::decode_from_buffer(
                     &mut body_buf,
-                    Some(handshake_cipher_ref),
+                    &handshake_cipher,
                     state.traffic_config.encoding_type,
                 )? {
                     break data;

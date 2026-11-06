@@ -102,8 +102,8 @@ async fn setup_tunnel_response(
     host: &str,
     port: u16,
     stream_id: Uuid,
-    upload_cipher: Option<Arc<dyn FrameCipher>>,
-    download_cipher: Option<Arc<dyn FrameCipher>>,
+    upload_cipher: Arc<dyn FrameCipher>,
+    download_cipher: Arc<dyn FrameCipher>,
 ) -> Result<Response, ServerError> {
     let tunnel_permit = state
         .tunnel_semaphore
@@ -311,7 +311,7 @@ async fn spawn_encrypted_tunnel(
     span.record("target", &target);
 
     let download_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&download_key));
-    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
+    let upload_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&upload_key));
 
     let response = setup_tunnel_response(
         &state,
@@ -319,8 +319,8 @@ async fn spawn_encrypted_tunnel(
         host,
         port,
         stream_id,
-        Some(upload_cipher as Arc<dyn FrameCipher>),
-        Some(download_cipher),
+        upload_cipher,
+        download_cipher,
     )
     .await?;
 
@@ -422,7 +422,6 @@ pub async fn dispatch(
     body: Body,
 ) -> Result<Response, ServerError> {
     let span = tracing::Span::current();
-    let has_target = headers.get("X-Target").is_some();
 
     if let Some(stream_cookie_val) = utils::extract_cookie_value(&headers, "stream") {
         let stream_id = Uuid::parse_str(stream_cookie_val)
@@ -432,29 +431,16 @@ pub async fn dispatch(
             return dispatch_to_actor(handle, body).await;
         }
 
-        if has_target {
-            return handle_plaintext_tunnel(state, headers, body, span, Some(stream_id)).await;
-        }
-
         return handle_stream_not_found(&state, stream_id);
     }
 
     if let Some(session_val) = utils::extract_cookie_value(&headers, "session") {
-        if session_val.contains(':') {
-            return spawn_encrypted_tunnel(state, session_val, body, span).await;
+        if !session_val.contains(':') {
+            return Err(ServerError::precondition_required(
+                "invalid session cookie: encrypted session required",
+            ));
         }
-        if has_target {
-            let stream_id = Uuid::parse_str(session_val)
-                .map_err(|_| ServerError::precondition_required("invalid stream id"))?;
-            return handle_plaintext_tunnel(state, headers, body, span, Some(stream_id)).await;
-        }
-        return Err(ServerError::precondition_required(
-            "invalid session cookie — missing target or encrypted payload",
-        ));
-    }
-
-    if has_target {
-        return handle_plaintext_tunnel(state, headers, body, span, None).await;
+        return spawn_encrypted_tunnel(state, session_val, body, span).await;
     }
 
     let has_handshake_cookie = utils::extract_cookie_value(&headers, "eph_pk_a").is_some();
@@ -462,9 +448,7 @@ pub async fn dispatch(
         return handle_fresh_handshake(state, headers, body, span).await;
     }
 
-    Err(ServerError::bad_request(
-        "missing required cookies or headers",
-    ))
+    Err(ServerError::bad_request("missing required cookies"))
 }
 
 fn handle_stream_not_found(
@@ -491,49 +475,6 @@ fn handle_stream_not_found(
     }
 }
 
-async fn handle_plaintext_tunnel(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    body: Body,
-    span: tracing::Span,
-    stream_id_opt: Option<Uuid>,
-) -> Result<Response, ServerError> {
-    let user = validate_token_if_needed(&headers, &state.token_key, &state.token_cache).await?;
-    span.record("user", &*user);
-
-    let target = headers
-        .get("X-Target")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ServerError::bad_request("missing X-Target header"))?;
-    span.record("target", target);
-
-    let stream_id = match stream_id_opt {
-        Some(id) => id,
-        None => Uuid::new_v4(),
-    };
-
-    let (host, port_str) = target
-        .rsplit_once(':')
-        .ok_or_else(|| ServerError::bad_request("target must be host:port"))?;
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| ServerError::bad_request("invalid port"))?;
-
-    if !state.stream_registry.register(stream_id, crate::now_secs()) {
-        warn!(stream_id = %stream_id, "duplicate stream registration for plaintext tunnel");
-        return Err(ServerError::precondition_required("stream already active"));
-    }
-
-    let mut stream_guard = StreamGuard::new(Arc::clone(&state.stream_registry), stream_id);
-
-    let response = setup_tunnel_response(&state, body, host, port, stream_id, None, None).await?;
-
-    stream_guard.disarm();
-
-    info!(stream_id = %stream_id, "tunnel established");
-    Ok(response)
-}
-
 async fn handle_fresh_handshake(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -556,12 +497,7 @@ async fn handle_fresh_handshake(
     let eph_pk_a_arr: [u8; 32] = eph_pk_a_bytes[..].try_into().unwrap();
     let eph_pk_a = x25519_dalek::PublicKey::from(eph_pk_a_arr);
 
-    let private_key = state
-        .private_key
-        .as_ref()
-        .ok_or_else(|| ServerError::internal("server private key not configured"))?;
-
-    let shared_a = crypto::diffie_hellman(private_key, &eph_pk_a);
+    let shared_a = crypto::diffie_hellman(&state.private_key, &eph_pk_a);
     let handshake_key = crypto::derive_handshake_key(&shared_a);
     let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
@@ -576,7 +512,7 @@ async fn handle_fresh_handshake(
     let mut buf = BytesMut::from(&body_bytes[..]);
     let Some((_seq, client_hello_data)) = shaper::decode_from_buffer(
         &mut buf,
-        Some(&handshake_cipher as &dyn FrameCipher),
+        &handshake_cipher,
         state.traffic_config.encoding_type,
     )?
     else {
@@ -641,7 +577,7 @@ async fn handle_fresh_handshake(
     let server_hello_frame = shaper::encode_frame(
         &server_hello,
         0,
-        Some(&handshake_cipher as &dyn FrameCipher),
+        &handshake_cipher,
         state.traffic_config.global.padding_threshold,
         state.traffic_config.global.padding_range,
         state.traffic_config.encoding_type,
@@ -714,7 +650,9 @@ mod tests {
             server: crate::config::ServerSection {
                 listen: "127.0.0.1:0".to_string(),
                 path: "/secret".to_string(),
-                private_key: None,
+                private_key: crate::crypto::private_key_to_b64(
+                    &crate::crypto::generate_keypair().0,
+                ),
                 max_tunnels: None,
             },
             auth: crate::config::AuthSection {
@@ -848,20 +786,33 @@ mod tests {
         assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
     }
 
-    #[tokio::test]
-    async fn dispatch_rejects_bad_token_with_target() {
-        let state = test_state().await;
+    fn handshake_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
-        headers.insert("Authorization", "Bearer invalid-token".parse().unwrap());
-        let err = dispatch(State(state), headers, Body::empty())
-            .await
-            .unwrap_err();
+        headers.insert(
+            "cookie",
+            "eph_pk_a=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_bad_token_with_handshake_cookie() {
+        let state = test_state().await;
+        let err = dispatch(
+            State(state),
+            handshake_headers("invalid-token"),
+            Body::empty(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn dispatch_bad_gateway_on_unreachable_target_with_valid_token() {
+    async fn dispatch_rejects_plaintext_tunnel() {
         let state = test_state().await;
         let mut headers = HeaderMap::new();
         headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
@@ -872,7 +823,7 @@ mod tests {
         let err = dispatch(State(state), headers, Body::empty())
             .await
             .unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -887,19 +838,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_routes_expired_token_to_handshake_cookie_path() {
+    async fn dispatch_rejects_expired_token_on_handshake_path() {
         let state = test_state().await;
-        let token = crate::server::token::issue(
-            &crate::server::token::key_from_secret(b"test-secret"),
-            &crate::server::Claims {
-                sub: "user".to_string(),
-                exp: 1,
-            },
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
-        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
-        let err = dispatch(State(state), headers, Body::empty())
+        let token = token_with_exp(1);
+        let err = dispatch(State(state), handshake_headers(&token), Body::empty())
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);

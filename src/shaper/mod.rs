@@ -27,8 +27,7 @@ pub const MAX_RAW_PAYLOAD: usize = 16 * 1024;
 
 const READ_HIGH_WATER: usize = 32 * 1024;
 
-pub const JSON_PAYLOAD_CAP_PLAIN: usize = 14320 - HEADER_LEN;
-pub const JSON_PAYLOAD_CAP_CIPHER: usize = 14320 - HEADER_LEN - NONCE_LEN - TAG_LEN;
+pub const JSON_PAYLOAD_CAP: usize = 14320 - HEADER_LEN - NONCE_LEN - TAG_LEN;
 
 const TABLE_SIZE: usize = 8192;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
@@ -288,11 +287,10 @@ fn parse_json_payload_into(json: &[u8], out: &mut Vec<u8>) -> Result<usize, Erro
 }
 
 #[inline]
-fn frame_raw_limit(cipher: Option<&dyn FrameCipher>, encoding: EncodingType) -> usize {
-    match (cipher.is_some(), encoding) {
-        (true, EncodingType::Json) => JSON_PAYLOAD_CAP_CIPHER,
-        (false, EncodingType::Json) => JSON_PAYLOAD_CAP_PLAIN,
-        _ => MAX_RAW_PAYLOAD,
+fn frame_raw_limit(encoding: EncodingType) -> usize {
+    match encoding {
+        EncodingType::Json => JSON_PAYLOAD_CAP,
+        EncodingType::Binary => MAX_RAW_PAYLOAD,
     }
 }
 
@@ -315,14 +313,14 @@ fn resolve_frame_padding(
 pub fn encode_frame_into(
     data: &[u8],
     seq: u64,
-    cipher: Option<&dyn FrameCipher>,
+    cipher: &dyn FrameCipher,
     padding_threshold: usize,
     padding_range: [usize; 2],
     encoding: EncodingType,
     out: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     let raw_len = data.len();
-    let raw_limit = frame_raw_limit(cipher, encoding);
+    let raw_limit = frame_raw_limit(encoding);
     if raw_len > raw_limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -333,8 +331,8 @@ pub fn encode_frame_into(
     let padding_len = resolve_frame_padding(raw_len, padding_threshold, padding_range, raw_limit);
     let payload_len = HEADER_LEN + raw_len + padding_len;
 
-    match (cipher, encoding) {
-        (Some(cipher), EncodingType::Binary) => {
+    match encoding {
+        EncodingType::Binary => {
             let enc_len = NONCE_LEN + payload_len + TAG_LEN;
             out.reserve(2 + enc_len);
             out.put_u16(enc_len as u16);
@@ -349,17 +347,7 @@ pub fn encode_frame_into(
             }
             cipher.seal_in_place(out, nonce_start, ct_start)?;
         }
-        (None, EncodingType::Binary) => {
-            out.reserve(2 + payload_len);
-            out.put_u16(payload_len as u16);
-            out.put_u64(seq);
-            out.put_u16(raw_len as u16);
-            out.put_slice(data);
-            if padding_len > 0 {
-                out.put_bytes(0u8, padding_len);
-            }
-        }
-        (_, EncodingType::Json) => {
+        EncodingType::Json => {
             let mut payload = BytesMut::with_capacity(payload_len);
             payload.put_u64(seq);
             payload.put_u16(raw_len as u16);
@@ -367,14 +355,10 @@ pub fn encode_frame_into(
             if padding_len > 0 {
                 payload.resize(payload_len, 0u8);
             }
+            let mut sealed = BytesMut::with_capacity(payload_len + NONCE_LEN + TAG_LEN);
+            cipher.encrypt_into(&payload, &mut sealed)?;
             let mut encoded = Vec::with_capacity(payload_len + payload_len / 6 + 16);
-            if let Some(cipher) = cipher {
-                let mut sealed = BytesMut::with_capacity(payload_len + NONCE_LEN + TAG_LEN);
-                cipher.encrypt_into(&payload, &mut sealed)?;
-                base122_fast::encode_into(&sealed, &mut encoded);
-            } else {
-                base122_fast::encode_into(&payload, &mut encoded);
-            }
+            base122_fast::encode_into(&sealed, &mut encoded);
             out.reserve(9 + encoded.len() + 3);
             out.put_slice(b"{\"data\":\"");
             out.put_slice(&encoded);
@@ -388,7 +372,7 @@ pub fn encode_frame_into(
 pub fn encode_frame(
     data: &[u8],
     seq: u64,
-    cipher: Option<&dyn FrameCipher>,
+    cipher: &dyn FrameCipher,
     padding_threshold: usize,
     padding_range: [usize; 2],
     encoding: EncodingType,
@@ -415,7 +399,7 @@ pub enum DecodedFrame {
 pub fn decode_frame(
     src: &mut BytesMut,
     json_scratch: &mut Vec<u8>,
-    cipher: Option<&dyn FrameCipher>,
+    cipher: &dyn FrameCipher,
     encoding: EncodingType,
 ) -> Result<Option<DecodedFrame>, Error> {
     match encoding {
@@ -437,14 +421,8 @@ pub fn decode_frame(
             src.advance(2);
             let mut view = src.split_to(frame_len);
 
-            let offset = match cipher {
-                Some(c) => {
-                    let range = c.decrypt_in_place(&mut view)?;
-                    range.start
-                }
-                None => 0,
-            };
-
+            let range = cipher.decrypt_in_place(&mut view)?;
+            let offset = range.start;
             let (seq, start, end) = extract_frame_range(&view[offset..])?;
             let data = view.freeze().slice(offset + start..offset + end);
             Ok(Some(DecodedFrame::Owned { seq, data }))
@@ -474,13 +452,7 @@ pub fn decode_frame(
                     }
                     parse_json_payload_into(&line, json_scratch)?;
 
-                    let plain = match cipher {
-                        Some(c) => {
-                            let range = c.decrypt_in_place(json_scratch)?;
-                            range.start..range.end
-                        }
-                        None => 0..json_scratch.len(),
-                    };
+                    let plain = cipher.decrypt_in_place(json_scratch)?;
 
                     let (seq, start, end) =
                         extract_frame_range(&json_scratch[plain.start..plain.end])?;
@@ -506,7 +478,7 @@ pub fn decode_frame(
 
 pub fn decode_from_buffer(
     src: &mut BytesMut,
-    cipher: Option<&dyn FrameCipher>,
+    cipher: &dyn FrameCipher,
     encoding: EncodingType,
 ) -> Result<Option<(u64, Bytes)>, Error> {
     let mut json_scratch = Vec::new();
@@ -548,7 +520,7 @@ pin_project! {
         packet_count: usize,
         stage_idx: usize,
         rng: SmallRng,
-        cipher: Option<Arc<dyn FrameCipher>>,
+        cipher: Arc<dyn FrameCipher>,
         encoding: EncodingType,
         seal_threshold: usize,
         frame_capacity: usize,
@@ -560,7 +532,7 @@ impl<R> TrafficShaper<R> {
     pub fn with_seq(
         reader: R,
         config: &ResolvedShaperConfig,
-        cipher: Option<Arc<dyn FrameCipher>>,
+        cipher: Arc<dyn FrameCipher>,
         start_seq: u64,
     ) -> Self {
         let mut base_rng = rand::rng();
@@ -568,13 +540,9 @@ impl<R> TrafficShaper<R> {
 
         let out_capacity = max_encoded_frame_len(config.encoding);
 
-        let seal_threshold = match (cipher.is_some(), config.encoding) {
-            (true, EncodingType::Binary) => {
-                MAX_RAW_PAYLOAD - (NONCE_LEN + TAG_LEN + HEADER_LEN + 2)
-            }
-            (false, EncodingType::Binary) => MAX_RAW_PAYLOAD - (HEADER_LEN + 2),
-            (true, EncodingType::Json) => JSON_PAYLOAD_CAP_CIPHER,
-            (false, EncodingType::Json) => JSON_PAYLOAD_CAP_PLAIN,
+        let seal_threshold = match config.encoding {
+            EncodingType::Binary => MAX_RAW_PAYLOAD - (NONCE_LEN + TAG_LEN + HEADER_LEN + 2),
+            EncodingType::Json => JSON_PAYLOAD_CAP,
         };
 
         Self {
@@ -642,8 +610,8 @@ impl<R> TrafficShaper<R> {
 
         let (payload_len, padding_len) = Self::resolve_padding(this, raw_len);
 
-        match (this.cipher.as_deref(), *this.encoding) {
-            (Some(cipher), EncodingType::Binary) => {
+        match *this.encoding {
+            EncodingType::Binary => {
                 let enc_len = NONCE_LEN + payload_len + TAG_LEN;
                 out.reserve(2 + enc_len);
                 out.put_u16(enc_len as u16);
@@ -656,32 +624,19 @@ impl<R> TrafficShaper<R> {
                 if padding_len > 0 {
                     out.put_bytes(0u8, padding_len);
                 }
-                cipher.seal_in_place(out, nonce_start, ct_start)?;
+                this.cipher.seal_in_place(out, nonce_start, ct_start)?;
             }
-            (None, EncodingType::Binary) => {
-                out.reserve(2 + payload_len);
-                out.put_u16(payload_len as u16);
-                out.put_u64(seq);
-                out.put_u16(raw_len as u16);
-                out.put_slice(&this.raw_buf[..raw_len]);
-                if padding_len > 0 {
-                    out.put_bytes(0u8, padding_len);
-                }
-            }
-            (_, EncodingType::Json) => {
-                let head = if this.cipher.is_some() { NONCE_LEN } else { 0 };
+            EncodingType::Json => {
                 this.enc_buf.clear();
-                this.enc_buf.reserve(head + payload_len + TAG_LEN);
-                this.enc_buf.put_bytes(0u8, head);
+                this.enc_buf.reserve(NONCE_LEN + payload_len + TAG_LEN);
+                this.enc_buf.put_bytes(0u8, NONCE_LEN);
                 this.enc_buf.put_u64(seq);
                 this.enc_buf.put_u16(raw_len as u16);
                 this.enc_buf.put_slice(&this.raw_buf[..raw_len]);
                 if padding_len > 0 {
                     this.enc_buf.put_bytes(0u8, padding_len);
                 }
-                if let Some(cipher) = this.cipher.as_deref() {
-                    cipher.seal_in_place(this.enc_buf, 0, NONCE_LEN)?;
-                }
+                this.cipher.seal_in_place(this.enc_buf, 0, NONCE_LEN)?;
                 base122_fast::encode_into(&this.enc_buf[..], this.json_buf);
                 out.reserve(9 + this.json_buf.len() + 3);
                 out.put_slice(b"{\"data\":\"");
@@ -787,7 +742,9 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::AesFrameCipher;
     use std::io::Cursor;
+    use zeroize::Zeroizing;
 
     fn test_config() -> TrafficConfig {
         TrafficConfig {
@@ -801,21 +758,30 @@ mod tests {
         }
     }
 
+    fn test_cipher() -> AesFrameCipher {
+        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
+    }
+
+    fn test_cipher_arc() -> Arc<dyn FrameCipher> {
+        Arc::new(test_cipher())
+    }
+
     #[test]
-    fn encode_decode_roundtrip_binary_no_cipher() {
+    fn encode_decode_roundtrip_binary() {
         let data = b"hello proxy frame";
         let config = test_config();
+        let cipher = test_cipher();
         let frame = encode_frame(
             data,
             7,
-            None,
+            &cipher,
             config.global.padding_threshold,
             config.global.padding_range,
             config.encoding_type,
         )
         .unwrap();
         let mut buf = BytesMut::from(&frame[..]);
-        let (seq, decoded) = decode_from_buffer(&mut buf, None, EncodingType::Binary)
+        let (seq, decoded) = decode_from_buffer(&mut buf, &cipher, EncodingType::Binary)
             .unwrap()
             .unwrap();
         assert_eq!(seq, 7);
@@ -829,7 +795,13 @@ mod tests {
         buf.put_u16(100u16);
         buf.put_u8(0xAA);
         let mut json_scratch = Vec::new();
-        let result = decode_frame(&mut buf, &mut json_scratch, None, EncodingType::Binary).unwrap();
+        let result = decode_frame(
+            &mut buf,
+            &mut json_scratch,
+            &test_cipher(),
+            EncodingType::Binary,
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -839,7 +811,12 @@ mod tests {
         buf.put_u16((MAX_RAW_PAYLOAD + 1000) as u16);
         buf.resize(2 + MAX_RAW_PAYLOAD + 1000, 0u8);
         let mut json_scratch = Vec::new();
-        let result = decode_frame(&mut buf, &mut json_scratch, None, EncodingType::Binary);
+        let result = decode_frame(
+            &mut buf,
+            &mut json_scratch,
+            &test_cipher(),
+            EncodingType::Binary,
+        );
         assert!(result.is_err());
     }
 
@@ -888,98 +865,29 @@ mod tests {
     }
 
     #[test]
-    fn decode_frame_plain_owned_zero_copy() {
-        let data = b"plain payload";
-        let frame = encode_frame(data, 9, None, 16384, [0, 0], EncodingType::Binary).unwrap();
-        let mut src = BytesMut::from(&frame[..]);
-        let mut json_scratch = Vec::new();
-        match decode_frame(&mut src, &mut json_scratch, None, EncodingType::Binary)
-            .unwrap()
-            .unwrap()
-        {
-            DecodedFrame::Owned { seq, data } => {
-                assert_eq!(seq, 9);
-                assert_eq!(&data[..], b"plain payload");
-            }
-            _ => panic!("expected Owned frame"),
-        }
-        assert!(src.is_empty());
-    }
-
-    #[test]
     fn decode_frame_binary_is_zero_copy() {
-        use crate::crypto::AesFrameCipher;
-        use zeroize::Zeroizing;
-
-        let cipher = AesFrameCipher::new(&Zeroizing::new([7u8; 32]));
-        let ciphers: [Option<&dyn FrameCipher>; 2] = [None, Some(&cipher)];
-        for c in ciphers {
-            let frame = encode_frame(b"payload", 0, c, 0, [0, 0], EncodingType::Binary).unwrap();
-            let mut src = BytesMut::from(&frame[..]);
-            let base = src.as_ptr() as usize;
-            let limit = base + src.capacity();
-            let mut json_scratch = Vec::new();
-            let Some(DecodedFrame::Owned { data, .. }) =
-                decode_frame(&mut src, &mut json_scratch, c, EncodingType::Binary).unwrap()
-            else {
-                panic!("expected Owned frame");
-            };
-            let start = data.as_ptr() as usize;
-            assert_eq!(&data[..], b"payload");
-            assert!(
-                start >= base && start + data.len() <= limit,
-                "decoded payload must alias the input buffer, not a copy"
-            );
-        }
-    }
-
-    #[test]
-    fn decode_frame_cipher_in_place() {
-        use crate::crypto::AesFrameCipher;
-        use zeroize::Zeroizing;
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(&mut *key);
-        let cipher = AesFrameCipher::new(&key);
-
-        let frame = encode_frame(
-            b"secret payload",
-            42,
-            Some(&cipher),
-            16384,
-            [0, 0],
-            EncodingType::Binary,
-        )
-        .unwrap();
+        let cipher = test_cipher();
+        let frame = encode_frame(b"payload", 0, &cipher, 0, [0, 0], EncodingType::Binary).unwrap();
         let mut src = BytesMut::from(&frame[..]);
+        let base = src.as_ptr() as usize;
+        let limit = base + src.capacity();
         let mut json_scratch = Vec::new();
-        match decode_frame(
-            &mut src,
-            &mut json_scratch,
-            Some(&cipher),
-            EncodingType::Binary,
-        )
-        .unwrap()
-        .unwrap()
-        {
-            DecodedFrame::Owned { seq, data } => {
-                assert_eq!(seq, 42);
-                assert_eq!(&data[..], b"secret payload");
-            }
-            _ => panic!("expected Owned frame"),
-        }
-        assert!(src.is_empty());
+        let Some(DecodedFrame::Owned { data, .. }) =
+            decode_frame(&mut src, &mut json_scratch, &cipher, EncodingType::Binary).unwrap()
+        else {
+            panic!("expected Owned frame");
+        };
+        let start = data.as_ptr() as usize;
+        assert_eq!(&data[..], b"payload");
+        assert!(
+            start >= base && start + data.len() <= limit,
+            "decoded payload must alias the input buffer, not a copy"
+        );
     }
 
     #[test]
-    fn decode_frame_cipher_multiple_frames() {
-        use crate::crypto::AesFrameCipher;
-        use zeroize::Zeroizing;
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(&mut *key);
-        let cipher = AesFrameCipher::new(&key);
-
+    fn decode_frame_roundtrips_multiple_frames() {
+        let cipher = test_cipher();
         let mut combined = BytesMut::new();
         for (i, msg) in [
             b"first".as_slice(),
@@ -989,15 +897,8 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let frame = encode_frame(
-                msg,
-                i as u64,
-                Some(&cipher),
-                16384,
-                [0, 0],
-                EncodingType::Binary,
-            )
-            .unwrap();
+            let frame =
+                encode_frame(msg, i as u64, &cipher, 16384, [0, 0], EncodingType::Binary).unwrap();
             combined.extend_from_slice(&frame);
         }
 
@@ -1007,7 +908,7 @@ mod tests {
             match decode_frame(
                 &mut combined,
                 &mut json_scratch,
-                Some(&cipher),
+                &cipher,
                 EncodingType::Binary,
             )
             .unwrap()
@@ -1033,11 +934,19 @@ mod tests {
 
     #[test]
     fn decode_frame_json_roundtrip() {
-        let frame =
-            encode_frame(b"json payload", 3, None, 16384, [0, 0], EncodingType::Json).unwrap();
+        let cipher = test_cipher();
+        let frame = encode_frame(
+            b"json payload",
+            3,
+            &cipher,
+            16384,
+            [0, 0],
+            EncodingType::Json,
+        )
+        .unwrap();
         let mut src = BytesMut::from(&frame[..]);
         let mut json_scratch = Vec::new();
-        match decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json)
+        match decode_frame(&mut src, &mut json_scratch, &cipher, EncodingType::Json)
             .unwrap()
             .unwrap()
         {
@@ -1051,18 +960,19 @@ mod tests {
     }
 
     #[test]
-    fn decode_frame_json_plain_keeps_scratch_allocation() {
+    fn decode_frame_json_keeps_scratch_allocation() {
+        let cipher = test_cipher();
         let mut src = BytesMut::new();
         for (i, msg) in [b"aaaa".as_slice(), b"bbbb".as_slice()].iter().enumerate() {
             let frame =
-                encode_frame(msg, i as u64, None, 16384, [0, 0], EncodingType::Json).unwrap();
+                encode_frame(msg, i as u64, &cipher, 16384, [0, 0], EncodingType::Json).unwrap();
             src.extend_from_slice(&frame);
         }
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut cap_after_first = 0usize;
         for i in 0..2u64 {
-            match decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json)
+            match decode_frame(&mut src, &mut json_scratch, &cipher, EncodingType::Json)
                 .unwrap()
                 .unwrap()
             {
@@ -1085,94 +995,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_frame_json_cipher_roundtrip() {
-        use crate::crypto::AesFrameCipher;
-        use zeroize::Zeroizing;
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(&mut *key);
-        let cipher = AesFrameCipher::new(&key);
-
-        let frame = encode_frame(
-            b"json cipher payload",
-            5,
-            Some(&cipher),
-            16384,
-            [0, 0],
-            EncodingType::Json,
-        )
-        .unwrap();
-        let mut src = BytesMut::from(&frame[..]);
-        let mut json_scratch = Vec::new();
-        match decode_frame(
-            &mut src,
-            &mut json_scratch,
-            Some(&cipher),
-            EncodingType::Json,
-        )
-        .unwrap()
-        .unwrap()
-        {
-            DecodedFrame::InJsonScratch { seq, start, end } => {
-                assert_eq!(seq, 5);
-                assert_eq!(&json_scratch[start..end], b"json cipher payload");
-            }
-            _ => panic!("expected InJsonScratch frame"),
-        }
-        assert!(src.is_empty());
-    }
-
     #[tokio::test]
     async fn json_frames_fit_single_h2_data_frame() {
-        use crate::crypto::AesFrameCipher;
-        use zeroize::Zeroizing;
+        let cipher = test_cipher_arc();
+        let mut config = test_config();
+        config.encoding_type = EncodingType::Json;
+        let resolved = ResolvedShaperConfig::resolve(&config);
+        let data = vec![0xAAu8; 64 * 1024];
+        let shaper =
+            TrafficShaper::with_seq(Cursor::new(data.clone()), &resolved, Arc::clone(&cipher), 0);
+        let mut out = Vec::new();
+        seal_all(shaper, &mut out);
 
-        let no_cipher: Option<Arc<dyn FrameCipher>> = None;
-        let aes_cipher: Option<Arc<dyn FrameCipher>> =
-            Some(Arc::new(AesFrameCipher::new(&Zeroizing::new([0u8; 32]))));
-        for cipher in [no_cipher, aes_cipher] {
-            let cipher_for_decode = cipher.clone();
-            let mut config = test_config();
-            config.encoding_type = EncodingType::Json;
-            let resolved = ResolvedShaperConfig::resolve(&config);
-            let data = vec![0xAAu8; 64 * 1024];
-            let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &resolved, cipher, 0);
-            let mut out = Vec::new();
-            seal_all(shaper, &mut out);
-
-            let mut frames = 0;
-            let mut src = &out[..];
-            while !src.is_empty() {
-                let newline = memchr::memchr(b'\n', src).expect("frame must end with newline");
-                let line_len = newline + 1;
-                assert!(line_len <= 16384, "JSON frame {line_len} B > 16384");
-                src = &src[line_len..];
-                frames += 1;
-            }
-            assert!(frames >= 4, "expected multiple frames, got {frames}");
-
-            let mut json_scratch = Vec::new();
-            let mut decoded = Vec::new();
-            let mut buf = BytesMut::from(&out[..]);
-            while !buf.is_empty() {
-                match decode_frame(
-                    &mut buf,
-                    &mut json_scratch,
-                    cipher_for_decode.as_deref(),
-                    EncodingType::Json,
-                )
-                .unwrap()
-                .unwrap()
-                {
-                    DecodedFrame::InJsonScratch { start, end, .. } => {
-                        decoded.extend_from_slice(&json_scratch[start..end]);
-                    }
-                    DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
-                }
-            }
-            assert_eq!(decoded, data);
+        let mut frames = 0;
+        let mut src = &out[..];
+        while !src.is_empty() {
+            let newline = memchr::memchr(b'\n', src).expect("frame must end with newline");
+            let line_len = newline + 1;
+            assert!(line_len <= 16384, "JSON frame {line_len} B > 16384");
+            src = &src[line_len..];
+            frames += 1;
         }
+        assert!(frames >= 4, "expected multiple frames, got {frames}");
+
+        let mut json_scratch = Vec::new();
+        let mut decoded = Vec::new();
+        let mut buf = BytesMut::from(&out[..]);
+        while !buf.is_empty() {
+            match decode_frame(
+                &mut buf,
+                &mut json_scratch,
+                cipher.as_ref(),
+                EncodingType::Json,
+            )
+            .unwrap()
+            .unwrap()
+            {
+                DecodedFrame::InJsonScratch { start, end, .. } => {
+                    decoded.extend_from_slice(&json_scratch[start..end]);
+                }
+                DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
+            }
+        }
+        assert_eq!(decoded, data);
     }
 
     fn seal_all(shaper: TrafficShaper<Cursor<Vec<u8>>>, out: &mut Vec<u8>) -> Vec<u64> {
@@ -1194,8 +1059,9 @@ mod tests {
     #[tokio::test]
     async fn poll_seal_into_produces_valid_frames() {
         let config = ResolvedShaperConfig::resolve(&test_config());
+        let cipher = test_cipher_arc();
         let data = vec![0xABu8; 40_000];
-        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, None, 0);
+        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, cipher.clone(), 0);
         let mut out = Vec::new();
         let seqs = seal_all(shaper, &mut out);
 
@@ -1206,9 +1072,14 @@ mod tests {
         let mut decoded = Vec::new();
         let mut frame_idx = 0usize;
         while !out.is_empty() {
-            match decode_frame(&mut out, &mut json_scratch, None, EncodingType::Binary)
-                .unwrap()
-                .unwrap()
+            match decode_frame(
+                &mut out,
+                &mut json_scratch,
+                cipher.as_ref(),
+                EncodingType::Binary,
+            )
+            .unwrap()
+            .unwrap()
             {
                 DecodedFrame::Owned { seq, data } => {
                     assert_eq!(seq, seqs[frame_idx]);
@@ -1223,13 +1094,9 @@ mod tests {
 
     #[tokio::test]
     async fn poll_seal_into_cipher_matches_stream_output() {
-        use crate::crypto::AesFrameCipher;
         use futures::StreamExt;
-        use zeroize::Zeroizing;
 
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(&mut *key);
-        let cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&key));
+        let cipher = test_cipher_arc();
 
         let config = ResolvedShaperConfig::resolve(&test_config());
         let data = vec![0x5Cu8; 33_000];
@@ -1240,7 +1107,7 @@ mod tests {
             match decode_frame(
                 src,
                 &mut json_scratch,
-                Some(cipher_for_decode.as_ref()),
+                cipher_for_decode.as_ref(),
                 EncodingType::Binary,
             )
             .unwrap()
@@ -1251,12 +1118,8 @@ mod tests {
             }
         };
 
-        let shaper_stream = TrafficShaper::with_seq(
-            Cursor::new(data.clone()),
-            &config,
-            Some(Arc::clone(&cipher)),
-            0,
-        );
+        let shaper_stream =
+            TrafficShaper::with_seq(Cursor::new(data.clone()), &config, Arc::clone(&cipher), 0);
         let mut stream_payload = Vec::new();
         let mut stream_seqs = Vec::new();
         let mut shaper_stream = Box::pin(shaper_stream);
@@ -1267,8 +1130,7 @@ mod tests {
             decode_append(&mut frame_buf, &mut stream_payload);
         }
 
-        let shaper_seal =
-            TrafficShaper::with_seq(Cursor::new(data.clone()), &config, Some(cipher), 0);
+        let shaper_seal = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, cipher, 0);
         let mut out = Vec::new();
         let seqs = seal_all(shaper_seal, &mut out);
         let mut out_buf = BytesMut::from(&out[..]);
@@ -1284,8 +1146,6 @@ mod tests {
 
     #[tokio::test]
     async fn seal_in_place_default_impl_produces_valid_frames() {
-        use zeroize::Zeroizing;
-
         struct VecCipher(Zeroizing<[u8; 32]>);
         impl FrameCipher for VecCipher {
             fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
@@ -1303,7 +1163,7 @@ mod tests {
 
         let config = ResolvedShaperConfig::resolve(&test_config());
         let data = vec![0x3Du8; 20_000];
-        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, Some(cipher), 0);
+        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, cipher, 0);
         let mut out = Vec::new();
         let seqs = seal_all(shaper, &mut out);
 
@@ -1315,7 +1175,7 @@ mod tests {
             match decode_frame(
                 &mut out,
                 &mut json_scratch,
-                Some(cipher_for_decode.as_ref()),
+                cipher_for_decode.as_ref(),
                 EncodingType::Binary,
             )
             .unwrap()
@@ -1335,29 +1195,27 @@ mod tests {
     #[test]
     fn encode_frame_rejects_oversized_payload() {
         let big = vec![0u8; MAX_RAW_PAYLOAD + 1];
-        let r = encode_frame(&big, 0, None, 0, [0, 0], EncodingType::Binary);
+        let cipher = test_cipher();
+        let r = encode_frame(&big, 0, &cipher, 0, [0, 0], EncodingType::Binary);
         assert!(r.is_err());
-        let r = encode_frame(&big, 0, None, 0, [0, 0], EncodingType::Json);
+        let r = encode_frame(&big, 0, &cipher, 0, [0, 0], EncodingType::Json);
         assert!(r.is_err());
     }
 
     #[test]
     fn encode_frame_json_padding_stays_within_line_limit() {
         let raw = vec![0x42u8; 1000];
-        let aes = crate::crypto::AesFrameCipher::new(&zeroize::Zeroizing::new([0u8; 32]));
-        for cipher in [None, Some(&aes as &dyn FrameCipher)] {
-            let frame =
-                encode_frame(&raw, 0, cipher, 100_000, [0, 100_000], EncodingType::Json).unwrap();
-            let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
-            assert!(line_len <= MAX_JSON_LINE_LEN);
-        }
+        let aes = test_cipher();
+        let frame = encode_frame(&raw, 0, &aes, 100_000, [0, 100_000], EncodingType::Json).unwrap();
+        let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
+        assert!(line_len <= MAX_JSON_LINE_LEN);
     }
 
     #[tokio::test]
     async fn poll_seal_into_eof_returns_none() {
         let reader = std::io::Cursor::new(Vec::<u8>::new());
         let cfg = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 0));
+        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, test_cipher_arc(), 0));
         let mut out = Vec::new();
         let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
         assert!(matches!(result, Ok(None)));
@@ -1368,13 +1226,19 @@ mod tests {
         let data = vec![0x55u8; 1000];
         let reader = std::io::Cursor::new(data);
         let cfg = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 42));
+        let cipher = test_cipher();
+        let mut shaper = Box::pin(TrafficShaper::with_seq(
+            reader,
+            &cfg,
+            Arc::new(test_cipher()),
+            42,
+        ));
         let mut out = Vec::new();
         let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
         assert!(matches!(result, Ok(Some(42))));
         let mut out = BytesMut::from(&out[..]);
         let mut json_scratch = Vec::new();
-        let frame = decode_frame(&mut out, &mut json_scratch, None, EncodingType::Binary)
+        let frame = decode_frame(&mut out, &mut json_scratch, &cipher, EncodingType::Binary)
             .unwrap()
             .expect("frame");
         match frame {
@@ -1388,7 +1252,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
         let cfg = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, None, 0));
+        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, test_cipher_arc(), 0));
         let mut out = Vec::new();
 
         let waker = std::task::Waker::noop();
@@ -1439,7 +1303,12 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let resolved = ResolvedShaperConfig::resolve(&cfg);
         let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
-        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &resolved, None, 0));
+        let mut shaper = Box::pin(TrafficShaper::with_seq(
+            reader,
+            &resolved,
+            test_cipher_arc(),
+            0,
+        ));
         let mut out = Vec::new();
         let mut sizes = Vec::new();
         for _ in 0..4 {
@@ -1450,14 +1319,16 @@ mod tests {
             sizes.push(out.len());
             out.clear();
         }
-        assert_eq!(sizes[0], 2 + 10 + 1000 + 100);
-        assert_eq!(sizes[1], 2 + 10 + 1000 + 200);
-        assert_eq!(sizes[2], 2 + 10 + 1000 + 200);
-        assert_eq!(sizes[3], 2 + 10 + 1000);
+        let overhead = 2 + NONCE_LEN + HEADER_LEN + TAG_LEN;
+        assert_eq!(sizes[0], overhead + 1000 + 100);
+        assert_eq!(sizes[1], overhead + 1000 + 200);
+        assert_eq!(sizes[2], overhead + 1000 + 200);
+        assert_eq!(sizes[3], overhead + 1000);
     }
 
     #[test]
     fn decode_frame_json_rejects_malformed_lines() {
+        let cipher = test_cipher();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::new();
 
@@ -1465,12 +1336,12 @@ mod tests {
             b"
 ",
         );
-        assert!(decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json).is_err());
+        assert!(decode_frame(&mut src, &mut json_scratch, &cipher, EncodingType::Json).is_err());
 
         let mut long = BytesMut::new();
         long.extend_from_slice(b"{\"data\":\"");
         long.resize(MAX_JSON_LINE_LEN + 2, b'x');
-        assert!(decode_frame(&mut long, &mut json_scratch, None, EncodingType::Json).is_err());
+        assert!(decode_frame(&mut long, &mut json_scratch, &cipher, EncodingType::Json).is_err());
 
         let mut unclosed = BytesMut::new();
         unclosed.extend_from_slice(b"{\"data\":\"abc");
@@ -1478,7 +1349,15 @@ mod tests {
             b"
 ",
         );
-        assert!(decode_frame(&mut unclosed, &mut json_scratch, None, EncodingType::Json).is_err());
+        assert!(
+            decode_frame(
+                &mut unclosed,
+                &mut json_scratch,
+                &cipher,
+                EncodingType::Json
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1491,6 +1370,14 @@ mod tests {
             b"\"}
 ",
         );
-        assert!(decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json).is_err());
+        assert!(
+            decode_frame(
+                &mut src,
+                &mut json_scratch,
+                &test_cipher(),
+                EncodingType::Json
+            )
+            .is_err()
+        );
     }
 }

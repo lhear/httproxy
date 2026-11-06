@@ -95,7 +95,9 @@ mod tests {
             SessionHandle {
                 cmd_tx: tx,
                 upload_tx,
-                upload_cipher: None,
+                upload_cipher: Arc::new(crate::crypto::AesFrameCipher::new(
+                    &zeroize::Zeroizing::new([7u8; 32]),
+                )),
                 encoding: EncodingType::Binary,
             },
             rx,

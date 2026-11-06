@@ -45,13 +45,12 @@ impl UploadLoopActor {
         state: Arc<SharedState>,
         initial_payload: Bytes,
         read_half: tokio::net::tcp::OwnedReadHalf,
-        cipher: Option<Arc<AesFrameCipher>>,
+        cipher: Arc<AesFrameCipher>,
         stream_id: Uuid,
         start_seq: u64,
     ) -> Self {
         let reader = AsyncReadExt::chain(std::io::Cursor::new(initial_payload), read_half);
-        let traffic_cipher: Option<Arc<dyn shaper::FrameCipher>> =
-            cipher.map(|c| c as Arc<dyn shaper::FrameCipher>);
+        let traffic_cipher: Arc<dyn shaper::FrameCipher> = cipher;
         let shaped: ShaperStream = Box::pin(shaper::TrafficShaper::with_seq(
             reader,
             &state.resolved_traffic,
@@ -216,15 +215,12 @@ async fn send_upload_post(
     debug_assert!(!body.is_empty(), "empty upload body");
     let mut cookie = String::new();
     utils::build_stream_cookie(&mut cookie, stream_id);
-    let mut req = http_client
+    let req = http_client
         .post(state.remote_str.as_str())
         .header("Accept-Encoding", "identity")
         .header("Cache-Control", "no-store, no-transform")
         .header("Content-Type", "application/octet-stream")
         .header("Cookie", cookie);
-    if state.server_public_key.is_none() {
-        req = req.header("Authorization", state.auth_header.as_str());
-    }
     let response = tokio::time::timeout(
         UPLOAD_REQUEST_TIMEOUT,
         req.body(wreq::Body::from(body)).send(),
@@ -249,8 +245,14 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
+    use zeroize::Zeroizing;
+
+    fn test_cipher() -> Arc<AesFrameCipher> {
+        Arc::new(AesFrameCipher::new(&Zeroizing::new([7u8; 32])))
+    }
 
     fn test_state(remote: &str, max_in_flight: usize) -> Arc<SharedState> {
+        let (_, server_pk) = crate::crypto::generate_keypair();
         let traffic = TrafficConfig {
             global: PaddingConfig {
                 padding_threshold: 0,
@@ -266,7 +268,7 @@ mod tests {
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass: None,
-            server_public_key: None,
+            server_public_key: server_pk,
             proxy_auth: None,
             initial_master: Mutex::new(None),
             handshake_lock: Mutex::new(()),
@@ -338,11 +340,17 @@ mod tests {
     }
 
     fn decode_all(received: &[u8]) -> Vec<u8> {
+        let cipher = test_cipher();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::from(received);
         let mut decoded = Vec::new();
-        while let Some(frame) =
-            decode_frame(&mut src, &mut json_scratch, None, EncodingType::Binary).unwrap()
+        while let Some(frame) = decode_frame(
+            &mut src,
+            &mut json_scratch,
+            cipher.as_ref(),
+            EncodingType::Binary,
+        )
+        .unwrap()
         {
             match frame {
                 DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
@@ -383,7 +391,7 @@ mod tests {
             state,
             Bytes::from(initial),
             read_half,
-            None,
+            test_cipher(),
             Uuid::new_v4(),
             0,
         );
@@ -416,7 +424,7 @@ mod tests {
             state,
             Bytes::from(initial),
             read_half,
-            None,
+            test_cipher(),
             Uuid::new_v4(),
             7,
         );
@@ -428,8 +436,13 @@ mod tests {
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::from(&received[..]);
         let mut seqs = Vec::new();
-        while let Some(frame) =
-            decode_frame(&mut src, &mut json_scratch, None, EncodingType::Binary).unwrap()
+        while let Some(frame) = decode_frame(
+            &mut src,
+            &mut json_scratch,
+            test_cipher().as_ref(),
+            EncodingType::Binary,
+        )
+        .unwrap()
         {
             match frame {
                 DecodedFrame::Owned { seq, .. } => seqs.push(seq),
@@ -459,7 +472,7 @@ mod tests {
             state,
             Bytes::from(initial),
             read_half,
-            None,
+            test_cipher(),
             Uuid::new_v4(),
             0,
         );
@@ -485,7 +498,7 @@ mod tests {
             state,
             Bytes::new(),
             read_half,
-            None,
+            test_cipher(),
             Uuid::new_v4(),
             5,
         );

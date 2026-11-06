@@ -36,7 +36,7 @@ pub fn build_stream_cookie(buf: &mut String, stream_id: Uuid) {
 pub fn encode_initial_payload(
     initial_payload: &Bytes,
     max_bytes: usize,
-    cipher: Option<&dyn FrameCipher>,
+    cipher: &dyn FrameCipher,
     config: &shaper::TrafficConfig,
 ) -> Result<(Bytes, Bytes, u64)> {
     let take_len = initial_payload.len().min(max_bytes);
@@ -47,10 +47,9 @@ pub fn encode_initial_payload(
         Bytes::new()
     };
 
-    let raw_payload_limit = match (cipher.is_some(), config.encoding_type) {
-        (true, shaper::EncodingType::Json) => shaper::JSON_PAYLOAD_CAP_CIPHER,
-        (false, shaper::EncodingType::Json) => shaper::JSON_PAYLOAD_CAP_PLAIN,
-        _ => shaper::MAX_RAW_PAYLOAD,
+    let raw_payload_limit = match config.encoding_type {
+        shaper::EncodingType::Json => shaper::JSON_PAYLOAD_CAP,
+        shaper::EncodingType::Binary => shaper::MAX_RAW_PAYLOAD,
     };
     let frame_count = data_to_send.len().div_ceil(raw_payload_limit.max(1));
     let mut body =
@@ -156,6 +155,12 @@ pub(crate) async fn check_response_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::AesFrameCipher;
+    use zeroize::Zeroizing;
+
+    fn test_cipher() -> AesFrameCipher {
+        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
+    }
 
     #[test]
     fn build_cookie_contains_session() {
@@ -176,8 +181,13 @@ mod tests {
             encoding_type: Default::default(),
             max_download_bytes: None,
         };
-        let (body, remaining, seq) =
-            encode_initial_payload(&Bytes::new(), shaper::MAX_RAW_PAYLOAD, None, &config).unwrap();
+        let (body, remaining, seq) = encode_initial_payload(
+            &Bytes::new(),
+            shaper::MAX_RAW_PAYLOAD,
+            &test_cipher(),
+            &config,
+        )
+        .unwrap();
         assert!(body.is_empty());
         assert!(remaining.is_empty());
         assert_eq!(seq, 0);
@@ -211,15 +221,16 @@ mod tests {
             max_download_bytes: None,
         };
         let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+        let cipher = test_cipher();
         let (body, remaining, seq) =
-            encode_initial_payload(&Bytes::from(data.clone()), usize::MAX, None, &cfg).unwrap();
+            encode_initial_payload(&Bytes::from(data.clone()), usize::MAX, &cipher, &cfg).unwrap();
         assert!(remaining.is_empty());
         let mut src = BytesMut::from(&body[..]);
         let mut json_scratch = Vec::new();
         let mut decoded = Vec::new();
         let mut count = 0u64;
         while let Some(frame) =
-            decode_frame(&mut src, &mut json_scratch, None, EncodingType::Json).unwrap()
+            decode_frame(&mut src, &mut json_scratch, &cipher, EncodingType::Json).unwrap()
         {
             match frame {
                 DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),

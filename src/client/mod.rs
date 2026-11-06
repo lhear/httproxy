@@ -55,12 +55,8 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         }
     };
 
-    let server_public_key = cfg
-        .client
-        .public_key
-        .as_deref()
-        .map(crypto::b64_to_public_key)
-        .transpose()?;
+    let server_public_key =
+        crypto::b64_to_public_key(&cfg.client.public_key).context("invalid client.public_key")?;
 
     let remote: url::Url = cfg.client.remote.parse().context("invalid server URL")?;
     let remote_str = remote.as_str().to_owned();
@@ -102,6 +98,7 @@ mod tests {
 [client]
 listen = "127.0.0.1:8080"
 remote = "https://example.com/secret"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 [auth]
 token = "tok"
