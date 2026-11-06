@@ -4,24 +4,22 @@ use common::*;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn start_encrypted() -> (SocketAddr, SocketAddr, String) {
+async fn start_tunnel() -> (SocketAddr, SocketAddr) {
+    let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let (sk, pk) = httproxy::crypto::generate_keypair();
-    let sk_b64 = httproxy::crypto::private_key_to_b64(&sk);
-    let pk_b64 = httproxy::crypto::public_key_to_b64(&pk);
-    let server = spawn_server(server_config(traffic(true, None), Some(sk_b64), None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let client = spawn_client(
-        client_config(traffic(true, None), Some(pk_b64.clone()), None, vec![]),
+        client_config(traffic(true, None), &keys, None, vec![]),
         server,
     )
     .await;
-    (upstream, client, pk_b64)
+    (upstream, client)
 }
 
 #[tokio::test]
-async fn encrypted_get_small_response() {
+async fn tunnel_get_small_response() {
     common::init_logging();
-    let (upstream, client, _) = start_encrypted().await;
+    let (upstream, client) = start_tunnel().await;
     let url = format!("http://{upstream}/hello");
     let (status, body) = raw_exchange(
         client,
@@ -33,9 +31,9 @@ async fn encrypted_get_small_response() {
 }
 
 #[tokio::test]
-async fn encrypted_get_large_response() {
+async fn tunnel_get_large_response() {
     common::init_logging();
-    let (upstream, client, _) = start_encrypted().await;
+    let (upstream, client) = start_tunnel().await;
     let url = format!("http://{upstream}/large");
     let (status, body) = raw_exchange(
         client,
@@ -48,12 +46,13 @@ async fn encrypted_get_large_response() {
 }
 
 #[tokio::test]
-async fn encrypted_large_post_echoes() {
+async fn tunnel_large_post_echoes() {
     common::init_logging();
-    let (upstream, client, _) = start_encrypted().await;
-    let body: Vec<u8> = (0..(2 * 1024 * 1024) as u32)
+    let (upstream, client) = start_tunnel().await;
+    let body: Vec<u8> = (0..(3 * 1024 * 1024) as u32)
         .map(|i| (i % 251) as u8)
         .collect();
+
     let url = format!("http://{upstream}/echo");
     let request = format!(
         "POST {url} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -68,9 +67,9 @@ async fn encrypted_large_post_echoes() {
 }
 
 #[tokio::test]
-async fn encrypted_connect_tunnel() {
+async fn tunnel_connect_relays_bytes() {
     common::init_logging();
-    let (upstream, client, _) = start_encrypted().await;
+    let (upstream, client) = start_tunnel().await;
     let mut stream = proxy_connect(client, upstream).await;
     stream
         .write_all(b"GET /hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
@@ -82,15 +81,13 @@ async fn encrypted_connect_tunnel() {
 }
 
 #[tokio::test]
-async fn pq_session_resumption_reuses_ticket() {
+async fn session_resumption_reuses_ticket() {
     common::init_logging();
+    let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let (sk, pk) = httproxy::crypto::generate_keypair();
-    let sk_b64 = httproxy::crypto::private_key_to_b64(&sk);
-    let pk_b64 = httproxy::crypto::public_key_to_b64(&pk);
-    let server = spawn_server(server_config(traffic(true, None), Some(sk_b64), None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let client = spawn_client(
-        client_config(traffic(true, None), Some(pk_b64), None, vec![]),
+        client_config(traffic(true, None), &keys, None, vec![]),
         server,
     )
     .await;

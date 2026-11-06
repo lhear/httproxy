@@ -30,17 +30,12 @@ async fn spawn_tcp_echo() -> SocketAddr {
 
 async fn spawn_redirect(
     traffic: httproxy::shaper::TrafficConfig,
-    keys: Option<(String, String)>,
+    keys: &common::TestKeys,
 ) -> SocketAddr {
     let echo = spawn_tcp_echo().await;
-    let (server_key, client_key) = match keys {
-        Some((sk, pk)) => (Some(sk), Some(pk)),
-        None => (None, None),
-    };
-    let server =
-        common::spawn_server(common::server_config(traffic.clone(), server_key, None)).await;
+    let server = common::spawn_server(common::server_config(traffic.clone(), keys, None)).await;
 
-    let mut cfg = common::client_config(traffic, client_key, None, vec![]);
+    let mut cfg = common::client_config(traffic, keys, None, vec![]);
     cfg.redirect = vec![httproxy::config::RedirectSection {
         listen: "127.0.0.1:0".to_string(),
         target: echo.to_string(),
@@ -54,7 +49,8 @@ async fn spawn_redirect(
 #[tokio::test]
 async fn redirect_forwards_raw_tcp() {
     common::init_logging();
-    let redirect = spawn_redirect(common::traffic(true, None), None).await;
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, None), &keys).await;
 
     let mut stream = TcpStream::connect(redirect).await.unwrap();
     stream.write_all(b"hello redirect\n").await.unwrap();
@@ -70,7 +66,8 @@ async fn redirect_forwards_raw_tcp() {
 #[tokio::test]
 async fn redirect_handles_many_roundtrips() {
     common::init_logging();
-    let redirect = spawn_redirect(common::traffic(true, None), None).await;
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, None), &keys).await;
     let mut stream = TcpStream::connect(redirect).await.unwrap();
 
     for i in 0..8u8 {
@@ -88,7 +85,8 @@ async fn redirect_handles_many_roundtrips() {
 #[tokio::test]
 async fn redirect_forwards_large_bidirectional_stream() {
     common::init_logging();
-    let redirect = spawn_redirect(common::traffic(true, None), None).await;
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, None), &keys).await;
     let stream = TcpStream::connect(redirect).await.unwrap();
 
     let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -119,17 +117,10 @@ async fn redirect_forwards_large_bidirectional_stream() {
 }
 
 #[tokio::test]
-async fn redirect_works_over_encrypted_tunnel() {
+async fn redirect_survives_download_rotation() {
     common::init_logging();
-    let (sk, pk) = httproxy::crypto::generate_keypair();
-    let redirect = spawn_redirect(
-        common::traffic(true, Some(2 * 1024 * 1024)),
-        Some((
-            httproxy::crypto::private_key_to_b64(&sk),
-            httproxy::crypto::public_key_to_b64(&pk),
-        )),
-    )
-    .await;
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, Some(2 * 1024 * 1024)), &keys).await;
 
     let mut stream = TcpStream::connect(redirect).await.unwrap();
     let payload: Vec<u8> = (0..128 * 1024u32).map(|i| (i % 241) as u8).collect();

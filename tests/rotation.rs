@@ -5,17 +5,18 @@ use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 
 async fn start_rotating(binary: bool, max_download_bytes: u64) -> (SocketAddr, SocketAddr) {
+    let keys = test_keys();
     let upstream = spawn_upstream().await;
     let server = spawn_server(server_config(
         traffic(binary, Some(max_download_bytes)),
-        None,
+        &keys,
         None,
     ))
     .await;
     let client = spawn_client(
         client_config(
             traffic(binary, Some(max_download_bytes)),
-            None,
+            &keys,
             None,
             vec![],
         ),

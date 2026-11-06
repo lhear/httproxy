@@ -220,6 +220,7 @@ async fn start_with_warp() -> (SocketAddr, SocketAddr, Arc<AtomicUsize>) {
 async fn start_with_warp_and_dns(
     dns_upstream: Option<SocketAddr>,
 ) -> (SocketAddr, SocketAddr, Arc<AtomicUsize>) {
+    let keys = test_keys();
     let upstream = spawn_upstream().await;
     let (masque_addr, connects) = spawn_masque_proxy().await;
 
@@ -238,7 +239,7 @@ async fn start_with_warp_and_dns(
         .await
         .unwrap();
 
-    let mut cfg = server_config(traffic(true, None), None, None);
+    let mut cfg = server_config(traffic(true, None), &keys, None);
     cfg.dns = dns_upstream.map(|upstream| httproxy::dns::DnsConfig {
         upstream,
         tls_domain: None,
@@ -264,7 +265,7 @@ async fn start_with_warp_and_dns(
 
     let server = spawn_server(cfg).await;
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![]),
+        client_config(traffic(true, None), &keys, None, vec![]),
         server,
     )
     .await;

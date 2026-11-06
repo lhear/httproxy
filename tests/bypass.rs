@@ -15,12 +15,13 @@ fn write_bypass_file(rules: &str) -> String {
 
 #[tokio::test]
 async fn bypass_direct_connect_skips_tunnel() {
+    let keys = test_keys();
     common::init_logging();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), None, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![bypass_file]),
+        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
         server,
     )
     .await;
@@ -37,12 +38,13 @@ async fn bypass_direct_connect_skips_tunnel() {
 
 #[tokio::test]
 async fn bypass_large_body_direct() {
+    let keys = test_keys();
     common::init_logging();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), None, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![bypass_file]),
+        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
         server,
     )
     .await;
@@ -60,12 +62,13 @@ async fn bypass_large_body_direct() {
 
 #[tokio::test]
 async fn bypass_connect_direct() {
+    let keys = test_keys();
     common::init_logging();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), None, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![bypass_file]),
+        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
         server,
     )
     .await;
@@ -82,12 +85,13 @@ async fn bypass_connect_direct() {
 
 #[tokio::test]
 async fn non_matching_domain_still_tunneled() {
+    let keys = test_keys();
     common::init_logging();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), None, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["10.0.0.0/8"]}"#);
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![bypass_file]),
+        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
         server,
     )
     .await;
@@ -104,11 +108,12 @@ async fn non_matching_domain_still_tunneled() {
 
 #[tokio::test]
 async fn bypass_unreachable_target_fails_fast() {
+    let keys = test_keys();
     common::init_logging();
-    let server = spawn_server(server_config(traffic(true, None), None, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![bypass_file]),
+        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
         server,
     )
     .await;

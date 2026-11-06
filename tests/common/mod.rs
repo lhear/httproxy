@@ -50,16 +50,29 @@ pub fn valid_token() -> String {
     make_token("test-user", 4_102_444_800)
 }
 
+pub struct TestKeys {
+    pub private_key: String,
+    pub public_key: String,
+}
+
+pub fn test_keys() -> TestKeys {
+    let (sk, pk) = httproxy::crypto::generate_keypair();
+    TestKeys {
+        private_key: httproxy::crypto::private_key_to_b64(&sk),
+        public_key: httproxy::crypto::public_key_to_b64(&pk),
+    }
+}
+
 pub fn server_config(
     traffic: TrafficConfig,
-    private_key: Option<String>,
+    keys: &TestKeys,
     max_tunnels: Option<usize>,
 ) -> ServerTopConfig {
     ServerTopConfig {
         server: ServerSection {
             listen: "127.0.0.1:0".to_string(),
             path: PATH.to_string(),
-            private_key,
+            private_key: keys.private_key.clone(),
             max_tunnels,
         },
         auth: AuthSection {
@@ -75,7 +88,7 @@ pub fn server_config(
 
 pub fn client_config(
     traffic: TrafficConfig,
-    public_key: Option<String>,
+    keys: &TestKeys,
     token: Option<String>,
     bypass_files: Vec<String>,
 ) -> ClientTopConfig {
@@ -84,7 +97,7 @@ pub fn client_config(
             listen: "127.0.0.1:0".to_string(),
             remote: format!("http://proxy-host.invalid{PATH}"),
             address: None,
-            public_key,
+            public_key: keys.public_key.clone(),
             auth: None,
             max_connections: None,
             max_in_flight_bytes: None,

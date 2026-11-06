@@ -17,8 +17,9 @@ fn live_credentials_path() -> String {
 #[ignore = "requires real network access to Cloudflare WARP"]
 async fn real_warp_serves_a_page() {
     common::init_logging();
+    let keys = test_keys();
 
-    let mut cfg = server_config(traffic(true, None), None, None);
+    let mut cfg = server_config(traffic(true, None), &keys, None);
     cfg.dns = Some(httproxy::dns::DnsConfig {
         upstream: "1.1.1.1:53".parse().unwrap(),
         tls_domain: None,
@@ -44,7 +45,7 @@ async fn real_warp_serves_a_page() {
 
     let server = spawn_server(cfg).await;
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![]),
+        client_config(traffic(true, None), &keys, None, vec![]),
         server,
     )
     .await;

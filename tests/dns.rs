@@ -84,8 +84,11 @@ async fn spawn_mock_dns(
     addr
 }
 
-fn server_with_dns(mock_dns: std::net::SocketAddr) -> httproxy::config::ServerTopConfig {
-    let mut cfg = server_config(traffic(true, None), None, None);
+fn server_with_dns(
+    mock_dns: std::net::SocketAddr,
+    keys: &TestKeys,
+) -> httproxy::config::ServerTopConfig {
+    let mut cfg = server_config(traffic(true, None), keys, None);
     cfg.dns = Some(DnsConfig {
         upstream: mock_dns,
         tls_domain: None,
@@ -96,6 +99,7 @@ fn server_with_dns(mock_dns: std::net::SocketAddr) -> httproxy::config::ServerTo
 
 #[tokio::test]
 async fn server_resolves_domain_via_dns_module() {
+    let keys = test_keys();
     common::init_logging();
     let upstream = spawn_upstream().await;
     let query_count = Arc::new(AtomicUsize::new(0));
@@ -115,9 +119,9 @@ async fn server_resolves_domain_via_dns_module() {
         .lookup("dns-test.invalid", domain::base::iana::Rtype::A, None)
         .await;
     assert!(!ips.unwrap().is_empty(), "direct lookup must resolve");
-    let server = spawn_server(server_with_dns(mock_dns)).await;
+    let server = spawn_server(server_with_dns(mock_dns, &keys)).await;
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![]),
+        client_config(traffic(true, None), &keys, None, vec![]),
         server,
     )
     .await;
@@ -138,15 +142,16 @@ async fn server_resolves_domain_via_dns_module() {
 
 #[tokio::test]
 async fn dns_results_are_cached() {
+    let keys = test_keys();
     common::init_logging();
     let upstream = spawn_upstream().await;
     let query_count = Arc::new(AtomicUsize::new(0));
     let mut records = HashMap::new();
     records.insert("cached.invalid".to_string(), upstream.ip());
     let mock_dns = spawn_mock_dns(records, query_count.clone()).await;
-    let server = spawn_server(server_with_dns(mock_dns)).await;
+    let server = spawn_server(server_with_dns(mock_dns, &keys)).await;
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![]),
+        client_config(traffic(true, None), &keys, None, vec![]),
         server,
     )
     .await;
@@ -167,11 +172,12 @@ async fn dns_results_are_cached() {
 
 #[tokio::test]
 async fn nxdomain_fails_connection() {
+    let keys = test_keys();
     common::init_logging();
     let mock_dns = spawn_mock_dns(HashMap::new(), Arc::new(AtomicUsize::new(0))).await;
-    let server = spawn_server(server_with_dns(mock_dns)).await;
+    let server = spawn_server(server_with_dns(mock_dns, &keys)).await;
     let client = spawn_client(
-        client_config(traffic(true, None), None, None, vec![]),
+        client_config(traffic(true, None), &keys, None, vec![]),
         server,
     )
     .await;
