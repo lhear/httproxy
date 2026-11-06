@@ -186,6 +186,69 @@ pub fn rewrite_request_line(
     Ok(())
 }
 
+const PROXY_ONLY_HEADERS: [&[u8]; 2] = [b"proxy-authorization", b"proxy-connection"];
+
+#[inline]
+fn is_proxy_only_header(line: &[u8]) -> bool {
+    let Some(colon) = memchr::memchr(b':', line) else {
+        return false;
+    };
+    let name = trim_ascii(&line[..colon]);
+    PROXY_ONLY_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+}
+
+pub fn strip_proxy_headers(buf: &mut BytesMut, header_len: usize) -> usize {
+    let head_end = header_len.min(buf.len());
+    let head = buf[..head_end].to_vec();
+
+    let Some(request_line_end) = memchr::memchr(b'\n', &head).map(|pos| pos + 1) else {
+        return header_len;
+    };
+
+    let mut kept = Vec::with_capacity(head.len());
+    kept.extend_from_slice(&head[..request_line_end]);
+
+    let mut dropping = false;
+    let mut cursor = request_line_end;
+    while cursor < head.len() {
+        let rest = &head[cursor..];
+        let Some(rel) = memchr::memchr(b'\n', rest) else {
+            kept.extend_from_slice(rest);
+            break;
+        };
+        let line_end = cursor + rel + 1;
+        let line = &head[cursor..line_end];
+        if matches!(line.first(), Some(b' ') | Some(b'\t')) {
+            if !dropping {
+                kept.extend_from_slice(line);
+            }
+        } else {
+            dropping = is_proxy_only_header(line);
+            if !dropping {
+                kept.extend_from_slice(line);
+            }
+        }
+        cursor = line_end;
+    }
+
+    if kept.len() == head.len() {
+        return header_len;
+    }
+
+    let new_len = kept.len();
+    buf[..new_len].copy_from_slice(&kept);
+    if buf.len() > header_len {
+        buf.copy_within(header_len.., new_len);
+        let tail_len = buf.len() - header_len;
+        buf.truncate(new_len + tail_len);
+    } else {
+        buf.truncate(new_len);
+    }
+    new_len
+}
+
 #[inline]
 fn write_request_line(dst: &mut [u8], method: &str, origin_path: &str, version: &[u8]) {
     let mut pos = 0;
@@ -416,5 +479,60 @@ mod tests {
             .unwrap();
         assert_eq!(req.target, "http://example.com/very/long/path");
         assert_eq!(&buf[..req.header_len], &raw[..]);
+    }
+
+    #[test]
+    fn strip_proxy_headers_drops_credentials() {
+        let raw = b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
+        let mut buf = BytesMut::from(&raw[..]);
+        let new_len = strip_proxy_headers(&mut buf, raw.len());
+
+        let head = String::from_utf8(buf[..new_len].to_vec()).unwrap();
+        assert!(!head.to_ascii_lowercase().contains("proxy-authorization"));
+        assert!(!head.to_ascii_lowercase().contains("proxy-connection"));
+        assert!(head.contains("Host: example.com\r\n"));
+        assert!(head.contains("Accept: */*\r\n"));
+        assert!(head.ends_with("\r\n\r\n"));
+        assert_eq!(new_len, buf.len());
+    }
+
+    #[test]
+    fn strip_proxy_headers_keeps_body() {
+        let head = b"POST http://example.com/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic YQ==\r\nContent-Length: 4\r\n\r\n";
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(head);
+        buf.extend_from_slice(b"body");
+
+        let new_len = strip_proxy_headers(&mut buf, head.len());
+
+        assert!(
+            String::from_utf8_lossy(&buf[..new_len])
+                .to_ascii_lowercase()
+                .find("proxy-authorization")
+                .is_none()
+        );
+        assert!(buf.ends_with(b"body"));
+        assert_eq!(buf.len() - new_len, 4);
+    }
+
+    #[test]
+    fn strip_proxy_headers_is_noop_without_them() {
+        let raw = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut buf = BytesMut::from(&raw[..]);
+        let new_len = strip_proxy_headers(&mut buf, raw.len());
+        assert_eq!(new_len, raw.len());
+        assert_eq!(&buf[..], &raw[..]);
+    }
+
+    #[test]
+    fn strip_proxy_headers_drops_folded_continuation() {
+        let raw = b"GET http://example.com/ HTTP/1.1\r\nProxy-Authorization: Basic\r\n dXNlcjpwYXNz\r\nHost: x\r\n\r\n";
+        let mut buf = BytesMut::from(&raw[..]);
+        let new_len = strip_proxy_headers(&mut buf, raw.len());
+
+        let head = String::from_utf8(buf[..new_len].to_vec()).unwrap();
+        assert!(!head.to_ascii_lowercase().contains("proxy-authorization"));
+        assert!(!head.contains("dXNlcjpwYXNz"));
+        assert!(head.contains("Host: x\r\n"));
     }
 }

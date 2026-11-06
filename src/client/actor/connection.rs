@@ -52,6 +52,12 @@ impl ClientConnectionActor {
         let (target_host, origin_form) = proxy::resolve_request(&method, &url)?;
         tracing::Span::current().record("target", target_host.as_str());
 
+        let header_len = if origin_form.is_some() {
+            proxy::strip_proxy_headers(&mut buf, header_len)
+        } else {
+            header_len
+        };
+
         if let Some(origin_path) = origin_form {
             proxy::rewrite_request_line(&mut buf, header_len, &method, &origin_path)?;
         }
@@ -288,6 +294,12 @@ mod tests {
             "expected rewritten request echoed, got: {echoed_str}"
         );
         assert!(echoed_str.contains("Host: x"));
+        assert!(
+            !echoed_str
+                .to_ascii_lowercase()
+                .contains("proxy-authorization"),
+            "proxy credentials must never reach the target, got: {echoed_str}"
+        );
 
         let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
     }
