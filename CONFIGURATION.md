@@ -33,8 +33,7 @@ keys and invalid values abort startup (`deny_unknown_fields`).
 
 The token is `base64url(nonce ‖ AES-256-GCM(ver ‖ exp ‖ sub_len ‖ sub) ‖ tag)`.
 The AES key is derived from `[auth] secret` with HKDF-SHA256, the subject never
-appears in the clear, and verification is a single AEAD pass with no JSON
-parsing — about half the size of an equivalent JWT.
+appears in the clear, and verification is a single AEAD pass with no parsing.
 
 ### 1.2 Keypair Generation
 
@@ -43,8 +42,9 @@ parsing — about half the size of an equivalent JWT.
 ```
 
 Prints an X25519 keypair. Put the **private key** in `[server] private_key` and
-the **public key** in `[client] public_key`. Without `public_key` the tunnel is
-unencrypted at the application layer (transport TLS still applies).
+the **public key** in `[client] public_key`. Both are required: the tunnel is
+always sealed, and the server rejects requests that are not part of an encrypted
+session.
 
 ---
 
@@ -54,7 +54,7 @@ unencrypted at the application layer (transport TLS still applies).
 [client]
 listen = "127.0.0.1:8080"
 remote = "https://your-server-domain/YOUR_SECRET_PATH"
-# public_key = "your-public-key"     # enables end-to-end encryption (§1.2)
+public_key = "your-public-key"       # required (§1.2)
 # address = "your-server-ip"
 # max_connections = 1024
 # max_in_flight_bytes = 2097152
@@ -89,7 +89,7 @@ padding_threshold = 500
 | `listen`              | string  | yes      | —           | Local listen address, e.g. `"127.0.0.1:8080"`. |
 | `remote`              | string  | yes      | —           | Server URL including the hidden path. |
 | `address`             | string  | no       | host of `remote` | Connection address override. TLS SNI and `Host` still use the `remote` domain. |
-| `public_key`          | string  | no       | — (no encryption) | Server's X25519 public key; enables end-to-end encryption. |
+| `public_key`          | string  | yes      | —           | Server's X25519 public key; required for the tunnel handshake. |
 | `auth`                | table   | no       | —           | Local proxy authentication (§2.2). |
 | `max_connections`     | integer | no       | `1024`      | Concurrent local connections; excess are refused. |
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Upload bytes in flight per tunnel. **Must not exceed 2 MiB** (§9). |
@@ -128,7 +128,7 @@ target = "172.16.0.207:22"   # far side host:port
 
 | Field   | Type   | Required | Description |
 | ------- | ------ | -------- | ----------- |
-| `token` | string | yes      | Bearer token sent on every tunnel request (from `gen-token`). |
+| `token` | string | yes      | Bearer token that authorises opening a tunnel (from `gen-token`). |
 
 ### 2.5 `[bypass]`
 
@@ -142,7 +142,7 @@ Optional; routes matching traffic directly, outside the tunnel (§6).
 [server]
 listen = "/dev/shm/httproxy.sock"    # or "0.0.0.0:443"
 path = "/YOUR_SECRET_PATH"
-# private_key = "your-private-key"   # from `gen-key`
+private_key = "your-private-key"     # required, from `gen-key`
 # max_tunnels = 1024
 
 [auth]
@@ -172,7 +172,7 @@ padding_threshold = 500
 | ------------- | ------- | -------- | ------- | ----------- |
 | `listen`      | string  | yes      | —       | TCP address (`"0.0.0.0:443"`) or Unix socket path. |
 | `path`        | string  | yes      | —       | Hidden service path; must match the path in the client's `remote`. |
-| `private_key` | string  | no       | —       | X25519 private key (from `gen-key`), paired with the client's `public_key`. |
+| `private_key` | string  | yes      | —       | X25519 private key (from `gen-key`), paired with the client's `public_key`. |
 | `max_tunnels` | integer | no       | `1024`  | Concurrent tunnels; excess requests get HTTP 503. |
 
 ### 3.2 `[auth]` — Token Signing Secret
@@ -200,7 +200,7 @@ enabled = true
 
 | Field | Type | Required | Default | Description |
 | ----- | ---- | -------- | ------- | ----------- |
-| `enabled` | bool | no | `true` | `false` behaves like omitting the section. |
+| `enabled` | bool | no | `true` | Set `false` to disable WARP egress. |
 | `config_path` | string | no | `./warp.json` | Device credentials; auto-registered and written back (mode `0600`) when missing. |
 | `endpoint` / `endpoint_v6` | string | no | registration response | WARP endpoint IP override. |
 | `port` | integer | no | `443` | Endpoint UDP port. |
@@ -221,7 +221,7 @@ Behaviour:
 - **Names**: resolved locally ([`[dns]`](#7-dns-configuration), default `1.1.1.1:53`); the CONNECT `:authority` is always an IP literal. `[proxy] socks5` applies only to direct connections.
 - **DNS through WARP**: public upstreams are reached as DNS-over-TCP (port 53) or DoT inside the tunnel; private or loopback upstreams stay direct.
 - **Pinning**: the endpoint certificate is not publicly trusted, so the leaf SPKI is compared byte for byte with `config.peers[0].public_key`. `insecure_skip_verify = true` skips that.
-- **Failures**: a failed registration aborts startup rather than silently falling back to direct connections.
+- **Failures**: a failed registration aborts startup; traffic never falls back to direct connections.
 
 ### 3.5 `[traffic_shaping]`
 
@@ -232,8 +232,8 @@ See [§5](#5-traffic-shaping). Both sides must agree on `encoding_type` and
 
 ## 4. Authentication Model
 
-1. **Tunnel (mandatory):** every tunnel request carries the client's bearer token, verified against `[auth] secret`.
-2. **End-to-end encryption (optional):** with `public_key`/`private_key`, a hybrid X25519 + ML-KEM exchange seals the tunnel above transport TLS.
+1. **Tunnel authorisation:** opening a tunnel requires the client's bearer token, verified against `[auth] secret`. Later upload and download requests are bound to the tunnel by the stream cookie.
+2. **End-to-end encryption (mandatory):** every tunnel is sealed by a hybrid X25519 + ML-KEM exchange above transport TLS. `public_key` and `private_key` are required, and requests that are not part of an encrypted session are rejected.
 3. **Local proxy auth (optional):** `[client.auth]` gates the local proxy endpoint.
 
 ---
@@ -390,7 +390,7 @@ terminal).
 
 The server keeps a **2 MiB per-tunnel reorder buffer**, so
 `max_in_flight_bytes` must not exceed 2 MiB — a larger value causes hard upload
-errors under HTTP/2 frame reordering. The default is already at the ceiling.
+errors under HTTP/2 frame reordering. The default sits at this ceiling.
 
 Other notes:
 
@@ -437,7 +437,7 @@ server {
 
 - `proxy_request_buffering off` / `proxy_buffering off` keep the tunnel streaming (required for latency and full-duplex throughput); long `proxy_read/send_timeout`s prevent idle teardown.
 - `client_max_body_size` must cover `min(1 MiB, max_in_flight_bytes)` plus one frame (~16 KiB); `4m` covers the 2 MiB ceiling.
-- `proxy_pass http://unix:/dev/shm/httproxy.sock:` — the trailing colon forwards the original URI unchanged, which the tunnel path requires. A TCP listener works the same way (`proxy_pass http://127.0.0.1:8081;`).
+- `proxy_pass http://unix:/dev/shm/httproxy.sock:` — the trailing colon forwards the original URI unchanged, which the tunnel path requires. For a TCP listener, use `proxy_pass http://127.0.0.1:8081;`.
 
 ---
 
