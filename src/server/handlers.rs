@@ -481,9 +481,6 @@ async fn handle_fresh_handshake(
     body: Body,
     span: tracing::Span,
 ) -> Result<Response, ServerError> {
-    let user = validate_token_if_needed(&headers, &state.token_key, &state.token_cache).await?;
-    span.record("user", &*user);
-
     info!("handshake: received ClientHello");
 
     let eph_pk_a_b64 = utils::extract_cookie_value(&headers, "eph_pk_a")
@@ -523,12 +520,32 @@ async fn handle_fresh_handshake(
         return Err(ServerError::bad_request("ClientHello too short"));
     }
 
-    let len_kem = u16::from_be_bytes([client_hello_data[0], client_hello_data[1]]) as usize;
-    let kem_end = 2 + len_kem;
+    let token_len = u16::from_be_bytes([client_hello_data[0], client_hello_data[1]]) as usize;
+    let token_end = 2 + token_len;
+    if client_hello_data.len() < token_end {
+        return Err(ServerError::bad_request(
+            "ClientHello truncated (token part)",
+        ));
+    }
+    let token = std::str::from_utf8(&client_hello_data[2..token_end])
+        .map_err(|_| ServerError::unauthorized("invalid token"))?;
+    let user = validate_token_if_needed(token, &state.token_key, &state.token_cache).await?;
+    span.record("user", &*user);
+
+    if client_hello_data.len() < token_end + 2 {
+        return Err(ServerError::bad_request(
+            "ClientHello truncated (no KEM part)",
+        ));
+    }
+    let len_kem = u16::from_be_bytes([
+        client_hello_data[token_end],
+        client_hello_data[token_end + 1],
+    ]) as usize;
+    let kem_end = token_end + 2 + len_kem;
     if client_hello_data.len() < kem_end {
         return Err(ServerError::bad_request("ClientHello truncated (KEM part)"));
     }
-    let kem_pk_bytes = &client_hello_data[2..kem_end];
+    let kem_pk_bytes = &client_hello_data[token_end + 2..kem_end];
     let kem_pk = crypto::bytes_to_encapsulation_key(kem_pk_bytes)
         .map_err(|e| ServerError::bad_request(format!("invalid mlkem public key: {e}")))?;
 
@@ -599,24 +616,14 @@ async fn handle_fresh_handshake(
 }
 
 pub async fn validate_token_if_needed(
-    headers: &HeaderMap,
+    token: &str,
     key: &LessSafeKey,
     cache: &moka::future::Cache<Box<str>, Arc<str>>,
 ) -> Result<Arc<str>, ServerError> {
-    let auth_header = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            warn!("rejected: missing or invalid authorization header");
-            ServerError::unauthorized("invalid header")
-        })?;
-
-    if !auth_header.starts_with("Bearer ") {
-        warn!("rejected: invalid authorization format");
-        return Err(ServerError::unauthorized("invalid header"));
+    if token.is_empty() || token.len() > crate::server::token::MAX_TOKEN_LEN {
+        warn!("rejected: invalid token length");
+        return Err(ServerError::unauthorized("invalid token"));
     }
-
-    let token = &auth_header[7..];
 
     if let Some(user) = cache.get(token).await {
         return Ok(user);
@@ -685,12 +692,6 @@ mod tests {
         )
     }
 
-    fn bearer(token: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
-        headers
-    }
-
     fn token_with_exp(exp: u64) -> String {
         crate::server::token::issue(
             &crate::server::token::key_from_secret(b"test-secret"),
@@ -705,9 +706,8 @@ mod tests {
     async fn valid_token_is_cached_and_reused() {
         let state = test_state().await;
         let token = valid_token();
-        let headers = bearer(&token);
 
-        let first = validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+        let first = validate_token_if_needed(&token, &state.token_key, &state.token_cache)
             .await
             .unwrap();
         assert_eq!(&*first, "user");
@@ -718,7 +718,7 @@ mod tests {
             .expect("valid token must be cached");
         assert_eq!(&*cached, "user");
 
-        let second = validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+        let second = validate_token_if_needed(&token, &state.token_key, &state.token_cache)
             .await
             .unwrap();
         assert!(
@@ -730,9 +730,8 @@ mod tests {
     #[tokio::test]
     async fn invalid_tokens_are_never_cached() {
         let state = test_state().await;
-        let headers = bearer("not-a-token");
         assert!(
-            validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+            validate_token_if_needed("not-a-token", &state.token_key, &state.token_cache)
                 .await
                 .is_err()
         );
@@ -743,9 +742,8 @@ mod tests {
     async fn token_close_to_expiry_is_not_cached() {
         let state = test_state().await;
         let token = token_with_exp(crate::unix_now_secs() + 5);
-        let headers = bearer(&token);
         assert!(
-            validate_token_if_needed(&headers, &state.token_key, &state.token_cache)
+            validate_token_if_needed(&token, &state.token_key, &state.token_cache)
                 .await
                 .is_ok()
         );
@@ -786,28 +784,52 @@ mod tests {
         assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
     }
 
-    fn handshake_headers(token: &str) -> HeaderMap {
+    fn handshake_headers(eph_pk_a: &x25519_dalek::PublicKey) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            "eph_pk_a=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                .parse()
-                .unwrap(),
+            format!(
+                "eph_pk_a={}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eph_pk_a.as_bytes())
+            )
+            .parse()
+            .unwrap(),
         );
-        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
         headers
+    }
+
+    fn encrypted_client_hello(
+        state: &Arc<AppState>,
+        client_sk: &x25519_dalek::StaticSecret,
+        token: &str,
+    ) -> Body {
+        let server_pk = x25519_dalek::PublicKey::from(&state.private_key);
+        let shared = crate::crypto::diffie_hellman(client_sk, &server_pk);
+        let handshake_key = crate::crypto::derive_handshake_key(&shared);
+        let cipher = AesFrameCipher::new(&handshake_key);
+
+        let mut hello = Vec::with_capacity(2 + token.len());
+        hello.extend_from_slice(&(token.len() as u16).to_be_bytes());
+        hello.extend_from_slice(token.as_bytes());
+        let frame = shaper::encode_frame(
+            &hello,
+            0,
+            &cipher,
+            state.traffic_config.global.padding_threshold,
+            state.traffic_config.global.padding_range,
+            state.traffic_config.encoding_type,
+        )
+        .unwrap();
+        Body::from(frame)
     }
 
     #[tokio::test]
     async fn dispatch_rejects_bad_token_with_handshake_cookie() {
         let state = test_state().await;
-        let err = dispatch(
-            State(state),
-            handshake_headers("invalid-token"),
-            Body::empty(),
-        )
-        .await
-        .unwrap_err();
+        let (client_sk, client_pk) = crate::crypto::generate_keypair();
+        let headers = handshake_headers(&client_pk);
+        let body = encrypted_client_hello(&state, &client_sk, "invalid-token");
+        let err = dispatch(State(state), headers, body).await.unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
@@ -816,10 +838,6 @@ mod tests {
         let state = test_state().await;
         let mut headers = HeaderMap::new();
         headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", valid_token()).parse().unwrap(),
-        );
         let err = dispatch(State(state), headers, Body::empty())
             .await
             .unwrap_err();
@@ -840,10 +858,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_rejects_expired_token_on_handshake_path() {
         let state = test_state().await;
-        let token = token_with_exp(1);
-        let err = dispatch(State(state), handshake_headers(&token), Body::empty())
-            .await
-            .unwrap_err();
+        let (client_sk, client_pk) = crate::crypto::generate_keypair();
+        let headers = handshake_headers(&client_pk);
+        let body = encrypted_client_hello(&state, &client_sk, &token_with_exp(1));
+        let err = dispatch(State(state), headers, body).await.unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 }

@@ -151,7 +151,12 @@ pub async fn perform_pq_handshake(
     let (eph_sk_b, eph_pk_b) = crypto::generate_keypair();
     let eph_pk_b_bytes = eph_pk_b.to_bytes().to_vec();
 
-    let mut client_hello = Vec::with_capacity(2 + kem_pk_bytes.len() + 2 + eph_pk_b_bytes.len());
+    let token = state.auth_token.as_bytes();
+    let token_len = u16::try_from(token.len()).context("auth token too long")?;
+    let mut client_hello =
+        Vec::with_capacity(2 + token.len() + 2 + kem_pk_bytes.len() + 2 + eph_pk_b_bytes.len());
+    client_hello.extend_from_slice(&token_len.to_be_bytes());
+    client_hello.extend_from_slice(token);
     client_hello.extend_from_slice(&(kem_pk_bytes.len() as u16).to_be_bytes());
     client_hello.extend_from_slice(&kem_pk_bytes);
     client_hello.extend_from_slice(&(eph_pk_b_bytes.len() as u16).to_be_bytes());
@@ -182,7 +187,6 @@ pub async fn perform_pq_handshake(
         DOWNLOAD_CONNECT_TIMEOUT,
         http_client
             .post(state.remote_str.as_str())
-            .header("Authorization", format!("Bearer {}", state.auth_token))
             .header("Cookie", &handshake_cookie)
             .body(wreq::Body::from(client_hello_frame))
             .send(),
