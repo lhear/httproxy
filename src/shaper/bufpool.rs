@@ -131,11 +131,9 @@ mod tests {
 
     #[test]
     fn oversized_buffers_are_not_pooled() {
-        let huge = Vec::with_capacity(MAX_BUFFER + 1);
-        let ptr = huge.as_ptr();
-        put(huge);
+        put(Vec::with_capacity(MAX_BUFFER + 1));
 
-        let again = take(MAX_BUFFER + 1);
-        assert_ne!(again.as_ptr(), ptr, "oversized buffer must not be reused");
+        let pooled = FREE.with(|free| free.borrow().bufs.len());
+        assert_eq!(pooled, 0, "oversized buffer must not be pooled");
     }
 }
