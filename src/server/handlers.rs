@@ -15,8 +15,8 @@ use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
 use crate::server::connection::connect_upstream;
 use crate::server::constants::{
-    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE, TOKEN_CACHE_TTL,
-    TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
+    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE, MAX_HANDSHAKE_BODY_SIZE,
+    TOKEN_CACHE_TTL, TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream::FrameDecoder;
 use crate::server::stream_registry::StreamQueryResult;
@@ -479,7 +479,7 @@ async fn handle_fresh_handshake(
 
     let body_bytes = tokio::time::timeout(
         BODY_READ_TIMEOUT,
-        axum::body::to_bytes(body, MAX_FRAME_BUF_SIZE),
+        axum::body::to_bytes(body, MAX_HANDSHAKE_BODY_SIZE),
     )
     .await
     .map_err(|_| ServerError::request_timeout("request body read timed out"))?

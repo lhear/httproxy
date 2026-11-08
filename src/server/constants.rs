@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 pub const MAX_FRAME_BUF_SIZE: usize = 18781;
+pub const MAX_HANDSHAKE_BODY_SIZE: usize = 2 * MAX_FRAME_BUF_SIZE;
 
 pub const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PENDING_FRAMES: usize = 8 * 1024;

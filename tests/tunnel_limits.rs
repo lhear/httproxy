@@ -79,6 +79,24 @@ async fn unreachable_upstream_yields_connection_error() {
 }
 
 #[tokio::test]
+async fn handshake_survives_max_padding() {
+    common::init_logging();
+    let keys = test_keys();
+    let upstream = spawn_upstream().await;
+    let mut traffic = traffic(false, None);
+    traffic.global.padding_threshold = 20_000;
+    traffic.global.padding_range = [14_000, 14_000];
+    let server = spawn_server(server_config(traffic.clone(), &keys, None)).await;
+    let client = spawn_client(client_config(traffic, &keys, None, vec![]), server).await;
+
+    let url = format!("http://{upstream}/hello");
+    let request = format!("GET {url} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    let (status, body) = raw_exchange(client, request.as_bytes()).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello upstream");
+}
+
+#[tokio::test]
 async fn concurrent_tunnels_work_independently() {
     common::init_logging();
     let keys = test_keys();
