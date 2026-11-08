@@ -33,7 +33,7 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
@@ -105,13 +105,17 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         None => (None, None),
     };
 
-    let private_key = crypto::b64_to_mlkem_private_key(&config.server.private_key)
-        .context("invalid server.private_key")?;
+    let private_key = crypto::b64_to_mlkem_private_key(&config.server.private_key);
+    config.server.private_key.zeroize();
+    let private_key = private_key.context("invalid server.private_key")?;
+
+    let token_key = token::key_from_secret(config.auth.secret.as_bytes());
+    config.auth.secret.zeroize();
 
     let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
 
     Ok(Arc::new(AppState {
-        token_key: Arc::new(token::key_from_secret(config.auth.secret.as_bytes())),
+        token_key: Arc::new(token_key),
         socks5_proxy: config
             .proxy
             .as_ref()

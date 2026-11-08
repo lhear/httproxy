@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::fs;
+use zeroize::Zeroize;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -54,8 +55,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config_str = fs::read_to_string(&cli.config)?;
+    let mut config_str = fs::read_to_string(&cli.config)?;
     let mut config: httproxy::config::ServerTopConfig = toml::from_str(&config_str)?;
+    config_str.zeroize();
 
     let _guard = httproxy::log::init_tracing(&config.log.as_ref().cloned().unwrap_or_default());
 
