@@ -3,7 +3,7 @@ edition = "2024"
 license = "MPL-2.0"
 name = "httproxy"
 rust-version = "1.99"
-version = "0.5.3"
+version = "0.5.4"
 
 [[bin]]
 name = "server"
