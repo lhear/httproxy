@@ -1,9 +1,7 @@
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hkdf::Hkdf;
 use rand::Rng;
-use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use super::Claims;
@@ -17,10 +15,8 @@ const KEY_INFO: &[u8] = b"httproxy-token-v1";
 pub const MAX_TOKEN_LEN: usize = 1024;
 
 pub fn key_from_secret(secret: &[u8]) -> LessSafeKey {
-    let hkdf = Hkdf::<Sha256>::new(None, secret);
     let mut key = Zeroizing::new([0u8; 32]);
-    hkdf.expand(KEY_INFO, &mut *key)
-        .expect("32 bytes is valid for HKDF");
+    crate::crypto::expand_key(None, secret, &[KEY_INFO], &mut *key);
     let unbound = UnboundKey::new(&AES_256_GCM, &*key).expect("32 bytes is valid for AES-256-GCM");
     LessSafeKey::new(unbound)
 }
