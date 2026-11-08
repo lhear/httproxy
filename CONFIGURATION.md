@@ -41,7 +41,7 @@ appears in the clear, and verification is a single AEAD pass with no parsing.
 ./server gen-key
 ```
 
-Prints an X25519 keypair. Put the **private key** in `[server] private_key` and
+Prints an ML-KEM-768 keypair. Put the **private key** in `[server] private_key` and
 the **public key** in `[client] public_key`. Both are required: the tunnel is
 always sealed, and the server rejects requests that are not part of an encrypted
 session.
@@ -89,7 +89,7 @@ padding_threshold = 500
 | `listen`              | string  | yes      | —           | Local listen address, e.g. `"127.0.0.1:8080"`. |
 | `remote`              | string  | yes      | —           | Server URL including the hidden path. |
 | `address`             | string  | no       | host of `remote` | Connection address override. TLS SNI and `Host` still use the `remote` domain. |
-| `public_key`          | string  | yes      | —           | Server's X25519 public key; required for the tunnel handshake. |
+| `public_key`          | string  | yes      | —           | Server's ML-KEM-768 encapsulation key; required for the tunnel handshake. |
 | `auth`                | table   | no       | —           | Local proxy authentication (§2.2). |
 | `max_connections`     | integer | no       | `1024`      | Concurrent local connections; excess are refused. |
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Upload bytes in flight per tunnel. **Must not exceed 2 MiB** (§9). |
@@ -172,7 +172,7 @@ padding_threshold = 500
 | ------------- | ------- | -------- | ------- | ----------- |
 | `listen`      | string  | yes      | —       | TCP address (`"0.0.0.0:443"`) or Unix socket path. |
 | `path`        | string  | yes      | —       | Hidden service path; must match the path in the client's `remote`. |
-| `private_key` | string  | yes      | —       | X25519 private key (from `gen-key`), paired with the client's `public_key`. |
+| `private_key` | string  | yes      | —       | ML-KEM-768 decapsulation key (from `gen-key`), paired with the client's `public_key`. |
 | `max_tunnels` | integer | no       | `1024`  | Concurrent tunnels; excess requests get HTTP 503. |
 
 ### 3.2 `[auth]` — Token Signing Secret
@@ -233,7 +233,7 @@ See [§5](#5-traffic-shaping). Both sides must agree on `encoding_type` and
 ## 4. Authentication Model
 
 1. **Tunnel authorisation:** opening a tunnel requires the client's tunnel token, verified against `[auth] secret`. Later upload and download requests are bound to the tunnel by the stream cookie.
-2. **End-to-end encryption (mandatory):** every tunnel is sealed by a hybrid X25519 + ML-KEM exchange above transport TLS. `public_key` and `private_key` are required, and requests that are not part of an encrypted session are rejected.
+2. **End-to-end encryption (mandatory):** every tunnel is sealed by an ML-KEM-768 handshake and a hybrid X25519 + ML-KEM exchange above transport TLS. `public_key` and `private_key` are required, and requests that are not part of an encrypted session are rejected.
 3. **Local proxy auth (optional):** `[client.auth]` gates the local proxy endpoint.
 
 ---

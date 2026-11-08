@@ -443,12 +443,7 @@ pub async fn dispatch(
         return spawn_encrypted_tunnel(state, session_val, body, span).await;
     }
 
-    let has_handshake_cookie = utils::extract_cookie_value(&headers, "eph_pk_a").is_some();
-    if has_handshake_cookie {
-        return handle_fresh_handshake(state, headers, body, span).await;
-    }
-
-    Err(ServerError::bad_request("missing required cookies"))
+    handle_fresh_handshake(state, body, span).await
 }
 
 fn handle_stream_not_found(
@@ -477,26 +472,10 @@ fn handle_stream_not_found(
 
 async fn handle_fresh_handshake(
     state: Arc<AppState>,
-    headers: HeaderMap,
     body: Body,
     span: tracing::Span,
 ) -> Result<Response, ServerError> {
     info!("handshake: received ClientHello");
-
-    let eph_pk_a_b64 = utils::extract_cookie_value(&headers, "eph_pk_a")
-        .ok_or_else(|| ServerError::bad_request("missing eph_pk_a cookie"))?;
-    let eph_pk_a_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(eph_pk_a_b64.as_bytes())
-        .map_err(|_| ServerError::bad_request("invalid eph_pk_a base64"))?;
-    if eph_pk_a_bytes.len() != 32 {
-        return Err(ServerError::bad_request("eph_pk_a must be 32 bytes"));
-    }
-    let eph_pk_a_arr: [u8; 32] = eph_pk_a_bytes[..].try_into().unwrap();
-    let eph_pk_a = x25519_dalek::PublicKey::from(eph_pk_a_arr);
-
-    let shared_a = crypto::diffie_hellman(&state.private_key, &eph_pk_a);
-    let handshake_key = crypto::derive_handshake_key(&shared_a);
-    let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
     let body_bytes = tokio::time::timeout(
         BODY_READ_TIMEOUT,
@@ -507,6 +486,20 @@ async fn handle_fresh_handshake(
     .map_err(|e| ServerError::payload_too_large(format!("request body error: {e}")))?;
 
     let mut buf = BytesMut::from(&body_bytes[..]);
+    let Some((_seq, static_ct)) = shaper::decode_from_buffer(
+        &mut buf,
+        &crypto::PlainFrameCipher,
+        state.traffic_config.encoding_type,
+    )?
+    else {
+        return Err(ServerError::bad_request("invalid ML-KEM ciphertext frame"));
+    };
+
+    let static_ss = crypto::mlkem_decapsulate(&state.private_key, &static_ct)
+        .map_err(|e| ServerError::bad_request(format!("invalid ML-KEM ciphertext: {e}")))?;
+    let handshake_key = crypto::derive_handshake_key(&static_ss);
+    let handshake_cipher = AesFrameCipher::new(&handshake_key);
+
     let Some((_seq, client_hello_data)) = shaper::decode_from_buffer(
         &mut buf,
         &handshake_cipher,
@@ -653,13 +646,16 @@ mod tests {
     use axum::http::StatusCode;
 
     async fn test_state() -> Arc<AppState> {
+        test_state_with_public_key().await.0
+    }
+
+    async fn test_state_with_public_key() -> (Arc<AppState>, crate::crypto::EncapsulationKey) {
+        let (private_key, public_key) = crate::crypto::generate_mlkem_keypair().unwrap();
         let mut cfg = crate::config::ServerTopConfig {
             server: crate::config::ServerSection {
                 listen: "127.0.0.1:0".to_string(),
                 path: "/secret".to_string(),
-                private_key: crate::crypto::private_key_to_b64(
-                    &crate::crypto::generate_keypair().0,
-                ),
+                private_key: crate::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
                 max_tunnels: None,
             },
             auth: crate::config::AuthSection {
@@ -679,7 +675,8 @@ mod tests {
                 max_download_bytes: None,
             },
         };
-        crate::server::build_state(&mut cfg).await.unwrap()
+        let state = crate::server::build_state(&mut cfg).await.unwrap();
+        (state, public_key)
     }
 
     fn valid_token() -> String {
@@ -784,34 +781,19 @@ mod tests {
         assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
     }
 
-    fn handshake_headers(eph_pk_a: &x25519_dalek::PublicKey) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "cookie",
-            format!(
-                "eph_pk_a={}",
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eph_pk_a.as_bytes())
-            )
-            .parse()
-            .unwrap(),
-        );
-        headers
-    }
-
     fn encrypted_client_hello(
         state: &Arc<AppState>,
-        client_sk: &x25519_dalek::StaticSecret,
+        server_pk: &crate::crypto::EncapsulationKey,
         token: &str,
     ) -> Body {
-        let server_pk = x25519_dalek::PublicKey::from(&state.private_key);
-        let shared = crate::crypto::diffie_hellman(client_sk, &server_pk);
-        let handshake_key = crate::crypto::derive_handshake_key(&shared);
+        let (static_ct, static_ss) = crate::crypto::mlkem_encapsulate(server_pk).unwrap();
+        let handshake_key = crate::crypto::derive_handshake_key(&static_ss);
         let cipher = AesFrameCipher::new(&handshake_key);
 
         let mut hello = Vec::with_capacity(2 + token.len());
         hello.extend_from_slice(&(token.len() as u16).to_be_bytes());
         hello.extend_from_slice(token.as_bytes());
-        let frame = shaper::encode_frame(
+        let client_hello_frame = shaper::encode_frame(
             &hello,
             0,
             &cipher,
@@ -820,16 +802,28 @@ mod tests {
             state.traffic_config.encoding_type,
         )
         .unwrap();
-        Body::from(frame)
+        let static_ct_frame = shaper::encode_frame(
+            static_ct.as_ref(),
+            0,
+            &crate::crypto::PlainFrameCipher,
+            state.traffic_config.global.padding_threshold,
+            state.traffic_config.global.padding_range,
+            state.traffic_config.encoding_type,
+        )
+        .unwrap();
+
+        let mut body = static_ct_frame;
+        body.extend_from_slice(&client_hello_frame);
+        Body::from(body)
     }
 
     #[tokio::test]
-    async fn dispatch_rejects_bad_token_with_handshake_cookie() {
-        let state = test_state().await;
-        let (client_sk, client_pk) = crate::crypto::generate_keypair();
-        let headers = handshake_headers(&client_pk);
-        let body = encrypted_client_hello(&state, &client_sk, "invalid-token");
-        let err = dispatch(State(state), headers, body).await.unwrap_err();
+    async fn dispatch_rejects_bad_token_in_client_hello() {
+        let (state, public_key) = test_state_with_public_key().await;
+        let body = encrypted_client_hello(&state, &public_key, "invalid-token");
+        let err = dispatch(State(state), HeaderMap::new(), body)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
@@ -857,11 +851,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_rejects_expired_token_on_handshake_path() {
-        let state = test_state().await;
-        let (client_sk, client_pk) = crate::crypto::generate_keypair();
-        let headers = handshake_headers(&client_pk);
-        let body = encrypted_client_hello(&state, &client_sk, &token_with_exp(1));
-        let err = dispatch(State(state), headers, body).await.unwrap_err();
+        let (state, public_key) = test_state_with_public_key().await;
+        let body = encrypted_client_hello(&state, &public_key, &token_with_exp(1));
+        let err = dispatch(State(state), HeaderMap::new(), body)
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 }

@@ -21,7 +21,7 @@ enum Commands {
         #[arg(short, long, help = "Expiration timestamp (Unix)")]
         exp: u64,
     },
-    #[command(about = "Generate an x25519 keypair")]
+    #[command(about = "Generate an ML-KEM-768 keypair")]
     GenKey,
 }
 
@@ -40,14 +40,14 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             Commands::GenKey => {
-                let (sk, pk) = httproxy::crypto::generate_keypair();
+                let (sk, pk) = httproxy::crypto::generate_mlkem_keypair()?;
                 println!(
                     "private_key = \"{}\"",
-                    httproxy::crypto::private_key_to_b64(&sk)
+                    httproxy::crypto::mlkem_private_key_to_b64(&sk)?
                 );
                 println!(
                     "public_key = \"{}\"",
-                    httproxy::crypto::public_key_to_b64(&pk)
+                    httproxy::crypto::mlkem_public_key_to_b64(&pk)?
                 );
                 return Ok(());
             }

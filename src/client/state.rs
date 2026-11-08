@@ -43,7 +43,7 @@ pub struct SharedState {
     pub traffic_config: TrafficConfig,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub bypass: Option<Arc<BypassRules>>,
-    pub server_public_key: x25519_dalek::PublicKey,
+    pub server_public_key: Arc<crate::crypto::EncapsulationKey>,
     pub proxy_auth: Option<(String, String)>,
     pub initial_master: Mutex<Option<InitialMasterEntry>>,
     pub handshake_lock: Mutex<()>,
@@ -66,7 +66,7 @@ pub struct Handshaking {
     pub payload: Bytes,
     pub read_half: OwnedReadHalf,
     pub write_half: OwnedWriteHalf,
-    pub server_pk: x25519_dalek::PublicKey,
+    pub server_pk: Arc<crate::crypto::EncapsulationKey>,
 }
 
 pub enum ClientPqFsm {
@@ -80,7 +80,7 @@ impl ClientPqFsm {
         payload: Bytes,
         read_half: OwnedReadHalf,
         write_half: OwnedWriteHalf,
-        server_pk: x25519_dalek::PublicKey,
+        server_pk: Arc<crate::crypto::EncapsulationKey>,
         state: &Arc<SharedState>,
     ) -> Self {
         match load_and_validate_ticket(state).await {
@@ -126,7 +126,7 @@ impl ClientPqFsm {
                             payload: resuming.payload,
                             read_half: rh,
                             write_half: wh,
-                            server_pk: state.server_public_key,
+                            server_pk: Arc::clone(&state.server_public_key),
                         })
                     }
                     Err((_, e)) => {
@@ -232,7 +232,7 @@ mod tests {
     use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
 
     fn shared_state() -> Arc<SharedState> {
-        let (_, server_pk) = crate::crypto::generate_keypair();
+        let (_, server_pk) = crate::crypto::generate_mlkem_keypair().unwrap();
         let traffic = TrafficConfig {
             global: PaddingConfig {
                 padding_threshold: 0,
@@ -248,7 +248,7 @@ mod tests {
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass: None,
-            server_public_key: server_pk,
+            server_public_key: Arc::new(server_pk),
             proxy_auth: None,
             initial_master: Mutex::new(None),
             handshake_lock: Mutex::new(()),

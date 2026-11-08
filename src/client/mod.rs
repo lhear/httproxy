@@ -55,8 +55,8 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         }
     };
 
-    let server_public_key =
-        crypto::b64_to_public_key(&cfg.client.public_key).context("invalid client.public_key")?;
+    let server_public_key = crypto::b64_to_mlkem_public_key(&cfg.client.public_key)
+        .context("invalid client.public_key")?;
 
     let remote: url::Url = cfg.client.remote.parse().context("invalid server URL")?;
     let remote_str = remote.as_str().to_owned();
@@ -76,7 +76,7 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         traffic_config: cfg.traffic_shaping.clone(),
         resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&cfg.traffic_shaping)),
         bypass,
-        server_public_key,
+        server_public_key: Arc::new(server_public_key),
         proxy_auth,
         initial_master: Mutex::new(None),
         handshake_lock: Mutex::new(()),
@@ -93,12 +93,14 @@ mod tests {
     use crate::client::constants::{MAX_IN_FLIGHT_BYTES, UPLOAD_CONCURRENCY};
 
     fn minimal_client_cfg() -> crate::config::ClientTopConfig {
-        toml::from_str(
+        let (_, public_key) = crate::crypto::generate_mlkem_keypair().unwrap();
+        let public_key = crate::crypto::mlkem_public_key_to_b64(&public_key).unwrap();
+        toml::from_str(&format!(
             r#"
 [client]
 listen = "127.0.0.1:8080"
 remote = "https://example.com/secret"
-public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+public_key = "{public_key}"
 
 [auth]
 token = "tok"
@@ -107,7 +109,7 @@ token = "tok"
 padding_range = [0, 100]
 padding_threshold = 50
 "#,
-        )
+        ))
         .unwrap()
     }
 

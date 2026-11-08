@@ -2,7 +2,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-pub fn derive_handshake_key(shared: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+pub fn derive_handshake_key(shared: &[u8]) -> Zeroizing<[u8; 32]> {
     let hkdf = Hkdf::<Sha256>::new(None, shared);
     let mut key = Zeroizing::new([0u8; 32]);
     hkdf.expand(b"mlkem_handshake_key", &mut *key)

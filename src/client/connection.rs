@@ -30,7 +30,7 @@ pub(crate) async fn open_tunnel(
         payload,
         read_half,
         write_half,
-        state.server_public_key,
+        Arc::clone(&state.server_public_key),
         &state,
     )
     .await;

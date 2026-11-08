@@ -56,10 +56,10 @@ pub struct TestKeys {
 }
 
 pub fn test_keys() -> TestKeys {
-    let (sk, pk) = httproxy::crypto::generate_keypair();
+    let (sk, pk) = httproxy::crypto::generate_mlkem_keypair().unwrap();
     TestKeys {
-        private_key: httproxy::crypto::private_key_to_b64(&sk),
-        public_key: httproxy::crypto::public_key_to_b64(&pk),
+        private_key: httproxy::crypto::mlkem_private_key_to_b64(&sk).unwrap(),
+        public_key: httproxy::crypto::mlkem_public_key_to_b64(&pk).unwrap(),
     }
 }
 

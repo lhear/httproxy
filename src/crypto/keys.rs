@@ -5,52 +5,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-const X25519_KEY_LEN: usize = 32;
-const X25519_B64_LEN: usize = 43;
-
 #[inline]
 pub fn generate_keypair() -> (StaticSecret, PublicKey) {
     let secret = StaticSecret::random();
     let public = PublicKey::from(&secret);
     (secret, public)
-}
-
-#[inline]
-fn encode_fixed_32(bytes: &[u8; X25519_KEY_LEN]) -> String {
-    let mut out = String::with_capacity(X25519_B64_LEN);
-    URL_SAFE_NO_PAD.encode_string(bytes, &mut out);
-    out
-}
-
-#[inline]
-fn decode_fixed_32(s: &str) -> Result<[u8; X25519_KEY_LEN]> {
-    let mut out = [0u8; X25519_KEY_LEN];
-    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(s.as_bytes())?);
-    if decoded.len() != X25519_KEY_LEN {
-        return Err(anyhow!("invalid key length"));
-    }
-    out.copy_from_slice(&decoded);
-    Ok(out)
-}
-
-#[inline]
-pub fn public_key_to_b64(pk: &PublicKey) -> String {
-    encode_fixed_32(pk.as_bytes())
-}
-
-#[inline]
-pub fn private_key_to_b64(sk: &StaticSecret) -> String {
-    encode_fixed_32(&sk.to_bytes())
-}
-
-#[inline]
-pub fn b64_to_public_key(s: &str) -> Result<PublicKey> {
-    Ok(PublicKey::from(decode_fixed_32(s)?))
-}
-
-#[inline]
-pub fn b64_to_private_key(s: &str) -> Result<StaticSecret> {
-    Ok(StaticSecret::from(decode_fixed_32(s)?))
 }
 
 #[inline]
@@ -78,6 +37,27 @@ pub fn bytes_to_encapsulation_key(bytes: &[u8]) -> Result<EncapsulationKey> {
     EncapsulationKey::new(&ML_KEM_768, bytes).map_err(|_| anyhow!("invalid encapsulation key"))
 }
 
+pub fn mlkem_public_key_to_b64(pk: &EncapsulationKey) -> Result<String> {
+    Ok(URL_SAFE_NO_PAD.encode(mlkem_public_key_bytes(pk)?))
+}
+
+pub fn b64_to_mlkem_public_key(s: &str) -> Result<EncapsulationKey> {
+    let raw = Zeroizing::new(URL_SAFE_NO_PAD.decode(s.as_bytes())?);
+    EncapsulationKey::new(&ML_KEM_768, &raw).map_err(|_| anyhow!("invalid ML-KEM public key"))
+}
+
+pub fn mlkem_private_key_to_b64(sk: &DecapsulationKey) -> Result<String> {
+    let bytes = sk
+        .key_bytes()
+        .map_err(|_| anyhow!("ML-KEM private key export failed"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes.as_ref()))
+}
+
+pub fn b64_to_mlkem_private_key(s: &str) -> Result<DecapsulationKey> {
+    let raw = Zeroizing::new(URL_SAFE_NO_PAD.decode(s.as_bytes())?);
+    DecapsulationKey::new(&ML_KEM_768, &raw).map_err(|_| anyhow!("invalid ML-KEM private key"))
+}
+
 pub fn mlkem_encapsulate(
     pk: &EncapsulationKey,
 ) -> Result<(Ciphertext<'static>, Zeroizing<Vec<u8>>)> {
@@ -97,21 +77,6 @@ pub fn mlkem_decapsulate(sk: &DecapsulationKey, ct: &[u8]) -> Result<Zeroizing<V
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn keypair_roundtrip() {
-        let (sk, pk) = generate_keypair();
-        let b64_pk = public_key_to_b64(&pk);
-        let b64_sk = private_key_to_b64(&sk);
-        assert_eq!(b64_pk.len(), X25519_B64_LEN);
-        assert_eq!(b64_sk.len(), X25519_B64_LEN);
-
-        let pk2 = b64_to_public_key(&b64_pk).unwrap();
-        assert_eq!(pk.as_bytes(), pk2.as_bytes());
-
-        let sk2 = b64_to_private_key(&b64_sk).unwrap();
-        assert_eq!(sk.to_bytes(), sk2.to_bytes());
-    }
 
     #[test]
     fn diffie_hellman_agreement() {
@@ -137,6 +102,24 @@ mod tests {
     }
 
     #[test]
+    fn mlkem_key_serialization_roundtrip() {
+        let (sk, pk) = generate_mlkem_keypair().unwrap();
+        let pk_b64 = mlkem_public_key_to_b64(&pk).unwrap();
+        let sk_b64 = mlkem_private_key_to_b64(&sk).unwrap();
+
+        let pk2 = b64_to_mlkem_public_key(&pk_b64).unwrap();
+        let sk2 = b64_to_mlkem_private_key(&sk_b64).unwrap();
+        assert_eq!(
+            mlkem_public_key_bytes(&pk).unwrap(),
+            mlkem_public_key_bytes(&pk2).unwrap()
+        );
+
+        let (ct, ss_enc) = mlkem_encapsulate(&pk2).unwrap();
+        let ss_dec = mlkem_decapsulate(&sk2, ct.as_ref()).unwrap();
+        assert_eq!(*ss_enc, *ss_dec);
+    }
+
+    #[test]
     fn mlkem_rejects_bad_public_key() {
         assert!(bytes_to_encapsulation_key(&[0u8; 17]).is_err());
     }
@@ -148,8 +131,8 @@ mod tests {
     }
 
     #[test]
-    fn b64_invalid_length_rejected() {
-        assert!(b64_to_public_key("abc").is_err());
-        assert!(b64_to_private_key("abc").is_err());
+    fn mlkem_b64_rejects_bad_keys() {
+        assert!(b64_to_mlkem_public_key("abc").is_err());
+        assert!(b64_to_mlkem_private_key("abc").is_err());
     }
 }

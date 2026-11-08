@@ -174,7 +174,7 @@ mod tests {
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass,
-            server_public_key: crate::crypto::generate_keypair().1,
+            server_public_key: Arc::new(crate::crypto::generate_mlkem_keypair().unwrap().1),
             proxy_auth,
             initial_master: Mutex::new(None),
             handshake_lock: Mutex::new(()),

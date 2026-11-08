@@ -64,7 +64,7 @@ pub struct AppState {
     pub client_subnet: Option<IpAddr>,
     pub traffic_config: Arc<TrafficConfig>,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
-    pub private_key: x25519_dalek::StaticSecret,
+    pub private_key: Arc<crate::crypto::DecapsulationKey>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
     pub stream_registry: Arc<StreamRegistry>,
     pub actors: Arc<DashMap<Uuid, SessionHandle>>,
@@ -105,7 +105,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         None => (None, None),
     };
 
-    let private_key = crypto::b64_to_private_key(&config.server.private_key)
+    let private_key = crypto::b64_to_mlkem_private_key(&config.server.private_key)
         .context("invalid server.private_key")?;
 
     let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
@@ -122,7 +122,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         client_subnet,
         traffic_config: Arc::new(config.traffic_shaping.clone()),
         resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&config.traffic_shaping)),
-        private_key,
+        private_key: Arc::new(private_key),
         master_store: Arc::new(DashMap::new()),
         stream_registry: Arc::new(StreamRegistry::new()),
         actors: Arc::new(DashMap::new()),
@@ -199,13 +199,12 @@ mod tests {
 
     #[test]
     fn build_state_with_minimal_config() {
+        let (private_key, public_key) = crate::crypto::generate_mlkem_keypair().unwrap();
         let mut cfg = ServerTopConfig {
             server: ServerSection {
                 listen: "0.0.0.0:0".into(),
                 path: "/t".into(),
-                private_key: crate::crypto::private_key_to_b64(
-                    &crate::crypto::generate_keypair().0,
-                ),
+                private_key: crate::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
                 max_tunnels: None,
             },
             auth: AuthSection {
@@ -228,8 +227,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let state = rt.block_on(build_state(&mut cfg)).unwrap();
         assert!(state.dns_client.is_none());
-        let peer = crate::crypto::generate_keypair().1;
-        let shared = crate::crypto::diffie_hellman(&state.private_key, &peer);
-        assert_ne!(*shared, [0u8; 32]);
+        let (ct, shared) = crate::crypto::mlkem_encapsulate(&public_key).unwrap();
+        let decapsulated =
+            crate::crypto::mlkem_decapsulate(&state.private_key, ct.as_ref()).unwrap();
+        assert_eq!(*shared, *decapsulated);
     }
 }

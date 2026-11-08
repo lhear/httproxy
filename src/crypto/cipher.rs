@@ -70,6 +70,30 @@ pub fn decrypt_bytes(key_z: &Zeroizing<[u8; 32]>, data: &[u8]) -> Result<Vec<u8>
     decrypt_with_cipher(&cipher, data)
 }
 
+pub struct PlainFrameCipher;
+
+impl FrameCipher for PlainFrameCipher {
+    #[inline]
+    fn encrypt(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(NONCE_LEN + data.len() + TAG_LEN);
+        out.extend_from_slice(&[0u8; NONCE_LEN]);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&[0u8; TAG_LEN]);
+        Ok(out)
+    }
+
+    #[inline]
+    fn decrypt(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if data.len() < NONCE_LEN + TAG_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too short",
+            ));
+        }
+        Ok(data[NONCE_LEN..data.len() - TAG_LEN].to_vec())
+    }
+}
+
 pub struct AesFrameCipher {
     key: Zeroizing<[u8; 32]>,
     cipher: LessSafeKey,

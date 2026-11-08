@@ -252,7 +252,7 @@ mod tests {
     }
 
     fn test_state(remote: &str, max_in_flight: usize) -> Arc<SharedState> {
-        let (_, server_pk) = crate::crypto::generate_keypair();
+        let (_, server_pk) = crate::crypto::generate_mlkem_keypair().unwrap();
         let traffic = TrafficConfig {
             global: PaddingConfig {
                 padding_threshold: 0,
@@ -268,7 +268,7 @@ mod tests {
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass: None,
-            server_public_key: server_pk,
+            server_public_key: Arc::new(server_pk),
             proxy_auth: None,
             initial_master: Mutex::new(None),
             handshake_lock: Mutex::new(()),

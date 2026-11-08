@@ -3,7 +3,6 @@ use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use http_body_util::BodyExt;
-use rand::RngExt;
 use std::sync::Arc;
 use tracing::{Instrument, info};
 use zeroize::Zeroizing;
@@ -15,9 +14,7 @@ use crate::crypto::{self, AesFrameCipher};
 use crate::shaper::{self, MAX_RAW_PAYLOAD};
 
 use super::state::SharedState;
-use crate::client::constants::{
-    DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, MIN_PADDING, PADDING_POOL,
-};
+use crate::client::constants::{DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT};
 
 pub struct PqSessionTicket {
     pub master: Zeroizing<[u8; 32]>,
@@ -136,13 +133,12 @@ pub async fn try_pq_connect(
 pub async fn perform_pq_handshake(
     http_client: &wreq::Client,
     state: &SharedState,
-    server_pk: &x25519_dalek::PublicKey,
+    server_pk: &crypto::EncapsulationKey,
 ) -> Result<PqSessionTicket> {
     info!("PQ handshake initiated");
 
-    let (eph_sk_a, eph_pk_a) = crypto::generate_keypair();
-    let x25519_shared_a = crypto::diffie_hellman(&eph_sk_a, server_pk);
-    let handshake_key = crypto::derive_handshake_key(&x25519_shared_a);
+    let (static_ct, static_ss) = crypto::mlkem_encapsulate(server_pk)?;
+    let handshake_key = crypto::derive_handshake_key(&static_ss);
     let handshake_cipher = AesFrameCipher::new(&handshake_key);
 
     let (kem_sk, kem_pk) = crypto::generate_mlkem_keypair()?;
@@ -170,16 +166,18 @@ pub async fn perform_pq_handshake(
         state.traffic_config.encoding_type,
     )?;
 
-    let eph_pk_a_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(eph_pk_a.as_bytes());
+    let static_ct_frame = shaper::encode_frame(
+        static_ct.as_ref(),
+        0,
+        &crypto::PlainFrameCipher,
+        state.traffic_config.global.padding_threshold,
+        state.traffic_config.global.padding_range,
+        state.traffic_config.encoding_type,
+    )?;
 
-    let mut handshake_cookie =
-        String::with_capacity(9 + eph_pk_a_b64.len() + 2 + MIN_PADDING + PADDING_POOL.len());
-    handshake_cookie.push_str("eph_pk_a=");
-    handshake_cookie.push_str(&eph_pk_a_b64);
-    handshake_cookie.push_str("; ");
-    let padding_len = rand::rng().random_range(MIN_PADDING..PADDING_POOL.len());
-    handshake_cookie
-        .push_str(std::str::from_utf8(&PADDING_POOL[..padding_len]).expect("Invalid UTF-8"));
+    let mut handshake_body = Vec::with_capacity(static_ct_frame.len() + client_hello_frame.len());
+    handshake_body.extend_from_slice(&static_ct_frame);
+    handshake_body.extend_from_slice(&client_hello_frame);
 
     info!("ClientHello ready, sending to server");
 
@@ -187,8 +185,7 @@ pub async fn perform_pq_handshake(
         DOWNLOAD_CONNECT_TIMEOUT,
         http_client
             .post(state.remote_str.as_str())
-            .header("Cookie", &handshake_cookie)
-            .body(wreq::Body::from(client_hello_frame))
+            .body(wreq::Body::from(handshake_body))
             .send(),
     )
     .await
@@ -258,7 +255,7 @@ pub async fn perform_pq_handshake(
 pub async fn full_handshake(
     http_client: &Arc<wreq::Client>,
     state: &Arc<SharedState>,
-    server_pk: &x25519_dalek::PublicKey,
+    server_pk: &crypto::EncapsulationKey,
     target_host: &str,
     initial_payload: Bytes,
     read_half: tokio::net::tcp::OwnedReadHalf,
