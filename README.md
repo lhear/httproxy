@@ -10,7 +10,7 @@ traffic.
   parameters.
 - **Flexible topology** — works through CDNs, web proxies and middleboxes.
 - **Traffic obfuscation** — configurable padding and inter-frame jitter.
-- **Mandatory authentication and encryption** — bearer tokens authorise tunnel
+- **Mandatory authentication and encryption** — tunnel tokens authorise tunnel
   setup, and every tunnel is sealed with X25519 + ML-KEM.
 - **Optional WARP egress** — non-private traffic exits through Cloudflare WARP
   (MASQUE/HTTP-3), hostnames are resolved locally, private targets stay direct.

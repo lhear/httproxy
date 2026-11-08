@@ -128,7 +128,7 @@ target = "172.16.0.207:22"   # far side host:port
 
 | Field   | Type   | Required | Description |
 | ------- | ------ | -------- | ----------- |
-| `token` | string | yes      | Bearer token that authorises opening a tunnel (from `gen-token`). |
+| `token` | string | yes      | Token that authorises opening a tunnel (from `gen-token`). |
 
 ### 2.5 `[bypass]`
 
@@ -232,7 +232,7 @@ See [§5](#5-traffic-shaping). Both sides must agree on `encoding_type` and
 
 ## 4. Authentication Model
 
-1. **Tunnel authorisation:** opening a tunnel requires the client's bearer token, verified against `[auth] secret`. Later upload and download requests are bound to the tunnel by the stream cookie.
+1. **Tunnel authorisation:** opening a tunnel requires the client's tunnel token, verified against `[auth] secret`. Later upload and download requests are bound to the tunnel by the stream cookie.
 2. **End-to-end encryption (mandatory):** every tunnel is sealed by a hybrid X25519 + ML-KEM exchange above transport TLS. `public_key` and `private_key` are required, and requests that are not part of an encrypted session are rejected.
 3. **Local proxy auth (optional):** `[client.auth]` gates the local proxy endpoint.
 
