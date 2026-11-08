@@ -70,7 +70,7 @@ pub fn decrypt_bytes(key_z: &Zeroizing<[u8; 32]>, data: &[u8]) -> Result<Vec<u8>
     decrypt_with_cipher(&cipher, data)
 }
 
-pub struct PlainFrameCipher;
+pub(crate) struct PlainFrameCipher;
 
 impl FrameCipher for PlainFrameCipher {
     #[inline]

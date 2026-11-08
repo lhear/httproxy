@@ -3,9 +3,8 @@ mod handshake;
 mod keys;
 
 pub use aws_lc_rs::kem::{DecapsulationKey, EncapsulationKey};
-pub use cipher::{
-    AesFrameCipher, NONCE_LEN, PlainFrameCipher, TAG_LEN, decrypt_bytes, encrypt_bytes,
-};
+pub(crate) use cipher::PlainFrameCipher;
+pub use cipher::{AesFrameCipher, NONCE_LEN, TAG_LEN, decrypt_bytes, encrypt_bytes};
 pub use handshake::{
     derive_connection_keys, derive_cookie_stream_key, derive_handshake_key, derive_initial_master,
 };
