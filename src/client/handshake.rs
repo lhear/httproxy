@@ -182,7 +182,7 @@ pub async fn perform_pq_handshake(
         DOWNLOAD_CONNECT_TIMEOUT,
         http_client
             .post(state.remote_str.as_str())
-            .header("Authorization", state.auth_header.as_str())
+            .header("Authorization", format!("Bearer {}", state.auth_token))
             .header("Cookie", &handshake_cookie)
             .body(wreq::Body::from(client_hello_frame))
             .send(),

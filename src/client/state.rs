@@ -39,7 +39,7 @@ impl wreq::dns::Resolve for ManualResolver {
 
 pub struct SharedState {
     pub remote_str: String,
-    pub auth_header: String,
+    pub auth_token: String,
     pub traffic_config: TrafficConfig,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub bypass: Option<Arc<BypassRules>>,
@@ -244,7 +244,7 @@ mod tests {
         };
         Arc::new(SharedState {
             remote_str: "http://x/".to_string(),
-            auth_header: "Bearer x".to_string(),
+            auth_token: "x".to_string(),
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass: None,

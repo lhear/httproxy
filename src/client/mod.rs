@@ -72,7 +72,7 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
 
     Ok(Arc::new(state::SharedState {
         remote_str,
-        auth_header: format!("Bearer {}", cfg.auth.token),
+        auth_token: cfg.auth.token.clone(),
         traffic_config: cfg.traffic_shaping.clone(),
         resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&cfg.traffic_shaping)),
         bypass,

@@ -264,7 +264,7 @@ mod tests {
         };
         Arc::new(SharedState {
             remote_str: remote.to_string(),
-            auth_header: "Bearer test-token".to_string(),
+            auth_token: "test-token".to_string(),
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass: None,

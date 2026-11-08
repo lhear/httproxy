@@ -170,7 +170,7 @@ mod tests {
         };
         Arc::new(SharedState {
             remote_str: "http://127.0.0.1:1/".to_string(),
-            auth_header: "Bearer test".to_string(),
+            auth_token: "test".to_string(),
             traffic_config: traffic.clone(),
             resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
             bypass,
