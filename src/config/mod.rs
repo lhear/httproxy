@@ -68,7 +68,7 @@ pub struct ClientSection {
     pub address: Option<String>,
     pub public_key: String,
     #[serde(default)]
-    pub auth: Option<ClientProxyAuth>,
+    pub proxy_auth: Option<ClientProxyAuth>,
     #[serde(default)]
     pub max_connections: Option<usize>,
     #[serde(default)]
@@ -230,6 +230,31 @@ padding_range = [0, 100]
 padding_threshold = 50
 "#;
         assert!(toml::from_str::<ServerTopConfig>(toml_str).is_err());
+    }
+
+    #[test]
+    fn parse_client_proxy_auth() {
+        let toml_str = r#"
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://example.com/secret"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[client.proxy_auth]
+username = "proxyuser"
+password = "proxypass"
+
+[auth]
+token = "mytoken"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+"#;
+        let cfg: ClientTopConfig = toml::from_str(toml_str).unwrap();
+        let proxy_auth = cfg.client.proxy_auth.unwrap();
+        assert_eq!(proxy_auth.username, "proxyuser");
+        assert_eq!(proxy_auth.password, "proxypass");
     }
 
     #[test]

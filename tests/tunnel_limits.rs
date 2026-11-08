@@ -146,7 +146,7 @@ async fn local_proxy_auth_challenges_and_accepts() {
     let upstream = spawn_upstream().await;
     let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
     let mut cfg = client_config(traffic(true, None), &keys, None, vec![]);
-    cfg.client.auth = Some(httproxy::config::ClientProxyAuth {
+    cfg.client.proxy_auth = Some(httproxy::config::ClientProxyAuth {
         username: "proxyuser".to_string(),
         password: "proxypass".to_string(),
     });

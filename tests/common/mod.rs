@@ -98,7 +98,7 @@ pub fn client_config(
             remote: format!("http://proxy-host.invalid{PATH}"),
             address: None,
             public_key: keys.public_key.clone(),
-            auth: None,
+            proxy_auth: None,
             max_connections: None,
             max_in_flight_bytes: None,
             upload_concurrency: None,

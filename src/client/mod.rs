@@ -61,7 +61,7 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
     let remote: url::Url = cfg.client.remote.parse().context("invalid server URL")?;
     let remote_str = remote.as_str().to_owned();
 
-    let proxy_auth = cfg.client.auth.as_ref().map(|a| {
+    let proxy_auth = cfg.client.proxy_auth.as_ref().map(|a| {
         let expected = format!(
             "Basic {}",
             base64::engine::general_purpose::STANDARD

@@ -60,7 +60,7 @@ public_key = "your-public-key"       # required (§1.2)
 # max_in_flight_bytes = 2097152
 # upload_concurrency = 128
 
-# [client.auth]                      # local proxy basic auth (§2.2)
+# [client.proxy_auth]                # local proxy basic auth (§2.2)
 # username = "proxyuser"
 # password = "proxypass"
 
@@ -90,12 +90,12 @@ padding_threshold = 500
 | `remote`              | string  | yes      | —           | Server URL including the hidden path. |
 | `address`             | string  | no       | host of `remote` | Connection address override. TLS SNI and `Host` still use the `remote` domain. |
 | `public_key`          | string  | yes      | —           | Server's ML-KEM-768 encapsulation key; required for the tunnel handshake. |
-| `auth`                | table   | no       | —           | Local proxy authentication (§2.2). |
+| `proxy_auth`          | table   | no       | —           | Local proxy authentication (§2.2). |
 | `max_connections`     | integer | no       | `1024`      | Concurrent local connections; excess are refused. |
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Upload bytes in flight per tunnel. **Must not exceed 2 MiB** (§9). |
 | `upload_concurrency`  | integer | no       | `128`       | Concurrent upload POSTs per tunnel. |
 
-### 2.2 `[client.auth]` — Local Proxy Authentication
+### 2.2 `[client.proxy_auth]` — Local Proxy Authentication
 
 When present, the local HTTP proxy requires basic auth from its clients.
 
@@ -124,11 +124,14 @@ target = "172.16.0.207:22"   # far side host:port
 - The local port speaks no protocol and does no auth — do not expose it publicly.
 - Invalid or duplicate `listen` values fail startup.
 
-### 2.4 `[auth]` — Server Authentication
+### 2.4 `[auth]` — Tunnel Token
 
 | Field   | Type   | Required | Description |
 | ------- | ------ | -------- | ----------- |
 | `token` | string | yes      | Token that authorises opening a tunnel (from `gen-token`). |
+
+This is separate from `[client.proxy_auth]`, which only gates the local proxy
+listener.
 
 ### 2.5 `[bypass]`
 
@@ -234,7 +237,7 @@ See [§5](#5-traffic-shaping). Both sides must agree on `encoding_type` and
 
 1. **Tunnel authorisation:** opening a tunnel requires the client's tunnel token, verified against `[auth] secret`. Later upload and download requests are bound to the tunnel by the stream cookie.
 2. **End-to-end encryption (mandatory):** every tunnel is sealed by an ML-KEM-768 handshake and a hybrid X25519 + ML-KEM exchange above transport TLS. `public_key` and `private_key` are required, and requests that are not part of an encrypted session are rejected.
-3. **Local proxy auth (optional):** `[client.auth]` gates the local proxy endpoint.
+3. **Local proxy auth (optional):** `[client.proxy_auth]` gates the local proxy endpoint.
 
 ---
 
