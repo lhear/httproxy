@@ -48,8 +48,7 @@ jobs:
           - target: x86_64
             target_triple: x86_64-unknown-linux-gnu
             apt_packages: ""
-            custom_env:
-              RUSTFLAGS: -C target-cpu=x86-64-v3
+            custom_env: {}
           - target: arm64
             target_triple: aarch64-unknown-linux-gnu
             apt_packages: crossbuild-essential-arm64
@@ -103,7 +102,6 @@ jobs:
               CXX: x86_64-linux-musl-g++
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-g++
               RUSTC_LINKER: x86_64-linux-musl-g++
-              RUSTFLAGS: -C target-cpu=x86-64-v3
           - target: arm64
             target_triple: aarch64-unknown-linux-musl
             package: aarch64-linux-musl-cross
@@ -153,8 +151,6 @@ jobs:
         include:
           - target: x86_64
             target_triple: x86_64-pc-windows-msvc
-            custom_env:
-              RUSTFLAGS: -C target-cpu=x86-64-v3
           - target: arm64
             target_triple: aarch64-pc-windows-msvc
     steps:
