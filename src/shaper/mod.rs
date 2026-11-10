@@ -650,6 +650,11 @@ impl<R> TrafficShaper<R> {
     }
 }
 
+enum Fill {
+    Frame,
+    Eof,
+}
+
 impl<R: AsyncRead> TrafficShaper<R> {
     fn poll_fill_and_seal(
         self: Pin<&mut Self>,
@@ -657,10 +662,18 @@ impl<R: AsyncRead> TrafficShaper<R> {
         out: &mut Vec<u8>,
     ) -> Poll<std::io::Result<Option<u64>>> {
         let mut this = self.project();
+        match Self::poll_fill_proj(&mut this, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Fill::Eof)) => Poll::Ready(Ok(None)),
+            Poll::Ready(Ok(Fill::Frame)) => Poll::Ready(Self::seal_into(&mut this, out).map(Some)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        }
+    }
 
+    fn poll_fill_proj(this: &mut Proj<'_, R>, cx: &mut Context<'_>) -> Poll<std::io::Result<Fill>> {
         loop {
             if this.raw_buf.len() >= *this.seal_threshold {
-                return Poll::Ready(Self::seal_into(&mut this, out).map(Some));
+                return Poll::Ready(Ok(Fill::Frame));
             }
 
             let remaining = READ_HIGH_WATER - this.raw_buf.len();
@@ -673,11 +686,11 @@ impl<R: AsyncRead> TrafficShaper<R> {
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
                     if n == 0 {
-                        return if this.raw_buf.is_empty() {
-                            Poll::Ready(Ok(None))
+                        return Poll::Ready(Ok(if this.raw_buf.is_empty() {
+                            Fill::Eof
                         } else {
-                            Poll::Ready(Self::seal_into(&mut this, out).map(Some))
-                        };
+                            Fill::Frame
+                        }));
                     }
 
                     unsafe {
@@ -690,7 +703,7 @@ impl<R: AsyncRead> TrafficShaper<R> {
                         return Poll::Pending;
                     }
                     if raw_len >= *this.seal_threshold {
-                        return Poll::Ready(Self::seal_into(&mut this, out).map(Some));
+                        return Poll::Ready(Ok(Fill::Frame));
                     }
 
                     if !*this.timer_armed {
@@ -704,7 +717,7 @@ impl<R: AsyncRead> TrafficShaper<R> {
                     }
 
                     if this.flush_timer.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(Self::seal_into(&mut this, out).map(Some));
+                        return Poll::Ready(Ok(Fill::Frame));
                     }
                     return Poll::Pending;
                 }
@@ -728,13 +741,18 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
     type Item = Result<(u64, Bytes), Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let capacity = self.as_ref().get_ref().frame_capacity;
-        let mut frame = bufpool::take(capacity);
-        match self.poll_fill_and_seal(cx, &mut frame) {
-            Poll::Ready(Ok(Some(seq))) => Poll::Ready(Some(Ok((seq, bufpool::frame_bytes(frame))))),
-            Poll::Ready(Ok(None)) => Poll::Ready(None),
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+        let mut this = self.project();
+        match Self::poll_fill_proj(&mut this, cx) {
             Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Fill::Eof)) => Poll::Ready(None),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(Fill::Frame)) => {
+                let mut frame = bufpool::take(*this.frame_capacity);
+                match Self::seal_into(&mut this, &mut frame) {
+                    Ok(seq) => Poll::Ready(Some(Ok((seq, bufpool::frame_bytes(frame))))),
+                    Err(e) => Poll::Ready(Some(Err(e))),
+                }
+            }
         }
     }
 }

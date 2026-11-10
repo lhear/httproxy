@@ -35,6 +35,8 @@ pub struct UploadLoopActor {
     bytes_sem: Arc<Semaphore>,
     max_batch_bytes: usize,
     max_in_flight_bytes: usize,
+    frame_headroom: usize,
+    next_batch_capacity: usize,
     tasks: JoinSet<Result<(), anyhow::Error>>,
     phase: Phase,
 }
@@ -63,6 +65,7 @@ impl UploadLoopActor {
         let max_batch_bytes = MAX_BATCH_BYTES
             .min(max_in_flight_bytes.saturating_sub(frame_headroom))
             .max(1);
+        let next_batch_capacity = BATCH_BUF_INITIAL_CAPACITY.min(max_batch_bytes);
         Self {
             http_client,
             state,
@@ -72,9 +75,11 @@ impl UploadLoopActor {
             bytes_sem: Arc::new(Semaphore::new(max_in_flight_bytes)),
             max_batch_bytes,
             max_in_flight_bytes,
+            frame_headroom,
+            next_batch_capacity,
             tasks: JoinSet::new(),
             phase: Phase::Batching {
-                batch_buf: shaper::take_buf(BATCH_BUF_INITIAL_CAPACITY.min(max_batch_bytes)),
+                batch_buf: shaper::take_buf(next_batch_capacity),
             },
         }
     }
@@ -125,7 +130,14 @@ impl UploadLoopActor {
             let mut cx = TaskContext::from_waker(waker);
             while batch_buf.len() < self.max_batch_bytes {
                 match self.poll_seal(&mut cx, &mut batch_buf) {
-                    Poll::Ready(Ok(Some(_))) => {}
+                    Poll::Ready(Ok(Some(_))) => {
+                        let target = self.max_batch_bytes + self.frame_headroom;
+                        if batch_buf.len() >= self.max_batch_bytes / 4 * 3
+                            && batch_buf.capacity() < target
+                        {
+                            batch_buf.reserve_exact(target - batch_buf.len());
+                        }
+                    }
                     Poll::Ready(Ok(None)) => {
                         stream_ended = true;
                         break;
@@ -153,6 +165,9 @@ impl UploadLoopActor {
             .await
             .map_err(|_| anyhow!("request semaphore closed"))?;
         let batch_len = batch_buf.len();
+        self.next_batch_capacity = batch_len
+            .saturating_add(self.frame_headroom)
+            .min(self.max_batch_bytes + self.frame_headroom);
         let permit_bytes = batch_len.min(self.max_in_flight_bytes).max(1) as u32;
         let bytes_permit: OwnedSemaphorePermit = self
             .bytes_sem
@@ -185,7 +200,7 @@ impl UploadLoopActor {
             })
         } else {
             Ok(Phase::Batching {
-                batch_buf: shaper::take_buf(BATCH_BUF_INITIAL_CAPACITY.min(self.max_batch_bytes)),
+                batch_buf: shaper::take_buf(self.next_batch_capacity),
             })
         }
     }
