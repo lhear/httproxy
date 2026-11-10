@@ -23,59 +23,59 @@ strip = true
 anyhow = "1.0.104"
 aws-lc-rs = "1.19.0"
 axum = {version = "0.8.9", features = ["http2", "macros"]}
-base122-fast = "0.1.6"
+base122-fast = "0.1.8"
 base64 = "0.23.1"
 bytes = "1.12.1"
-clap = {version = "4.6.5", features = ["derive"]}
+clap = {version = "4.6.7", features = ["derive"]}
 dashmap = "6.2.1"
-domain = "0.12.2"
+domain = "0.12.3"
 fst = "0.4.7"
-futures = "0.3.33"
-h2 = "0.4.15"
+futures = "0.3.34"
+h2 = "0.4.20"
 http = "1.5.0"
-http-body-util = "0.1.4"
-httparse = "1.10"
+http-body-util = "0.1.5"
+httparse = "1.10.1"
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
 memchr = "2.8.3"
-moka = {version = "0.12", features = ["future"]}
+moka = {version = "0.12.16", features = ["future"]}
 p256 = {version = "0.14.0", features = ["ecdsa", "pkcs8"]}
-pin-project-lite = "0.2"
+pin-project-lite = "0.2.17"
 quinn = {version = "0.11.12", default-features = false, features = [
   "runtime-tokio",
   "rustls-aws-lc-rs",
 ]}
-rand = "0.10.2"
-rand_distr = "0.6"
+rand = "0.10.3"
+rand_distr = "0.6.0"
 rcgen = {version = "0.14.10", default-features = false, features = [
   "crypto",
   "aws_lc_rs",
 ]}
 rustls = "0.23.46"
 serde = {version = "1.0.229", features = ["derive"]}
-serde_json = "1.0.151"
-singleflight-async = "0.2"
+serde_json = "1.0.154"
+singleflight-async = "0.2.0"
 tokio = {version = "1.54.1", features = ["rt-multi-thread", "test-util"]}
-tokio-rustls = "0.26"
+tokio-rustls = "0.26.6"
 tokio-socks = "0.5.3"
 tokio-stream = {version = "0.1.19", features = ["net"]}
-toml = "1.1.4"
-tower = "0.5"
-tower-http = {version = "0.7.0", features = ["trace"]}
-tracing = "0.1"
+toml = "1.2.1"
+tower = "0.5.3"
+tower-http = {version = "0.7.1", features = ["trace"]}
+tracing = "0.1.44"
 tracing-appender = "0.2.5"
-tracing-subscriber = {version = "0.3", features = [
+tracing-subscriber = {version = "0.3.23", features = [
   "env-filter",
   "chrono",
   "json",
 ]}
-url = "2.5"
-uuid = "1.29.0"
-webpki-roots = "1.0.9"
-wreq = "0.16"
-wreq-util = "0.2"
+url = "2.5.8"
+uuid = "1.29.2"
+webpki-roots = "1.0.11"
+wreq = "0.16.3"
+wreq-util = "0.2.1"
 x25519-dalek = {version = "3.0.0", features = ["static_secrets", "getrandom", "zeroize"]}
-zeroize = "1.9.0"
+zeroize = "1.9.1"
 
 [dev-dependencies]
 axum = {version = "0.8.9", features = ["http2", "macros"]}
@@ -88,8 +88,8 @@ rcgen = {version = "0.14.10", default-features = false, features = [
   "aws_lc_rs",
 ]}
 rustls = "0.23.46"
-serde_json = "1.0.150"
+serde_json = "1.0.154"
 tokio = {version = "1.54.1", features = ["full"]}
-tracing-subscriber = {version = "0.3", features = ["env-filter"]}
-wreq = "0.16"
-wreq-util = "0.2"
+tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
+wreq = "0.16.3"
+wreq-util = "0.2.1"
