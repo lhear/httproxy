@@ -23,7 +23,7 @@ strip = true
 anyhow = "1.0.104"
 aws-lc-rs = "1.19.0"
 axum = {version = "0.8.9", features = ["http2", "macros"]}
-base122-fast = "0.1.8"
+base122-fast = "0.1.9"
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = {version = "4.6.7", features = ["derive"]}
@@ -71,7 +71,7 @@ tracing-subscriber = {version = "0.3.23", features = [
 ]}
 url = "2.5.8"
 uuid = "1.29.2"
-webpki-roots = "1.0.11"
+webpki-roots = "1.0.12"
 wreq = "0.16.3"
 wreq-util = "0.2.1"
 x25519-dalek = {version = "3.0.0", features = ["static_secrets", "getrandom", "zeroize"]}
