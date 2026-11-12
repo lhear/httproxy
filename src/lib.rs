@@ -25,3 +25,6 @@ pub mod log;
 pub mod server;
 pub mod shaper;
 pub mod warp;
+
+#[cfg(test)]
+mod test_support;

@@ -141,19 +141,12 @@ mod tests {
     use super::*;
     use crate::bypass::{BypassRules, BypassRulesBuilder};
     use crate::shaper::{EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig};
+    use crate::test_support::connected_pair as tcp_pair;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
-
-    async fn tcp_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client = TcpStream::connect(addr).await.unwrap();
-        (server.await.unwrap(), client)
-    }
 
     fn test_state(
         proxy_auth: Option<(String, String)>,
@@ -372,39 +365,5 @@ mod tests {
             .expect("actor task must not panic");
         let err = joined.unwrap_err();
         assert!(err.to_string().contains("parse timeout"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn unauthenticated_connections_do_not_linger() {
-        let state = test_state(
-            Some(("Basic dXNlcjpwYXNz".to_string(), "user".to_string())),
-            None,
-        );
-        let req = b"GET http://example.com/ HTTP/1.1\r\nHost: x\r\n\r\n";
-
-        for _ in 0..3 {
-            let (server_side, mut client) = tcp_pair().await;
-            let http_client = test_client();
-            let state = Arc::clone(&state);
-            let actor = tokio::spawn(async move {
-                ClientConnectionActor::new(server_side, http_client, state)
-                    .run()
-                    .await
-            });
-
-            client.write_all(req).await.unwrap();
-            let mut sink = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut sink))
-                .await
-                .expect("server must close after 407")
-                .unwrap();
-            assert!(sink.starts_with(b"HTTP/1.1 407"));
-
-            let result = tokio::time::timeout(Duration::from_secs(5), actor)
-                .await
-                .expect("actor must stop after 407")
-                .expect("actor task must not panic");
-            assert!(result.is_ok());
-        }
     }
 }

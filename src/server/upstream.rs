@@ -136,15 +136,12 @@ async fn write_vectored_all(write: &mut OwnedWriteHalf, frames: &[Bytes]) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::connected_pair;
     use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client = TcpStream::connect(addr).await.unwrap();
-        (client, accept.await.unwrap())
+        let (server_side, client) = connected_pair().await;
+        (client, server_side)
     }
 
     #[tokio::test]

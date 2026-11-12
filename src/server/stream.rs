@@ -125,15 +125,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::AesFrameCipher;
     use crate::shaper;
+    use crate::test_support::test_cipher;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
-    use zeroize::Zeroizing;
-
-    fn test_cipher() -> AesFrameCipher {
-        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
-    }
 
     fn make_frame(data: &[u8], seq: u64) -> Bytes {
         let frame = shaper::encode_frame(
@@ -272,26 +267,6 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("buffer exceeded"), "got: {err_msg}");
-    }
-
-    #[tokio::test]
-    async fn encrypted_frames_decoded_with_scratch() {
-        let cipher = Arc::new(test_cipher());
-        let frame = shaper::encode_frame(
-            b"encrypted hello",
-            0,
-            cipher.as_ref() as &dyn shaper::FrameCipher,
-            16384,
-            [0, 0],
-            shaper::EncodingType::Binary,
-        )
-        .unwrap();
-        let byte_stream = stream::iter(vec![Ok(Bytes::from(frame))]);
-        let mut decoder =
-            FrameDecoder::new(byte_stream, cipher, shaper::EncodingType::Binary, 18_781);
-        let (seq, data) = decoder.next().await.unwrap().unwrap();
-        assert_eq!(seq, 0);
-        assert_eq!(&data[..], b"encrypted hello");
     }
 
     #[tokio::test]

@@ -815,7 +815,7 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::AesFrameCipher;
+    use crate::test_support::{stream_cipher_arc, test_cipher, test_cipher_dyn as test_cipher_arc};
     use std::io::Cursor;
     use zeroize::Zeroizing;
 
@@ -829,14 +829,6 @@ mod tests {
             stages: vec![],
             max_download_bytes: None,
         }
-    }
-
-    fn test_cipher() -> AesFrameCipher {
-        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
-    }
-
-    fn test_cipher_arc() -> Arc<dyn FrameCipher> {
-        Arc::new(test_cipher())
     }
 
     #[test]
@@ -1502,8 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_shaper_passes_client_ciphertext_through() {
-        let cipher: Arc<dyn FrameCipher> =
-            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([9u8; 32])));
+        let cipher = stream_cipher_arc(9);
         let mut input = tls13_client_hello_record();
         for _ in 0..20 {
             input.extend_from_slice(&tls13_app_data_record(1024));
@@ -1550,8 +1541,7 @@ mod tests {
 
     #[tokio::test]
     async fn shaper_continues_from_inspector_offset() {
-        let cipher: Arc<dyn FrameCipher> =
-            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([2u8; 32])));
+        let cipher = stream_cipher_arc(2);
         let hello = tls13_client_hello_record();
         let mut input = hello.clone();
         input.extend_from_slice(&tls13_app_data_record(2048));
@@ -1594,8 +1584,7 @@ mod tests {
 
     #[tokio::test]
     async fn shaper_switches_to_plaintext_after_tls13_server_hello() {
-        let cipher: Arc<dyn FrameCipher> =
-            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([3u8; 32])));
+        let cipher = stream_cipher_arc(3);
         let mut input = tls13_server_hello_record();
         for _ in 0..10 {
             input.extend_from_slice(&tls13_app_data_record(4096));
@@ -1667,8 +1656,7 @@ mod tests {
 
     #[tokio::test]
     async fn small_records_are_coalesced_into_one_plaintext_frame() {
-        let cipher: Arc<dyn FrameCipher> =
-            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([6u8; 32])));
+        let cipher = stream_cipher_arc(6);
         let mut input = tls13_server_hello_record();
         for _ in 0..16 {
             input.extend_from_slice(&tls13_app_data_record(4096));
@@ -1716,8 +1704,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_record_fragments_stay_plaintext() {
-        let cipher: Arc<dyn FrameCipher> =
-            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([4u8; 32])));
+        let cipher = stream_cipher_arc(4);
         let mut input = tls13_server_hello_record();
         for _ in 0..8 {
             input.extend_from_slice(&tls13_app_data_record(4096));

@@ -155,12 +155,7 @@ pub(crate) async fn check_response_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::AesFrameCipher;
-    use zeroize::Zeroizing;
-
-    fn test_cipher() -> AesFrameCipher {
-        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
-    }
+    use crate::test_support::test_cipher;
 
     #[test]
     fn build_cookie_contains_session() {

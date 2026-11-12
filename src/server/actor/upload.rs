@@ -257,16 +257,12 @@ async fn write_run(upstream: &mut Option<UpstreamWrite>, frames: &[Bytes]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::connected_pair;
     use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
     use tokio::net::tcp::OwnedReadHalf;
 
     async fn tcp_pair() -> (OwnedReadHalf, UpstreamWrite) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let server_stream = server.await.unwrap();
+        let (server_stream, client) = connected_pair().await;
         let (client_read, _client_write) = client.into_split();
         let (_server_read, server_write) = server_stream.into_split();
         (client_read, server_write.into())
@@ -411,12 +407,8 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_write_error_acks_eos_with_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let server_stream = server.await.unwrap();
-        drop(server_stream);
+        let (server_side, client) = connected_pair().await;
+        drop(server_side);
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let (_cr, write_half) = client.into_split();

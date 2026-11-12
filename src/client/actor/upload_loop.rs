@@ -235,22 +235,17 @@ async fn send_upload_post(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::AesFrameCipher;
     use crate::shaper::{
         DecodedFrame, EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig,
         decode_frame,
     };
+    use crate::test_support::{connected_pair, test_cipher_arc as test_cipher};
     use bytes::BytesMut;
     use std::net::SocketAddr;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
-    use zeroize::Zeroizing;
-
-    fn test_cipher() -> Arc<AesFrameCipher> {
-        Arc::new(AesFrameCipher::new(&Zeroizing::new([7u8; 32])))
-    }
 
     fn test_state(remote: &str, max_in_flight: usize) -> Arc<SharedState> {
         let (_, server_pk) = crate::crypto::generate_mlkem_keypair().unwrap();
@@ -366,11 +361,7 @@ mod tests {
     }
 
     async fn tcp_pair() -> (tokio::net::tcp::OwnedReadHalf, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client = TcpStream::connect(addr).await.unwrap();
-        let server_stream = server.await.unwrap();
+        let (server_stream, client) = connected_pair().await;
         let (read_half, _write_half) = server_stream.into_split();
         (read_half, client)
     }

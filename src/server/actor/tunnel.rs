@@ -410,24 +410,14 @@ impl Drop for TunnelActor {
 mod tests {
 
     use super::*;
-
-    fn test_cipher() -> Arc<dyn FrameCipher> {
-        Arc::new(crate::crypto::AesFrameCipher::new(
-            &zeroize::Zeroizing::new([7u8; 32]),
-        ))
-    }
     use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+    use crate::test_support::{connected_pair, test_cipher_dyn as test_cipher};
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
     async fn tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf, OwnedWriteHalf) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let server_stream = server.await.unwrap();
+        let (server_stream, client) = connected_pair().await;
         let (client_read, client_write) = client.into_split();
         let (_server_read, server_write) = server_stream.into_split();
         (client_read, client_write, server_write)
@@ -656,17 +646,13 @@ mod timeout_tests {
     use super::*;
     use crate::server::constants::ROTATION_STALENESS;
     use crate::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+    use crate::test_support::connected_pair;
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
     async fn tcp_pair() -> (OwnedReadHalf, OwnedWriteHalf, OwnedWriteHalf) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let server_stream = server.await.unwrap();
+        let (server_stream, client) = connected_pair().await;
         let (client_read, client_write) = client.into_split();
         let (_server_read, server_write) = server_stream.into_split();
         (client_read, client_write, server_write)

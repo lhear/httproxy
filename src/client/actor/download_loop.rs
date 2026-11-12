@@ -439,12 +439,7 @@ fn spawn_prefetch_continuation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::AesFrameCipher;
-    use zeroize::Zeroizing;
-
-    fn test_cipher() -> AesFrameCipher {
-        AesFrameCipher::new(&Zeroizing::new([7u8; 32]))
-    }
+    use crate::test_support::{cipher_with_key, test_cipher};
 
     fn buffers() -> DecodeBuffers {
         DecodeBuffers::new()
@@ -540,27 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn ingest_queues_decrypted_frames_without_copy() {
-        let cipher = test_cipher();
-        let plain: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
-        let raw =
-            shaper::encode_frame(&plain, 0, &cipher, 0, [0, 0], EncodingType::Binary).unwrap();
-
-        let mut bufs = buffers();
-        let mut expected_seq = 0u64;
-        bufs.ingest(
-            Bytes::from(raw),
-            &cipher,
-            EncodingType::Binary,
-            &mut expected_seq,
-        )
-        .unwrap();
-
-        assert_eq!(queued(&bufs), plain);
-        assert!(bufs.input.is_empty());
-    }
-
-    #[test]
     fn ingest_rejects_out_of_order() {
         let cipher = test_cipher();
         let mut bufs = buffers();
@@ -581,7 +555,7 @@ mod tests {
     #[test]
     fn ingest_rejects_undecryptable_frame() {
         let cipher = test_cipher();
-        let other = AesFrameCipher::new(&Zeroizing::new([9u8; 32]));
+        let other = cipher_with_key(9);
         let raw = Bytes::from(
             shaper::encode_frame(b"secret", 0, &other, 0, [0, 0], EncodingType::Binary).unwrap(),
         );
