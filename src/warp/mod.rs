@@ -2,10 +2,12 @@ pub(crate) mod h3;
 pub(crate) mod masque;
 pub(crate) mod register;
 
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -13,14 +15,19 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use masque::{MasqueConfig, MasqueConn, MasqueStream};
+use masque::{ConnectRejected, MasqueConfig, MasqueConn, MasqueStream};
 
 const DEFAULT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 const DEFAULT_PORT: u16 = 443;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+const CANCEL_GRACE_SECS: u64 = 3;
 const KEEPALIVE: Duration = Duration::from_secs(25);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const FALLBACK_ENDPOINT: &str = "162.159.192.1";
+const FALLBACK_ENDPOINT_V6: &str = "2606:4700:d0::a29f:c001";
+const IPV4_PROBE: &str = "1.1.1.1:53";
+const IPV6_PROBE: &str = "[2606:4700:4700::1111]:53";
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -62,11 +69,46 @@ fn yes() -> bool {
 }
 
 pub struct WarpClient {
-    endpoint: quinn::Endpoint,
+    endpoints: Endpoints,
     masque: MasqueConfig,
+    candidates: RwLock<Vec<SocketAddr>>,
     cached: RwLock<Option<Arc<MasqueConn>>>,
     establishing: Mutex<()>,
     bypass: Bypass,
+}
+
+struct Endpoints {
+    config: quinn::ClientConfig,
+    v4: StdMutex<Option<quinn::Endpoint>>,
+    v6: StdMutex<Option<quinn::Endpoint>>,
+}
+
+impl Endpoints {
+    fn new(config: quinn::ClientConfig) -> Self {
+        Self {
+            config,
+            v4: StdMutex::new(None),
+            v6: StdMutex::new(None),
+        }
+    }
+
+    fn get(&self, ip: IpAddr) -> Result<quinn::Endpoint> {
+        let slot = if ip.is_ipv4() { &self.v4 } else { &self.v6 };
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(endpoint) = guard.as_ref() {
+            return Ok(endpoint.clone());
+        }
+        let bind: SocketAddr = if ip.is_ipv4() {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        };
+        let mut endpoint = quinn::Endpoint::client(bind)
+            .with_context(|| format!("warp: cannot bind UDP socket {bind}"))?;
+        endpoint.set_default_client_config(self.config.clone());
+        *guard = Some(endpoint.clone());
+        Ok(endpoint)
+    }
 }
 
 impl WarpClient {
@@ -100,15 +142,17 @@ impl WarpClient {
         };
         let tls = masque::build_tls_config(&signing_key, pin)?;
 
-        let addr = resolve_endpoint(section, &creds)?;
         let port = section.port.unwrap_or(DEFAULT_PORT);
+        let candidates: Vec<SocketAddr> = resolve_endpoints(section, &creds)?
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
 
         let keepalive = Duration::from_secs(section.keepalive_secs.unwrap_or(KEEPALIVE.as_secs()));
         let idle_timeout =
             Duration::from_secs(section.idle_timeout_secs.unwrap_or(IDLE_TIMEOUT.as_secs()));
 
         let masque = MasqueConfig {
-            endpoint: SocketAddr::new(addr, port),
             sni: section
                 .sni
                 .clone()
@@ -123,24 +167,18 @@ impl WarpClient {
             tls,
         };
 
-        let bind: SocketAddr = if addr.is_ipv4() {
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-        };
-        let mut endpoint = quinn::Endpoint::client(bind)
-            .with_context(|| format!("warp: cannot bind UDP socket {bind}"))?;
-        endpoint.set_default_client_config(masque.client_config()?);
+        let endpoints = Endpoints::new(masque.client_config()?);
 
         info!(
-            endpoint = %masque.endpoint,
+            endpoints = ?candidates,
             sni = %masque.sni,
             "warp: outbound enabled"
         );
 
         Ok(Arc::new(Self {
-            endpoint,
+            endpoints,
             masque,
+            candidates: RwLock::new(candidates),
             cached: RwLock::new(None),
             establishing: Mutex::new(()),
             bypass: Bypass::new(section)?,
@@ -160,25 +198,39 @@ impl WarpClient {
         let mut last_error = None;
         for attempt in 0..2 {
             let conn = self.connection().await?;
-            match conn.open(&authority).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => {
-                    let stale = !conn.is_usable();
-                    if stale {
-                        self.invalidate(&conn).await;
-                    }
-                    debug!(
-                        authority = %authority,
-                        attempt,
-                        stale,
-                        error = %e,
-                        "warp: CONNECT failed"
-                    );
-                    last_error = Some(e);
-                    if !stale {
-                        break;
-                    }
+            let mut pending = PendingConnect::new(&conn);
+            let opened = tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, conn.open(&authority)).await;
+            pending.disarm();
+            let error = match opened {
+                Ok(Ok(stream)) => {
+                    conn.note_success();
+                    return Ok(stream);
                 }
+                Ok(Err(e)) => e,
+                Err(_) => anyhow!("warp: CONNECT {authority} timed out"),
+            };
+
+            let refused = error.downcast_ref::<ConnectRejected>().is_some();
+            let retire = !conn.is_usable() || (!refused && conn.note_failure());
+            if retire {
+                self.invalidate(&conn).await;
+                warn!(
+                    authority = %authority,
+                    attempt,
+                    error = %error,
+                    "warp: CONNECT failed, connection retired"
+                );
+            } else {
+                debug!(
+                    authority = %authority,
+                    attempt,
+                    error = %error,
+                    "warp: CONNECT failed"
+                );
+            }
+            last_error = Some(error);
+            if !retire {
+                break;
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow!("warp: CONNECT failed")))
@@ -198,9 +250,44 @@ impl WarpClient {
             return Ok(Arc::clone(conn));
         }
 
-        let conn = Arc::new(MasqueConn::establish(&self.endpoint, &self.masque).await?);
-        *self.cached.write().await = Some(Arc::clone(&conn));
-        Ok(conn)
+        self.cached.write().await.take();
+
+        let candidates = self.candidates.read().await.clone();
+        let mut last_error = None;
+        for addr in candidates {
+            let endpoint = match self.endpoints.get(addr.ip()) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    warn!(endpoint = %addr, error = %e, "warp: endpoint socket unavailable");
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            match MasqueConn::establish(&endpoint, &self.masque, addr).await {
+                Ok(conn) => {
+                    self.promote(addr).await;
+                    let conn = Arc::new(conn);
+                    *self.cached.write().await = Some(Arc::clone(&conn));
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    warn!(endpoint = %addr, error = %e, "warp: MASQUE handshake failed");
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("warp: no endpoint candidates")))
+    }
+
+    async fn promote(&self, addr: SocketAddr) {
+        let mut guard = self.candidates.write().await;
+        if let Some(pos) = guard.iter().position(|a| *a == addr)
+            && pos > 0
+        {
+            let addr = guard.remove(pos);
+            guard.insert(0, addr);
+            debug!(endpoint = %addr, "warp: endpoint promoted");
+        }
     }
 
     async fn invalidate(&self, stale: &Arc<MasqueConn>) {
@@ -209,24 +296,137 @@ impl WarpClient {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, stale))
         {
-            stale.close();
             *guard = None;
         }
     }
 }
 
-fn resolve_endpoint(section: &WarpSection, creds: &register::WarpCredentials) -> Result<IpAddr> {
-    let raw = section
-        .endpoint_v6
-        .as_deref()
-        .or(section.endpoint.as_deref())
-        .filter(|s| !s.is_empty())
-        .or_else(|| (!creds.endpoint_v4.is_empty()).then_some(creds.endpoint_v4.as_str()))
-        .or_else(|| (!creds.endpoint_v6.is_empty()).then_some(creds.endpoint_v6.as_str()))
-        .unwrap_or(FALLBACK_ENDPOINT);
+fn resolve_endpoints(
+    section: &WarpSection,
+    creds: &register::WarpCredentials,
+) -> Result<Vec<IpAddr>> {
+    let list = candidate_addrs(section, creds)?;
+    let v4 = family_reachable(false);
+    let v6 = family_reachable(true);
+    let routed = routable_candidates(&list, v4, v6);
+    if routed.len() < list.len() {
+        let dropped: Vec<String> = list
+            .iter()
+            .filter(|ip| !routed.contains(ip))
+            .map(IpAddr::to_string)
+            .collect();
+        warn!(
+            dropped = %dropped.join(", "),
+            "warp: endpoint family has no local route, skipped"
+        );
+    }
+    Ok(routed)
+}
 
+fn candidate_addrs(
+    section: &WarpSection,
+    creds: &register::WarpCredentials,
+) -> Result<Vec<IpAddr>> {
+    let mut list = Vec::with_capacity(6);
+    for raw in [section.endpoint_v6.as_deref(), section.endpoint.as_deref()] {
+        if let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) {
+            list.push(parse_endpoint(raw)?);
+        }
+    }
+    for raw in [
+        creds.endpoint_v4.as_str(),
+        creds.endpoint_v6.as_str(),
+        FALLBACK_ENDPOINT,
+        FALLBACK_ENDPOINT_V6,
+    ] {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            list.push(parse_endpoint(raw)?);
+        }
+    }
+
+    let mut out: Vec<IpAddr> = Vec::with_capacity(list.len());
+    for ip in list {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_endpoint(raw: &str) -> Result<IpAddr> {
     let trimmed = raw.trim_start_matches('[').trim_end_matches(']');
     IpAddr::from_str(trimmed).with_context(|| format!("warp: invalid endpoint address `{raw}`"))
+}
+
+fn routable_candidates(list: &[IpAddr], v4: Option<bool>, v6: Option<bool>) -> Vec<IpAddr> {
+    let routed: Vec<IpAddr> = list
+        .iter()
+        .copied()
+        .filter(|ip| {
+            let known = if ip.is_ipv4() { v4 } else { v6 };
+            known != Some(false)
+        })
+        .collect();
+    if routed.is_empty() {
+        list.to_vec()
+    } else {
+        routed
+    }
+}
+
+fn family_reachable(v6: bool) -> Option<bool> {
+    let (bind, probe) = if v6 {
+        (SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)), IPV6_PROBE)
+    } else {
+        (SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), IPV4_PROBE)
+    };
+    let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+        return Some(false);
+    };
+    match socket.connect(probe) {
+        Ok(()) => Some(true),
+        Err(e) => match e.kind() {
+            ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable => Some(false),
+            _ => None,
+        },
+    }
+}
+
+struct PendingConnect<'a> {
+    conn: &'a Arc<MasqueConn>,
+    started: u64,
+    armed: bool,
+}
+
+impl<'a> PendingConnect<'a> {
+    fn new(conn: &'a Arc<MasqueConn>) -> Self {
+        Self {
+            conn,
+            started: crate::now_secs(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingConnect<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let elapsed = crate::now_secs().saturating_sub(self.started);
+        if elapsed >= CANCEL_GRACE_SECS {
+            warn!(
+                elapsed,
+                "warp: CONNECT abandoned before completion, connection marked"
+            );
+            self.conn.note_failure();
+        }
+    }
 }
 
 fn authority(ip: IpAddr, port: u16) -> String {
@@ -442,12 +642,21 @@ mod tests {
         }
     }
 
+    fn ip(raw: &str) -> IpAddr {
+        raw.parse().unwrap()
+    }
+
     #[test]
-    fn endpoint_prefers_config_then_credentials() {
-        let c = creds("162.159.192.7", "");
+    fn candidates_put_config_first_then_credentials() {
+        let c = creds("162.159.192.7", "2606:4700:d0::1");
         assert_eq!(
-            resolve_endpoint(&section(), &c).unwrap(),
-            "162.159.192.7".parse::<IpAddr>().unwrap()
+            candidate_addrs(&section(), &c).unwrap(),
+            vec![
+                ip("162.159.192.7"),
+                ip("2606:4700:d0::1"),
+                ip(FALLBACK_ENDPOINT),
+                ip(FALLBACK_ENDPOINT_V6)
+            ]
         );
 
         let explicit = WarpSection {
@@ -455,14 +664,8 @@ mod tests {
             ..section()
         };
         assert_eq!(
-            resolve_endpoint(&explicit, &c).unwrap(),
-            "162.159.192.9".parse::<IpAddr>().unwrap()
-        );
-
-        let c = creds("162.159.192.7", "2606:4700:d0::1");
-        assert_eq!(
-            resolve_endpoint(&section(), &c).unwrap(),
-            "162.159.192.7".parse::<IpAddr>().unwrap()
+            candidate_addrs(&explicit, &c).unwrap().first().copied(),
+            Some(ip("162.159.192.9"))
         );
 
         let explicit_v6 = WarpSection {
@@ -470,14 +673,51 @@ mod tests {
             ..section()
         };
         assert_eq!(
-            resolve_endpoint(&explicit_v6, &c).unwrap(),
-            "2606:4700:d0::9".parse::<IpAddr>().unwrap()
+            candidate_addrs(&explicit_v6, &c).unwrap().first().copied(),
+            Some(ip("2606:4700:d0::9"))
         );
+    }
 
+    #[test]
+    fn candidates_fall_back_when_credentials_lack_addresses() {
         let c = creds("", "");
         assert_eq!(
-            resolve_endpoint(&section(), &c).unwrap(),
-            FALLBACK_ENDPOINT.parse::<IpAddr>().unwrap()
+            candidate_addrs(&section(), &c).unwrap(),
+            vec![ip(FALLBACK_ENDPOINT), ip(FALLBACK_ENDPOINT_V6)]
+        );
+    }
+
+    #[test]
+    fn candidates_drop_duplicates() {
+        let c = creds(FALLBACK_ENDPOINT, FALLBACK_ENDPOINT_V6);
+        assert_eq!(
+            candidate_addrs(&section(), &c).unwrap(),
+            vec![ip(FALLBACK_ENDPOINT), ip(FALLBACK_ENDPOINT_V6)]
+        );
+    }
+
+    #[test]
+    fn routable_candidates_skip_family_without_route() {
+        let list = vec![
+            ip("162.159.192.7"),
+            ip("2606:4700:d0::1"),
+            ip(FALLBACK_ENDPOINT),
+            ip(FALLBACK_ENDPOINT_V6),
+        ];
+
+        assert_eq!(
+            routable_candidates(&list, Some(false), Some(true)),
+            vec![ip("2606:4700:d0::1"), ip(FALLBACK_ENDPOINT_V6)]
+        );
+        assert_eq!(
+            routable_candidates(&list, Some(true), Some(false)),
+            vec![ip("162.159.192.7"), ip(FALLBACK_ENDPOINT)]
+        );
+        assert_eq!(routable_candidates(&list, Some(true), Some(true)), list);
+        assert_eq!(routable_candidates(&list, Some(false), Some(false)), list);
+        assert_eq!(
+            routable_candidates(&list, None, Some(false)),
+            vec![ip("162.159.192.7"), ip(FALLBACK_ENDPOINT)]
         );
     }
 }

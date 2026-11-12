@@ -2,6 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::h3;
 
@@ -22,10 +23,15 @@ const MAX_DATA_FRAME: usize = 64 * 1024;
 
 const MAX_RESPONSE_HEAD_BUFFER: usize = 64 * 1024;
 
+const MAX_CONTROL_BUFFER: usize = 64 * 1024;
+
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+const SUCCESS_GRACE_SECS: u64 = 60;
+
 const QUIC_ALPN: &[u8] = b"h3";
 
 pub(crate) struct MasqueConfig {
-    pub endpoint: SocketAddr,
     pub sni: String,
     pub connect_timeout: Duration,
     pub keepalive: Duration,
@@ -59,12 +65,92 @@ pub(crate) struct MasqueConn {
     _control: SendStream,
     _qpack_encoder: SendStream,
     _qpack_decoder: SendStream,
+    health: Health,
+    guard: Arc<CloseGuard>,
+}
+
+pub(crate) struct CloseGuard {
+    conn: quinn::Connection,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        self.conn.close(VarInt::from_u32(0), b"reconnect");
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct KeepAlive {
+    _guard: Arc<CloseGuard>,
+}
+
+impl KeepAlive {
+    fn new(guard: Arc<CloseGuard>) -> Self {
+        Self { _guard: guard }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ConnectRejected {
+    status: u16,
+    authority: String,
+}
+
+impl std::fmt::Display for ConnectRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "warp: CONNECT {} rejected with status {}",
+            self.authority, self.status
+        )
+    }
+}
+
+impl std::error::Error for ConnectRejected {}
+
+pub(crate) struct Health {
+    retiring: Arc<AtomicBool>,
+    last_success: AtomicU64,
+    failures: AtomicU32,
+}
+
+impl Health {
+    fn new(now: u64) -> Self {
+        Self {
+            retiring: Arc::new(AtomicBool::new(false)),
+            last_success: AtomicU64::new(now),
+            failures: AtomicU32::new(0),
+        }
+    }
+
+    fn usable(&self) -> bool {
+        !self.retiring.load(Ordering::Acquire)
+    }
+
+    fn success(&self, now: u64) {
+        self.failures.store(0, Ordering::Relaxed);
+        self.last_success.store(now, Ordering::Relaxed);
+    }
+
+    fn failure(&self, now: u64) -> bool {
+        let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let silent = now.saturating_sub(self.last_success.load(Ordering::Relaxed));
+        let retire = failures >= MAX_CONSECUTIVE_FAILURES || silent >= SUCCESS_GRACE_SECS;
+        if retire {
+            self.retiring.store(true, Ordering::Release);
+        }
+        retire
+    }
 }
 
 impl MasqueConn {
-    pub(crate) async fn establish(endpoint: &quinn::Endpoint, cfg: &MasqueConfig) -> Result<Self> {
+    pub(crate) async fn establish(
+        endpoint: &quinn::Endpoint,
+        cfg: &MasqueConfig,
+        addr: SocketAddr,
+    ) -> Result<Self> {
         let connecting = endpoint
-            .connect(cfg.endpoint, &cfg.sni)
+            .connect(addr, &cfg.sni)
             .context("warp: invalid endpoint address")?;
 
         let conn = tokio::time::timeout(cfg.connect_timeout, connecting)
@@ -87,22 +173,35 @@ impl MasqueConn {
             .write_all(&[h3::STREAM_QPACK_DECODER as u8])
             .await?;
 
-        debug!(endpoint = %cfg.endpoint, "warp: MASQUE connection established");
+        debug!(endpoint = %addr, "warp: MASQUE connection established");
 
+        let health = Health::new(crate::now_secs());
+        tokio::spawn(watch_server_streams(
+            conn.clone(),
+            Arc::clone(&health.retiring),
+        ));
+
+        let guard = Arc::new(CloseGuard { conn: conn.clone() });
         Ok(Self {
             conn,
             _control: control,
             _qpack_encoder: qpack_encoder,
             _qpack_decoder: qpack_decoder,
+            health,
+            guard,
         })
     }
 
     pub(crate) fn is_usable(&self) -> bool {
-        self.conn.close_reason().is_none()
+        self.conn.close_reason().is_none() && self.health.usable()
     }
 
-    pub(crate) fn close(&self) {
-        self.conn.close(VarInt::from_u32(0), b"reconnect");
+    pub(crate) fn note_success(&self) {
+        self.health.success(crate::now_secs());
+    }
+
+    pub(crate) fn note_failure(&self) -> bool {
+        self.health.failure(crate::now_secs())
     }
 
     pub(crate) async fn open(&self, authority: &str) -> Result<MasqueStream> {
@@ -125,12 +224,16 @@ impl MasqueConn {
         if !(200..300).contains(&status) {
             let _ = send.reset(VarInt::from_u32(0));
             let _ = recv.stop(VarInt::from_u32(0));
-            bail!("warp: CONNECT {authority} rejected with status {status}");
+            return Err(anyhow::Error::new(ConnectRejected {
+                status,
+                authority: authority.to_string(),
+            }));
         }
 
         Ok(MasqueStream {
             send: MasqueSend::new(send),
             recv: MasqueRecv::new(recv, pending),
+            guard: KeepAlive::new(Arc::clone(&self.guard)),
         })
     }
 }
@@ -138,18 +241,26 @@ impl MasqueConn {
 pub(crate) struct MasqueStream {
     pub(crate) send: MasqueSend,
     pub(crate) recv: MasqueRecv,
+    pub(crate) guard: KeepAlive,
 }
 
 impl MasqueStream {
     pub(crate) fn into_io(self) -> DuplexIo {
-        DuplexIo(Box::pin(tokio::io::join(self.recv, self.send)))
+        let Self { send, recv, guard } = self;
+        DuplexIo {
+            io: Box::pin(tokio::io::join(recv, send)),
+            _guard: guard,
+        }
     }
 }
 
 trait Duplex: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> Duplex for T {}
 
-pub(crate) struct DuplexIo(Pin<Box<dyn Duplex + Send>>);
+pub(crate) struct DuplexIo {
+    io: Pin<Box<dyn Duplex + Send>>,
+    _guard: KeepAlive,
+}
 
 impl AsyncRead for DuplexIo {
     fn poll_read(
@@ -157,7 +268,7 @@ impl AsyncRead for DuplexIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        AsyncRead::poll_read(self.get_mut().0.as_mut(), cx, buf)
+        AsyncRead::poll_read(self.get_mut().io.as_mut(), cx, buf)
     }
 }
 
@@ -167,15 +278,15 @@ impl AsyncWrite for DuplexIo {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        AsyncWrite::poll_write(self.get_mut().0.as_mut(), cx, buf)
+        AsyncWrite::poll_write(self.get_mut().io.as_mut(), cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(self.get_mut().0.as_mut(), cx)
+        AsyncWrite::poll_flush(self.get_mut().io.as_mut(), cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_shutdown(self.get_mut().0.as_mut(), cx)
+        AsyncWrite::poll_shutdown(self.get_mut().io.as_mut(), cx)
     }
 }
 
@@ -215,6 +326,72 @@ async fn read_response_head(recv: &mut RecvStream, authority: &str) -> Result<(u
             None => bail!("warp: connection closed before CONNECT response for {authority}"),
         }
     }
+}
+
+async fn watch_server_streams(conn: quinn::Connection, retiring: Arc<AtomicBool>) {
+    loop {
+        let Ok(recv) = conn.accept_uni().await else {
+            return;
+        };
+        let retiring = Arc::clone(&retiring);
+        tokio::spawn(async move {
+            let _ = watch_server_stream(recv, retiring).await;
+        });
+    }
+}
+
+async fn watch_server_stream(mut recv: RecvStream, retiring: Arc<AtomicBool>) -> Option<()> {
+    let mut buf = BytesMut::new();
+    let kind = loop {
+        if let Some((kind, used)) = h3::get_varint(&buf) {
+            buf.advance(used);
+            break kind;
+        }
+        let chunk = recv.read_chunk(4096, true).await.ok()??;
+        buf.extend_from_slice(&chunk.bytes);
+    };
+
+    if kind != h3::STREAM_CONTROL {
+        let _ = tokio::io::copy(&mut recv, &mut tokio::io::sink()).await;
+        return Some(());
+    }
+
+    loop {
+        if control_has_goaway(&mut buf) {
+            warn!("warp: gateway sent GOAWAY, connection is retired");
+            retiring.store(true, Ordering::Release);
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut recv, &mut tokio::io::sink()).await;
+            });
+            return Some(());
+        }
+        if buf.len() > MAX_CONTROL_BUFFER {
+            let _ = tokio::io::copy(&mut recv, &mut tokio::io::sink()).await;
+            return None;
+        }
+        let chunk = recv.read_chunk(4096, true).await.ok()??;
+        buf.extend_from_slice(&chunk.bytes);
+    }
+}
+
+fn control_has_goaway(buf: &mut BytesMut) -> bool {
+    let mut goaway = false;
+    while let Some((kind, len, used)) = h3::get_frame_header(buf) {
+        let Ok(len) = usize::try_from(len) else {
+            break;
+        };
+        let Some(total) = used.checked_add(len) else {
+            break;
+        };
+        if buf.len() < total {
+            break;
+        }
+        buf.advance(total);
+        if kind == h3::FRAME_GOAWAY {
+            goaway = true;
+        }
+    }
+    goaway
 }
 
 pub(crate) struct MasqueSend {
@@ -745,7 +922,7 @@ mod tests {
         assert_eq!(read_der_len(&[0x85, 0, 0, 0, 0, 0]), None);
     }
 
-    async fn spawn_server(status: u16) -> (quinn::Endpoint, SocketAddr, Vec<u8>) {
+    fn server_endpoint() -> (quinn::Endpoint, SocketAddr, Vec<u8>) {
         let (cert, key) = server_cert();
         let spki = extract_spki(&cert).unwrap().to_vec();
 
@@ -763,6 +940,11 @@ mod tests {
         let endpoint =
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = endpoint.local_addr().unwrap();
+        (endpoint, addr, spki)
+    }
+
+    async fn spawn_server(status: u16) -> (quinn::Endpoint, SocketAddr, Vec<u8>) {
+        let (endpoint, addr, spki) = server_endpoint();
 
         let driver = endpoint.clone();
         tokio::spawn(async move {
@@ -846,10 +1028,9 @@ mod tests {
         }
     }
 
-    fn client_config(addr: SocketAddr, pin: Option<Vec<u8>>) -> (quinn::Endpoint, MasqueConfig) {
+    fn client_config(pin: Option<Vec<u8>>) -> (quinn::Endpoint, MasqueConfig) {
         let tls = build_tls_config(&device_key(), pin).unwrap();
         let cfg = MasqueConfig {
-            endpoint: addr,
             sni: "localhost".to_string(),
             connect_timeout: Duration::from_secs(5),
             keepalive: Duration::from_secs(5),
@@ -864,9 +1045,9 @@ mod tests {
     #[tokio::test]
     async fn connect_tunnel_roundtrips_payload() {
         let (server, addr, spki) = spawn_server(200).await;
-        let (endpoint, cfg) = client_config(addr, Some(spki));
+        let (endpoint, cfg) = client_config(Some(spki));
 
-        let conn = MasqueConn::establish(&endpoint, &cfg).await.unwrap();
+        let conn = MasqueConn::establish(&endpoint, &cfg, addr).await.unwrap();
         assert!(conn.is_usable());
         let mut stream = conn.open("example.com:443").await.unwrap();
 
@@ -893,11 +1074,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_streams_survive_the_connection_handle() {
+        let (server, addr, spki) = spawn_server(200).await;
+        let (endpoint, cfg) = client_config(Some(spki));
+
+        let conn = MasqueConn::establish(&endpoint, &cfg, addr).await.unwrap();
+        let mut stream = conn.open("example.com:443").await.unwrap();
+        drop(conn);
+
+        let frames = vec![Bytes::from_static(b"still here")];
+        stream.send.write_frames(&frames).await.unwrap();
+        stream.send.shutdown().await.unwrap();
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            match stream.recv.read(&mut buf).await.unwrap() {
+                0 => break,
+                n => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        assert_eq!(got, b"still here");
+
+        server.close(VarInt::from_u32(0), b"done");
+        endpoint.close(VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
     async fn non_2xx_connect_is_rejected() {
         let (server, addr, spki) = spawn_server(403).await;
-        let (endpoint, cfg) = client_config(addr, Some(spki));
+        let (endpoint, cfg) = client_config(Some(spki));
 
-        let conn = MasqueConn::establish(&endpoint, &cfg).await.unwrap();
+        let conn = MasqueConn::establish(&endpoint, &cfg, addr).await.unwrap();
         let err = match conn.open("example.com:443").await {
             Ok(_) => panic!("CONNECT must be rejected"),
             Err(e) => e,
@@ -909,23 +1117,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goaway_from_gateway_retires_the_connection() {
+        let (endpoint, addr, spki) = server_endpoint();
+        let driver = endpoint.clone();
+        tokio::spawn(async move {
+            if let Some(incoming) = driver.accept().await {
+                let Ok(conn) = incoming.await else { return };
+                if let Ok(mut uni) = conn.open_uni().await {
+                    let mut control = BytesMut::new();
+                    control.put_u8(h3::STREAM_CONTROL as u8);
+                    control.put_u8(h3::FRAME_GOAWAY as u8);
+                    control.put_u8(2);
+                    control.put_u8(0);
+                    control.put_u8(0);
+                    let _ = uni.write_all(&control).await;
+                }
+                let _ = conn.closed().await;
+            }
+        });
+
+        let (client, cfg) = client_config(Some(spki));
+        let conn = MasqueConn::establish(&client, &cfg, addr).await.unwrap();
+        assert!(conn.is_usable());
+
+        for _ in 0..100 {
+            if !conn.is_usable() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!conn.is_usable(), "GOAWAY should retire the connection");
+
+        endpoint.close(VarInt::from_u32(0), b"done");
+        client.close(VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
     async fn wrong_pinned_key_fails_the_handshake() {
         let (server, addr, _spki) = spawn_server(200).await;
         let wrong = device_key().verifying_key().to_public_key_der().unwrap();
-        let (endpoint, cfg) = client_config(addr, Some(wrong.as_bytes().to_vec()));
+        let (endpoint, cfg) = client_config(Some(wrong.as_bytes().to_vec()));
 
-        assert!(MasqueConn::establish(&endpoint, &cfg).await.is_err());
+        assert!(MasqueConn::establish(&endpoint, &cfg, addr).await.is_err());
 
         server.close(VarInt::from_u32(0), b"done");
         endpoint.close(VarInt::from_u32(0), b"done");
     }
 
+    #[test]
+    fn health_retires_after_consecutive_failures() {
+        let h = Health::new(1_000);
+        assert!(!h.failure(1_001));
+        assert!(h.usable());
+        assert!(!h.failure(1_002));
+        assert!(h.failure(1_003));
+        assert!(!h.usable());
+    }
+
+    #[test]
+    fn health_retires_a_connection_that_has_gone_silent() {
+        let h = Health::new(1_000);
+        assert!(h.failure(1_000 + SUCCESS_GRACE_SECS + 1));
+        assert!(!h.usable());
+    }
+
+    #[test]
+    fn health_success_clears_failures() {
+        let h = Health::new(1_000);
+        assert!(h.failure(1_061));
+        h.success(1_062);
+        assert!(!h.failure(1_063));
+        assert!(!h.failure(1_064));
+    }
+
+    #[test]
+    fn health_retiring_flag_marks_connection_unusable() {
+        let h = Health::new(1_000);
+        assert!(h.usable());
+        h.retiring.store(true, Ordering::Release);
+        assert!(!h.usable());
+    }
+
+    #[test]
+    fn control_stream_goaway_is_detected() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(h3::FRAME_SETTINGS as u8);
+        buf.put_u8(0);
+        assert!(!control_has_goaway(&mut buf));
+        assert!(buf.is_empty());
+
+        buf.put_u8(h3::FRAME_GOAWAY as u8);
+        buf.put_u8(1);
+        buf.put_u8(0);
+        assert!(control_has_goaway(&mut buf));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn control_stream_partial_frame_waits_for_more_bytes() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(h3::FRAME_GOAWAY as u8);
+        buf.put_u8(4);
+        buf.put_u8(0);
+        assert!(!control_has_goaway(&mut buf));
+        assert_eq!(buf.len(), 3);
+
+        buf.put_u8(0);
+        buf.put_u8(0);
+        buf.put_u8(0);
+        assert!(control_has_goaway(&mut buf));
+        assert!(buf.is_empty());
+    }
+
     #[tokio::test]
     async fn insecure_mode_accepts_any_certificate() {
         let (server, addr, _spki) = spawn_server(200).await;
-        let (endpoint, cfg) = client_config(addr, None);
+        let (endpoint, cfg) = client_config(None);
 
-        let conn = MasqueConn::establish(&endpoint, &cfg).await.unwrap();
+        let conn = MasqueConn::establish(&endpoint, &cfg, addr).await.unwrap();
         assert!(conn.open("example.com:443").await.is_ok());
 
         server.close(VarInt::from_u32(0), b"done");

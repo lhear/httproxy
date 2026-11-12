@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::server::constants::MAX_WRITE_IOV;
-use crate::warp::masque::{MasqueRecv, MasqueSend, MasqueStream};
+use crate::warp::masque::{KeepAlive, MasqueRecv, MasqueSend, MasqueStream};
 
 pub(crate) enum Upstream {
     Direct(TcpStream),
@@ -23,8 +23,14 @@ impl Upstream {
                 (UpstreamRead::Direct(read), UpstreamWrite::Direct(write))
             }
             Upstream::Warp(stream) => (
-                UpstreamRead::Warp(stream.recv),
-                UpstreamWrite::Warp(stream.send),
+                UpstreamRead::Warp {
+                    read: stream.recv,
+                    _guard: stream.guard.clone(),
+                },
+                UpstreamWrite::Warp {
+                    write: stream.send,
+                    _guard: stream.guard,
+                },
             ),
         }
     }
@@ -32,7 +38,7 @@ impl Upstream {
 
 pub(crate) enum UpstreamRead {
     Direct(OwnedReadHalf),
-    Warp(MasqueRecv),
+    Warp { read: MasqueRecv, _guard: KeepAlive },
 }
 
 impl AsyncRead for UpstreamRead {
@@ -43,7 +49,7 @@ impl AsyncRead for UpstreamRead {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             UpstreamRead::Direct(read) => Pin::new(read).poll_read(cx, buf),
-            UpstreamRead::Warp(read) => Pin::new(read).poll_read(cx, buf),
+            UpstreamRead::Warp { read, .. } => Pin::new(read).poll_read(cx, buf),
         }
     }
 }
@@ -56,21 +62,24 @@ impl From<OwnedReadHalf> for UpstreamRead {
 
 pub(crate) enum UpstreamWrite {
     Direct(OwnedWriteHalf),
-    Warp(MasqueSend),
+    Warp {
+        write: MasqueSend,
+        _guard: KeepAlive,
+    },
 }
 
 impl UpstreamWrite {
     pub async fn write_frames(&mut self, frames: &[Bytes]) -> io::Result<()> {
         match self {
             UpstreamWrite::Direct(write) => write_tcp_frames(write, frames).await,
-            UpstreamWrite::Warp(write) => write.write_frames(frames).await,
+            UpstreamWrite::Warp { write, .. } => write.write_frames(frames).await,
         }
     }
 
     pub async fn shutdown(&mut self) -> io::Result<()> {
         match self {
             UpstreamWrite::Direct(write) => write.shutdown().await,
-            UpstreamWrite::Warp(write) => write.shutdown().await,
+            UpstreamWrite::Warp { write, .. } => write.shutdown().await,
         }
     }
 }

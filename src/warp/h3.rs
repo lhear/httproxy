@@ -3,6 +3,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 pub(crate) const FRAME_DATA: u64 = 0x00;
 pub(crate) const FRAME_HEADERS: u64 = 0x01;
 pub(crate) const FRAME_SETTINGS: u64 = 0x04;
+pub(crate) const FRAME_GOAWAY: u64 = 0x07;
 
 pub(crate) const STREAM_CONTROL: u64 = 0x00;
 pub(crate) const STREAM_QPACK_ENCODER: u64 = 0x02;
