@@ -5,8 +5,10 @@ use httproxy::config::{
     ServerTopConfig,
 };
 use httproxy::shaper::{EncodingType, PaddingConfig, TrafficConfig};
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -224,9 +226,6 @@ pub async fn read_response(stream: &mut TcpStream) -> (u16, Vec<u8>) {
     let mut tmp = [0u8; 8192];
     let header_end = loop {
         let n = stream.read(&mut tmp).await.unwrap();
-        if n == 0 {
-            eprintln!("DBG read_response EOF after {} bytes", buf.len());
-        }
         assert!(n > 0, "connection closed before headers");
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
@@ -279,4 +278,126 @@ pub async fn proxy_connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+pub fn dns_question(query: &[u8]) -> Option<(String, u16, usize)> {
+    let mut offset = 12;
+    let mut labels = Vec::new();
+    loop {
+        let len = *query.get(offset)? as usize;
+        offset += 1;
+        if len == 0 {
+            break;
+        }
+        let label = std::str::from_utf8(query.get(offset..offset + len)?).ok()?;
+        labels.push(label.to_string());
+        offset += len;
+    }
+    let qtype = u16::from_be_bytes([*query.get(offset)?, *query.get(offset + 1)?]);
+    Some((labels.join("."), qtype, offset + 4))
+}
+
+pub fn dns_answer(query: &[u8], records: &HashMap<String, IpAddr>) -> Vec<u8> {
+    use domain::base::iana::{Class, Rcode, Rtype};
+    use domain::base::{MessageBuilder, Name, Question, Record, Ttl};
+    use domain::rdata::{A, Aaaa};
+    use std::str::FromStr;
+
+    let id = u16::from_be_bytes([query[0], query[1]]);
+    let (qname, qtype_int, _) = dns_question(query).unwrap_or_default();
+    let qtype = Rtype::from_int(qtype_int);
+
+    let mut builder = MessageBuilder::new_vec();
+    builder.header_mut().set_id(id);
+    builder
+        .header_mut()
+        .set_rcode(if records.contains_key(&qname) {
+            Rcode::NOERROR
+        } else {
+            Rcode::NXDOMAIN
+        });
+
+    let name = Name::<Vec<u8>>::from_str(&qname).unwrap_or_else(|_| Name::root());
+    let mut question = builder.question();
+    let _ = question.push(Question::new(name.clone(), qtype, Class::IN));
+    let mut answer = question.answer();
+    if let Some(ip) = records.get(&qname) {
+        let _ = match ip {
+            IpAddr::V4(v4) => answer.push(Record::new(
+                name.clone(),
+                Class::IN,
+                Ttl::from_secs(60),
+                A::new(*v4),
+            )),
+            IpAddr::V6(v6) => answer.push(Record::new(
+                name.clone(),
+                Class::IN,
+                Ttl::from_secs(60),
+                Aaaa::new(*v6),
+            )),
+        };
+    }
+    answer.into_message().into_octets()
+}
+
+pub fn dns_zone(name: &str, ip: IpAddr) -> HashMap<String, IpAddr> {
+    HashMap::from([(name.to_string(), ip)])
+}
+
+pub async fn spawn_dns_udp(
+    records: HashMap<String, IpAddr>,
+    query_count: Arc<AtomicUsize>,
+) -> SocketAddr {
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            let query = &buf[..n];
+            if query.len() < 12 {
+                continue;
+            }
+            query_count.fetch_add(1, Ordering::Relaxed);
+            let _ = sock.send_to(&dns_answer(query, &records), peer).await;
+        }
+    });
+    addr
+}
+
+pub async fn spawn_dns_tcp(
+    records: HashMap<String, IpAddr>,
+    query_count: Arc<AtomicUsize>,
+) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let records = records.clone();
+            let query_count = Arc::clone(&query_count);
+            tokio::spawn(async move {
+                loop {
+                    let mut len_buf = [0u8; 2];
+                    if socket.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let mut query = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+                    if socket.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+                    query_count.fetch_add(1, Ordering::SeqCst);
+                    let resp = dns_answer(&query, &records);
+                    let resp_len = (resp.len() as u16).to_be_bytes();
+                    if socket.write_all(&resp_len).await.is_err()
+                        || socket.write_all(&resp).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
 }
