@@ -129,11 +129,6 @@ pub fn resolve_request(method: &str, target: &str) -> Result<(String, Option<Str
     Ok((format!("{host}:{port}"), Some(origin_form(&url))))
 }
 
-#[inline]
-pub fn resolve_target_host(method: &str, url_str: &str) -> Result<String> {
-    resolve_request(method, url_str).map(|(host, _)| host)
-}
-
 pub fn rewrite_request_line(
     buf: &mut BytesMut,
     header_len: usize,
@@ -269,39 +264,42 @@ fn write_request_line(dst: &mut [u8], method: &str, origin_path: &str, version: 
     dst[pos + 1] = b'\n';
 }
 
-pub fn rewrite_absolute_url(buf: &mut BytesMut, method: &str, url_str: &str) -> Result<()> {
-    let Ok(url) = Url::parse(url_str) else {
-        return Ok(());
-    };
-    let header_len = buf.len();
-    rewrite_request_line(buf, header_len, method, &origin_form(&url))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_connect_host() {
-        let target = resolve_target_host("CONNECT", "example.com:443").unwrap();
-        assert_eq!(target, "example.com:443");
+    fn handle_request(buf: &mut BytesMut, method: &str, target: &str) -> Result<()> {
+        let (_, origin_path) = resolve_request(method, target)?;
+        let Some(origin_path) = origin_path else {
+            return Ok(());
+        };
+        let header_len = head_len(buf);
+        let header_len = strip_proxy_headers(buf, header_len);
+        rewrite_request_line(buf, header_len, method, &origin_path)
+    }
+
+    fn head_len(buf: &[u8]) -> usize {
+        buf.windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(buf.len(), |pos| pos + 4)
     }
 
     #[test]
     fn resolve_http_url() {
-        let target = resolve_target_host("GET", "http://example.com/path").unwrap();
-        assert_eq!(target, "example.com:80");
+        let (host, path) = resolve_request("GET", "http://example.com/path").unwrap();
+        assert_eq!(host, "example.com:80");
+        assert_eq!(path.as_deref(), Some("/path"));
     }
 
     #[test]
     fn resolve_https_url() {
-        let target = resolve_target_host("GET", "https://example.com/path").unwrap();
-        assert_eq!(target, "example.com:443");
+        let (host, _) = resolve_request("GET", "https://example.com/path").unwrap();
+        assert_eq!(host, "example.com:443");
     }
 
     #[test]
     fn resolve_connect_no_port_fails() {
-        assert!(resolve_target_host("CONNECT", "example.com").is_err());
+        assert!(resolve_request("CONNECT", "example.com").is_err());
     }
 
     #[test]
@@ -309,7 +307,7 @@ mod tests {
         let mut buf = BytesMut::from(
             &b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
         );
-        rewrite_absolute_url(&mut buf, "GET", "http://example.com/path").unwrap();
+        handle_request(&mut buf, "GET", "http://example.com/path").unwrap();
         let result = String::from_utf8(buf.to_vec()).unwrap();
         assert!(
             result.starts_with("GET /path HTTP/1.1\r\n"),
@@ -324,7 +322,7 @@ mod tests {
             &b"GET http://example.com/search?q=rust&lang=en HTTP/1.1\r\nHost: example.com\r\n\r\n"
                 [..],
         );
-        rewrite_absolute_url(&mut buf, "GET", "http://example.com/search?q=rust&lang=en").unwrap();
+        handle_request(&mut buf, "GET", "http://example.com/search?q=rust&lang=en").unwrap();
         let result = String::from_utf8(buf.to_vec()).unwrap();
         assert!(
             result.starts_with("GET /search?q=rust&lang=en HTTP/1.1\r\n"),
@@ -336,7 +334,7 @@ mod tests {
     fn rewrite_root_path() {
         let mut buf =
             BytesMut::from(&b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n"[..]);
-        rewrite_absolute_url(&mut buf, "GET", "http://example.com/").unwrap();
+        handle_request(&mut buf, "GET", "http://example.com/").unwrap();
         let result = String::from_utf8(buf.to_vec()).unwrap();
         assert!(result.starts_with("GET / HTTP/1.1\r\n"), "got: {result}");
     }
@@ -346,7 +344,7 @@ mod tests {
         let mut buf = BytesMut::from(
             &b"GET http://example.com:8080/path HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"[..],
         );
-        rewrite_absolute_url(&mut buf, "GET", "http://example.com:8080/path").unwrap();
+        handle_request(&mut buf, "GET", "http://example.com:8080/path").unwrap();
         let result = String::from_utf8(buf.to_vec()).unwrap();
         assert!(
             result.starts_with("GET /path HTTP/1.1\r\n"),
@@ -356,11 +354,8 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_already_origin_form_noop() {
-        let original = b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let mut buf = BytesMut::from(&original[..]);
-        rewrite_absolute_url(&mut buf, "GET", "/path").unwrap();
-        assert_eq!(&buf[..], &original[..]);
+    fn origin_form_target_is_rejected() {
+        assert!(resolve_request("GET", "/path").is_err());
     }
 
     #[test]
@@ -375,7 +370,7 @@ mod tests {
         request.extend_from_slice(body);
 
         let mut buf = BytesMut::from(&request[..]);
-        rewrite_absolute_url(&mut buf, "POST", "http://example.com/api").unwrap();
+        handle_request(&mut buf, "POST", "http://example.com/api").unwrap();
         let result = buf.to_vec();
 
         let result_str = String::from_utf8(result.clone()).unwrap();
@@ -388,10 +383,25 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_drops_proxy_authorization() {
+        let mut buf = BytesMut::from(
+            &b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"[..],
+        );
+        handle_request(&mut buf, "GET", "http://example.com/path").unwrap();
+        let result = String::from_utf8(buf.to_vec()).unwrap();
+        assert!(
+            !result.to_ascii_lowercase().contains("proxy-authorization"),
+            "代理凭据不能被转发给上游: {result}"
+        );
+        assert!(result.contains("Host: example.com"));
+    }
+
+    #[test]
     fn resolve_connect_ipv6_brackets_stripped() {
-        let t = resolve_target_host("CONNECT", "[::1]:443").unwrap();
-        assert_eq!(t, "::1:443");
-        assert!(resolve_target_host("CONNECT", "[::1]").is_err());
+        let (host, path) = resolve_request("CONNECT", "[::1]:443").unwrap();
+        assert_eq!(host, "::1:443");
+        assert!(path.is_none());
+        assert!(resolve_request("CONNECT", "[::1]").is_err());
     }
 
     #[test]
