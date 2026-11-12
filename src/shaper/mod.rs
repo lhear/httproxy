@@ -16,7 +16,7 @@ use tokio::{
     time::{Instant, Sleep},
 };
 
-use crate::crypto::{NONCE_LEN, TAG_LEN};
+use crate::crypto::{NONCE_LEN, TAG_LEN, TlsInspector};
 
 mod bufpool;
 
@@ -24,8 +24,10 @@ pub use bufpool::frame_bytes as pooled_frame_bytes;
 pub use bufpool::take as take_buf;
 
 pub const MAX_RAW_PAYLOAD: usize = 16 * 1024;
-
-const READ_HIGH_WATER: usize = 32 * 1024;
+const TLS_RECORD_SLACK: usize = 256;
+const MAX_FRAME_PAYLOAD: usize = MAX_RAW_PAYLOAD + TLS_RECORD_SLACK;
+const HEAD_BINARY: usize = 2 + NONCE_LEN + HEADER_LEN;
+const HEAD_JSON: usize = NONCE_LEN + HEADER_LEN;
 
 pub const JSON_PAYLOAD_CAP: usize = 14320 - HEADER_LEN - NONCE_LEN - TAG_LEN;
 
@@ -33,9 +35,9 @@ const TABLE_SIZE: usize = 8192;
 const TABLE_MASK: usize = TABLE_SIZE - 1;
 const DELIMITER: u8 = b'\n';
 const AVG_LATENCY_MICROS: f64 = 5_000.0;
-const MAX_BINARY_FRAME_LEN: usize = MAX_RAW_PAYLOAD + 38;
+const MAX_BINARY_FRAME_LEN: usize = MAX_FRAME_PAYLOAD + NONCE_LEN + HEADER_LEN + TAG_LEN;
 const MAX_JSON_LINE_LEN: usize = MAX_RAW_PAYLOAD + 2396;
-const HEADER_LEN: usize = 10;
+pub(crate) const HEADER_LEN: usize = 10;
 
 #[inline]
 pub fn max_encoded_frame_len(encoding: EncodingType) -> usize {
@@ -81,7 +83,7 @@ pub struct StageConfig {
     pub padding_range: [usize; 2],
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EncodingType {
     Json,
@@ -211,6 +213,20 @@ pub trait FrameCipher: Send + Sync {
         let encrypted = self.encrypt(&plain)?;
         out.extend_from_slice(&encrypted);
         Ok(())
+    }
+
+    fn seal_frame(
+        &self,
+        out: &mut Vec<u8>,
+        nonce_start: usize,
+        ct_start: usize,
+        _opaque: bool,
+    ) -> Result<(), Error> {
+        self.seal_in_place(out, nonce_start, ct_start)
+    }
+
+    fn open_frame(&self, buf: &mut [u8]) -> Result<std::ops::Range<usize>, Error> {
+        self.decrypt_in_place(buf)
     }
 }
 
@@ -345,19 +361,19 @@ pub fn encode_frame_into(
             if padding_len > 0 {
                 out.put_bytes(0u8, padding_len);
             }
-            cipher.seal_in_place(out, nonce_start, ct_start)?;
+            cipher.seal_frame(out, nonce_start, ct_start, false)?;
         }
         EncodingType::Json => {
-            let mut payload = BytesMut::with_capacity(payload_len);
-            payload.put_u64(seq);
-            payload.put_u16(raw_len as u16);
-            payload.put_slice(data);
-            if padding_len > 0 {
-                payload.resize(payload_len, 0u8);
-            }
-            let mut sealed = BytesMut::with_capacity(payload_len + NONCE_LEN + TAG_LEN);
-            cipher.encrypt_into(&payload, &mut sealed)?;
-            let mut encoded = Vec::with_capacity(payload_len + payload_len / 6 + 16);
+            let mut payload = Vec::with_capacity(payload_len);
+            payload.extend_from_slice(&seq.to_be_bytes());
+            payload.extend_from_slice(&(raw_len as u16).to_be_bytes());
+            payload.extend_from_slice(data);
+            payload.resize(payload_len, 0u8);
+            let mut sealed = Vec::with_capacity(payload_len + NONCE_LEN + TAG_LEN);
+            sealed.resize(NONCE_LEN, 0u8);
+            sealed.extend_from_slice(&payload);
+            cipher.seal_frame(&mut sealed, 0, NONCE_LEN, false)?;
+            let mut encoded = Vec::with_capacity(sealed.len() + sealed.len() / 6 + 16);
             base122_fast::encode_into(&sealed, &mut encoded);
             out.reserve(9 + encoded.len() + 3);
             out.put_slice(b"{\"data\":\"");
@@ -421,7 +437,7 @@ pub fn decode_frame(
             src.advance(2);
             let mut view = src.split_to(frame_len);
 
-            let range = cipher.decrypt_in_place(&mut view)?;
+            let range = cipher.open_frame(&mut view)?;
             let offset = range.start;
             let (seq, start, end) = extract_frame_range(&view[offset..])?;
             let data = view.freeze().slice(offset + start..offset + end);
@@ -452,8 +468,7 @@ pub fn decode_frame(
                     }
                     parse_json_payload_into(&line, json_scratch)?;
 
-                    let plain = cipher.decrypt_in_place(json_scratch)?;
-
+                    let plain = cipher.open_frame(json_scratch)?;
                     let (seq, start, end) =
                         extract_frame_range(&json_scratch[plain.start..plain.end])?;
                     Ok(Some(DecodedFrame::InJsonScratch {
@@ -500,14 +515,15 @@ pub trait SealInto {
     ) -> Poll<std::io::Result<Option<u64>>>;
 }
 
+pub type ShaperStream = Pin<Box<dyn SealInto + Send>>;
+
 pin_project! {
     #[project = Proj]
     pub struct TrafficShaper<R> {
         #[pin]
         reader: R,
 
-        raw_buf: BytesMut,
-        enc_buf: Vec<u8>,
+        frame: Vec<u8>,
         json_buf: Vec<u8>,
 
         #[pin]
@@ -522,9 +538,13 @@ pin_project! {
         rng: SmallRng,
         cipher: Arc<dyn FrameCipher>,
         encoding: EncodingType,
+        head: usize,
         seal_threshold: usize,
         frame_capacity: usize,
+        line_capacity: usize,
         seq: u64,
+        inspector: Option<TlsInspector>,
+        sealed_total: u64,
     }
 }
 
@@ -535,20 +555,33 @@ impl<R> TrafficShaper<R> {
         cipher: Arc<dyn FrameCipher>,
         start_seq: u64,
     ) -> Self {
+        Self::with_inspector(reader, config, cipher, start_seq, None)
+    }
+
+    pub fn with_inspector(
+        reader: R,
+        config: &ResolvedShaperConfig,
+        cipher: Arc<dyn FrameCipher>,
+        start_seq: u64,
+        inspector: Option<TlsInspector>,
+    ) -> Self {
         let mut base_rng = rand::rng();
         let cursor = (base_rng.next_u64() as usize) & TABLE_MASK;
 
-        let out_capacity = max_encoded_frame_len(config.encoding);
-
-        let seal_threshold = match config.encoding {
-            EncodingType::Binary => MAX_RAW_PAYLOAD - (NONCE_LEN + TAG_LEN + HEADER_LEN + 2),
-            EncodingType::Json => JSON_PAYLOAD_CAP,
+        let (head, seal_threshold) = match config.encoding {
+            EncodingType::Binary => (HEAD_BINARY, MAX_FRAME_PAYLOAD),
+            EncodingType::Json => (HEAD_JSON, JSON_PAYLOAD_CAP),
         };
+        let frame_capacity = head + seal_threshold + TAG_LEN;
+
+        let mut frame = bufpool::take(frame_capacity);
+        frame.resize(head, 0);
+
+        let sealed_total = inspector.as_ref().map_or(0, TlsInspector::total);
 
         Self {
             reader,
-            raw_buf: BytesMut::with_capacity(READ_HIGH_WATER),
-            enc_buf: Vec::new(),
+            frame,
             json_buf: Vec::new(),
             flush_timer: tokio::time::sleep_until(Instant::now()),
             timer_armed: false,
@@ -561,14 +594,18 @@ impl<R> TrafficShaper<R> {
             rng: SmallRng::from_rng(&mut base_rng),
             cipher,
             encoding: config.encoding,
+            head,
             seal_threshold,
-            frame_capacity: out_capacity,
+            frame_capacity,
+            line_capacity: max_encoded_frame_len(config.encoding),
             seq: start_seq,
+            inspector,
+            sealed_total,
         }
     }
 
     #[inline]
-    fn resolve_padding(this: &mut Proj<'_, R>, raw_len: usize) -> (usize, usize) {
+    fn resolve_padding(this: &mut Proj<'_, R>, raw_len: usize) -> usize {
         *this.packet_count += 1;
 
         let stages = &this.stages;
@@ -585,67 +622,76 @@ impl<R> TrafficShaper<R> {
             (*this.global_threshold, *this.global_range)
         };
 
-        let padding_len = if raw_len < threshold {
-            let max_pad = *this.seal_threshold - raw_len;
+        if raw_len < threshold {
+            let max_pad = (*this.seal_threshold).saturating_sub(raw_len);
             let wanted = this.rng.random_range(range[0]..=range[1]);
             wanted.min(max_pad)
         } else {
             0
-        };
-
-        let payload_len = HEADER_LEN + raw_len + padding_len;
-        (payload_len, padding_len)
+        }
     }
 
     #[inline]
-    fn seal_into(this: &mut Proj<'_, R>, out: &mut Vec<u8>) -> Result<u64, Error> {
-        let raw_len = this.raw_buf.len().min(*this.seal_threshold);
+    fn finalize(this: &mut Proj<'_, R>) -> Result<u64, Error> {
+        let head = *this.head;
+        let raw_len = this.frame.len() - head;
         debug_assert!(raw_len > 0);
-        debug_assert!(raw_len <= MAX_RAW_PAYLOAD);
+        debug_assert!(raw_len <= *this.seal_threshold);
+
+        let start = *this.sealed_total;
+        let opaque = this
+            .inspector
+            .as_ref()
+            .and_then(TlsInspector::opaque_at)
+            .is_some_and(|at| start >= at);
 
         *this.timer_armed = false;
 
         let seq = *this.seq;
         *this.seq = seq + 1;
 
-        let (payload_len, padding_len) = Self::resolve_padding(this, raw_len);
-
-        match *this.encoding {
-            EncodingType::Binary => {
-                let enc_len = NONCE_LEN + payload_len + TAG_LEN;
-                out.reserve(2 + enc_len);
-                out.put_u16(enc_len as u16);
-                let nonce_start = out.len();
-                out.put_bytes(0u8, NONCE_LEN);
-                let ct_start = out.len();
-                out.put_u64(seq);
-                out.put_u16(raw_len as u16);
-                out.put_slice(&this.raw_buf[..raw_len]);
-                if padding_len > 0 {
-                    out.put_bytes(0u8, padding_len);
-                }
-                this.cipher.seal_in_place(out, nonce_start, ct_start)?;
-            }
-            EncodingType::Json => {
-                this.enc_buf.clear();
-                this.enc_buf.reserve(NONCE_LEN + payload_len + TAG_LEN);
-                this.enc_buf.put_bytes(0u8, NONCE_LEN);
-                this.enc_buf.put_u64(seq);
-                this.enc_buf.put_u16(raw_len as u16);
-                this.enc_buf.put_slice(&this.raw_buf[..raw_len]);
-                if padding_len > 0 {
-                    this.enc_buf.put_bytes(0u8, padding_len);
-                }
-                this.cipher.seal_in_place(this.enc_buf, 0, NONCE_LEN)?;
-                base122_fast::encode_into(&this.enc_buf[..], this.json_buf);
-                out.reserve(9 + this.json_buf.len() + 3);
-                out.put_slice(b"{\"data\":\"");
-                out.put_slice(this.json_buf);
-                out.put_slice(b"\"}\n");
-            }
+        let padding_len = Self::resolve_padding(this, raw_len);
+        if padding_len > 0 {
+            this.frame.resize(head + raw_len + padding_len, 0);
         }
 
-        this.raw_buf.advance(raw_len);
+        let ct = head - HEADER_LEN;
+        this.frame[ct..ct + 8].copy_from_slice(&seq.to_be_bytes());
+        this.frame[ct + 8..ct + 10].copy_from_slice(&(raw_len as u16).to_be_bytes());
+        if *this.encoding == EncodingType::Binary {
+            let wire_len = NONCE_LEN + HEADER_LEN + raw_len + padding_len + TAG_LEN;
+            this.frame[..2].copy_from_slice(&(wire_len as u16).to_be_bytes());
+        }
+
+        this.cipher
+            .seal_frame(this.frame, ct - NONCE_LEN, ct, opaque)?;
+
+        *this.sealed_total = start + raw_len as u64;
+        Ok(seq)
+    }
+
+    #[inline]
+    fn start_frame(this: &mut Proj<'_, R>) {
+        this.frame.clear();
+        this.frame.resize(*this.head, 0);
+    }
+
+    fn write_json(this: &mut Proj<'_, R>, out: &mut Vec<u8>) {
+        base122_fast::encode_into(this.frame, this.json_buf);
+        out.extend_from_slice(b"{\"data\":\"");
+        out.extend_from_slice(this.json_buf);
+        out.extend_from_slice(b"\"}\n");
+    }
+
+    #[inline]
+    fn seal_into(this: &mut Proj<'_, R>, out: &mut Vec<u8>) -> Result<u64, Error> {
+        let seq = Self::finalize(this)?;
+        if *this.encoding == EncodingType::Json {
+            Self::write_json(this, out);
+        } else {
+            out.extend_from_slice(this.frame);
+        }
+        Self::start_frame(this);
         Ok(seq)
     }
 }
@@ -671,22 +717,23 @@ impl<R: AsyncRead> TrafficShaper<R> {
     }
 
     fn poll_fill_proj(this: &mut Proj<'_, R>, cx: &mut Context<'_>) -> Poll<std::io::Result<Fill>> {
+        let head = *this.head;
+        let budget = head + *this.seal_threshold;
         loop {
-            if this.raw_buf.len() >= *this.seal_threshold {
+            if this.frame.len() >= budget {
                 return Poll::Ready(Ok(Fill::Frame));
             }
 
-            let remaining = READ_HIGH_WATER - this.raw_buf.len();
-            this.raw_buf.reserve(remaining);
-            let spare = this.raw_buf.spare_capacity_mut();
-            let read_limit = spare.len().min(remaining);
-            let mut rb = ReadBuf::uninit(&mut spare[..read_limit]);
+            let want = budget - this.frame.len();
+            this.frame.reserve(want + TAG_LEN);
+            let spare = this.frame.spare_capacity_mut();
+            let mut rb = ReadBuf::uninit(&mut spare[..want]);
 
             match this.reader.as_mut().poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
                     if n == 0 {
-                        return Poll::Ready(Ok(if this.raw_buf.is_empty() {
+                        return Poll::Ready(Ok(if this.frame.len() == head {
                             Fill::Eof
                         } else {
                             Fill::Frame
@@ -694,16 +741,16 @@ impl<R: AsyncRead> TrafficShaper<R> {
                     }
 
                     unsafe {
-                        this.raw_buf.advance_mut(n);
+                        this.frame.set_len(this.frame.len() + n);
+                    }
+
+                    if let Some(inspector) = this.inspector.as_mut() {
+                        inspector.feed(&this.frame[this.frame.len() - n..]);
                     }
                 }
                 Poll::Pending => {
-                    let raw_len = this.raw_buf.len();
-                    if raw_len == 0 {
+                    if this.frame.len() == head {
                         return Poll::Pending;
-                    }
-                    if raw_len >= *this.seal_threshold {
-                        return Poll::Ready(Ok(Fill::Frame));
                     }
 
                     if !*this.timer_armed {
@@ -747,11 +794,19 @@ impl<R: AsyncRead> tokio_stream::Stream for TrafficShaper<R> {
             Poll::Ready(Ok(Fill::Eof)) => Poll::Ready(None),
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
             Poll::Ready(Ok(Fill::Frame)) => {
-                let mut frame = bufpool::take(*this.frame_capacity);
-                match Self::seal_into(&mut this, &mut frame) {
-                    Ok(seq) => Poll::Ready(Some(Ok((seq, bufpool::frame_bytes(frame))))),
-                    Err(e) => Poll::Ready(Some(Err(e))),
-                }
+                let seq = match Self::finalize(&mut this) {
+                    Ok(seq) => seq,
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                };
+                let buf = if *this.encoding == EncodingType::Json {
+                    let mut line = bufpool::take(*this.line_capacity);
+                    Self::write_json(&mut this, &mut line);
+                    line
+                } else {
+                    std::mem::replace(this.frame, bufpool::take(*this.frame_capacity))
+                };
+                Self::start_frame(&mut this);
+                Poll::Ready(Some(Ok((seq, bufpool::frame_bytes(buf)))))
             }
         }
     }
@@ -1268,7 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn poll_seal_into_pending_then_data() {
         use tokio::io::AsyncWriteExt;
-        let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
+        let (mut writer, reader) = tokio::io::duplex(32 * 1024);
         let cfg = ResolvedShaperConfig::resolve(&test_config());
         let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, test_cipher_arc(), 0));
         let mut out = Vec::new();
@@ -1283,7 +1338,7 @@ mod tests {
             "empty duplex must yield Pending"
         );
 
-        writer.write_all(&[0x33u8; READ_HIGH_WATER]).await.unwrap();
+        writer.write_all(&[0x33u8; 32 * 1024]).await.unwrap();
         assert!(
             matches!(
                 shaper.as_mut().poll_seal_into(&mut cx, &mut out),
@@ -1320,7 +1375,7 @@ mod tests {
         };
         use tokio::io::AsyncWriteExt;
         let resolved = ResolvedShaperConfig::resolve(&cfg);
-        let (mut writer, reader) = tokio::io::duplex(READ_HIGH_WATER);
+        let (mut writer, reader) = tokio::io::duplex(32 * 1024);
         let mut shaper = Box::pin(TrafficShaper::with_seq(
             reader,
             &resolved,
@@ -1397,5 +1452,323 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn tls13_server_hello_record() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[5u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(0);
+        let ext = [0x00u8, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut hs = Vec::new();
+        hs.push(2);
+        hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        hs.extend_from_slice(&body);
+        let mut record = Vec::new();
+        record.push(22);
+        record.extend_from_slice(&[0x03, 0x03]);
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    fn tls13_client_hello_record() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[6u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(1);
+        body.push(0);
+        let ext = [0x00u8, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04];
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut hs = Vec::new();
+        hs.push(1);
+        hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        hs.extend_from_slice(&body);
+        let mut record = Vec::new();
+        record.push(22);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    #[tokio::test]
+    async fn upload_shaper_passes_client_ciphertext_through() {
+        let cipher: Arc<dyn FrameCipher> =
+            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([9u8; 32])));
+        let mut input = tls13_client_hello_record();
+        for _ in 0..20 {
+            input.extend_from_slice(&tls13_app_data_record(1024));
+        }
+
+        let cfg = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_inspector(
+            std::io::Cursor::new(input.clone()),
+            &cfg,
+            Arc::clone(&cipher),
+            0,
+            Some(crate::crypto::TlsInspector::new()),
+        ));
+
+        let mut out = Vec::new();
+        std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out[2] & 0x80, 0);
+
+        out.clear();
+        std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out[2] & 0x80, 0x80);
+
+        let mut buf = BytesMut::from(&out[..]);
+        let mut json_scratch = Vec::new();
+        let DecodedFrame::Owned { seq, data } = decode_frame(
+            &mut buf,
+            &mut json_scratch,
+            cipher.as_ref(),
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .expect("frame") else {
+            panic!("expected owned frame");
+        };
+        assert_eq!(seq, 1);
+        assert_eq!(&data[..], &input[16640..]);
+    }
+
+    #[tokio::test]
+    async fn shaper_continues_from_inspector_offset() {
+        let cipher: Arc<dyn FrameCipher> =
+            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([2u8; 32])));
+        let hello = tls13_client_hello_record();
+        let mut input = hello.clone();
+        input.extend_from_slice(&tls13_app_data_record(2048));
+        let split = hello.len() + 5;
+
+        let mut inspector = crate::crypto::TlsInspector::new();
+        inspector.feed(&input[..split]);
+        assert_eq!(inspector.opaque_at(), Some(hello.len() as u64));
+
+        let cfg = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_inspector(
+            std::io::Cursor::new(input[split..].to_vec()),
+            &cfg,
+            Arc::clone(&cipher),
+            0,
+            Some(inspector),
+        ));
+
+        let mut out = Vec::new();
+        std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(out[2] & 0x80, 0x80);
+
+        let mut buf = BytesMut::from(&out[..]);
+        let mut json_scratch = Vec::new();
+        let DecodedFrame::Owned { data, .. } = decode_frame(
+            &mut buf,
+            &mut json_scratch,
+            cipher.as_ref(),
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .expect("frame") else {
+            panic!("expected owned frame");
+        };
+        assert_eq!(&data[..], &input[split..]);
+    }
+
+    #[tokio::test]
+    async fn shaper_switches_to_plaintext_after_tls13_server_hello() {
+        let cipher: Arc<dyn FrameCipher> =
+            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([3u8; 32])));
+        let mut input = tls13_server_hello_record();
+        for _ in 0..10 {
+            input.extend_from_slice(&tls13_app_data_record(4096));
+        }
+
+        let cfg = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_inspector(
+            std::io::Cursor::new(input.clone()),
+            &cfg,
+            Arc::clone(&cipher),
+            0,
+            Some(crate::crypto::TlsInspector::new()),
+        ));
+
+        let mut out = Vec::new();
+        let seq = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 0);
+        assert_eq!(out[2] & 0x80, 0);
+
+        let mut buf = BytesMut::from(&out[..]);
+        let mut json_scratch = Vec::new();
+        let DecodedFrame::Owned { data, .. } = decode_frame(
+            &mut buf,
+            &mut json_scratch,
+            cipher.as_ref(),
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .expect("frame") else {
+            panic!("expected owned frame");
+        };
+        assert_eq!(data.len(), 16640);
+
+        out.clear();
+        let seq = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(out[2] & 0x80, 0x80);
+
+        let mut buf = BytesMut::from(&out[..]);
+        let frame = decode_frame(
+            &mut buf,
+            &mut json_scratch,
+            cipher.as_ref(),
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .expect("frame");
+        match frame {
+            DecodedFrame::Owned { seq, data } => {
+                assert_eq!(seq, 1);
+                assert_eq!(&data[..], &input[16640..33280]);
+            }
+            DecodedFrame::InJsonScratch { .. } => panic!("expected owned frame"),
+        }
+    }
+
+    fn tls13_app_data_record(len: usize) -> Vec<u8> {
+        let mut record = vec![23u8, 0x03, 0x03];
+        record.extend_from_slice(&(len as u16).to_be_bytes());
+        record.extend(std::iter::repeat_n(0x5Au8, len));
+        record
+    }
+
+    #[tokio::test]
+    async fn small_records_are_coalesced_into_one_plaintext_frame() {
+        let cipher: Arc<dyn FrameCipher> =
+            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([6u8; 32])));
+        let mut input = tls13_server_hello_record();
+        for _ in 0..16 {
+            input.extend_from_slice(&tls13_app_data_record(4096));
+        }
+
+        let cfg = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_inspector(
+            std::io::Cursor::new(input.clone()),
+            &cfg,
+            Arc::clone(&cipher),
+            0,
+            Some(crate::crypto::TlsInspector::new()),
+        ));
+
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            out.clear();
+            std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let mut buf = BytesMut::from(&out[..]);
+        let mut json_scratch = Vec::new();
+        let DecodedFrame::Owned { seq, data } = decode_frame(
+            &mut buf,
+            &mut json_scratch,
+            cipher.as_ref(),
+            EncodingType::Binary,
+        )
+        .unwrap()
+        .expect("frame") else {
+            panic!("expected owned frame");
+        };
+        assert_eq!(seq, 1);
+        assert_eq!(&data[..], &input[16640..33280]);
+
+        let headers = data
+            .windows(5)
+            .filter(|w| w[0] == 23 && w[1..3] == [3, 3] && w[3..5] == [0x10, 0x00])
+            .count();
+        assert_eq!(headers, 4, "one frame must span four 4 KiB records");
+    }
+
+    #[tokio::test]
+    async fn json_record_fragments_stay_plaintext() {
+        let cipher: Arc<dyn FrameCipher> =
+            Arc::new(crate::crypto::StreamCipher::new(&Zeroizing::new([4u8; 32])));
+        let mut input = tls13_server_hello_record();
+        for _ in 0..8 {
+            input.extend_from_slice(&tls13_app_data_record(4096));
+        }
+
+        let cfg = ResolvedShaperConfig::resolve(&TrafficConfig {
+            encoding_type: EncodingType::Json,
+            global: PaddingConfig {
+                padding_threshold: 0,
+                padding_range: [0, 0],
+            },
+            ..test_config()
+        });
+        let mut shaper = Box::pin(TrafficShaper::with_inspector(
+            std::io::Cursor::new(input.clone()),
+            &cfg,
+            Arc::clone(&cipher),
+            0,
+            Some(crate::crypto::TlsInspector::new()),
+        ));
+
+        let mut out = Vec::new();
+        let mut received = Vec::new();
+        for expected_seq in 0..3 {
+            out.clear();
+            let seq = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(seq, expected_seq);
+
+            let mut sealed = Vec::new();
+            parse_json_payload_into(&out, &mut sealed).unwrap();
+            assert_eq!(
+                sealed[0] & 0x80,
+                if expected_seq == 0 { 0 } else { 0x80 },
+                "frame {expected_seq}"
+            );
+
+            let mut buf = BytesMut::from(&out[..]);
+            let mut scratch = Vec::new();
+            let frame = decode_frame(&mut buf, &mut scratch, cipher.as_ref(), EncodingType::Json)
+                .unwrap()
+                .expect("frame");
+            match frame {
+                DecodedFrame::InJsonScratch { start, end, .. } => {
+                    received.extend_from_slice(&scratch[start..end]);
+                }
+                DecodedFrame::Owned { data, .. } => received.extend_from_slice(&data),
+            }
+        }
+        assert_eq!(received, input);
     }
 }

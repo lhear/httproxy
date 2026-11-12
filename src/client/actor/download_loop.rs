@@ -18,7 +18,6 @@ use crate::client::constants::{
     PREFETCH_ROTATE_TIMEOUT, WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT, WRITE_STALL_TIMEOUT,
 };
 use crate::client::utils;
-use crate::crypto::AesFrameCipher;
 use crate::shaper::{self, DecodedFrame, EncodingType, FrameCipher};
 
 enum Phase {
@@ -182,7 +181,7 @@ impl DownloadLoopActor {
     pub fn new(
         initial_response: wreq::Response,
         write_half: OwnedWriteHalf,
-        cipher: Arc<AesFrameCipher>,
+        cipher: Arc<dyn FrameCipher>,
         stream_id: Uuid,
         http_client: Arc<wreq::Client>,
         state: Arc<SharedState>,

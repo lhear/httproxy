@@ -208,8 +208,15 @@ impl TunnelActor {
         config: &ResolvedShaperConfig,
         download_cipher: Arc<dyn FrameCipher>,
         initial_seq: u64,
+        inspector: Option<crate::crypto::TlsInspector>,
     ) {
-        let shaper = TrafficShaper::with_seq(read_half, config, download_cipher, initial_seq);
+        let shaper = TrafficShaper::with_inspector(
+            read_half,
+            config,
+            download_cipher,
+            initial_seq,
+            inspector,
+        );
         self.shaper_slot = Some(Arc::new(StdMutex::new(Some(Box::pin(shaper)))));
 
         if let Some(wh) = write_half {
@@ -476,6 +483,7 @@ mod tests {
             &resolved_config(),
             test_cipher(),
             0,
+            None,
         );
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
@@ -514,6 +522,7 @@ mod tests {
             &resolved_config(),
             test_cipher(),
             0,
+            None,
         );
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
@@ -556,6 +565,7 @@ mod tests {
             &resolved_config(),
             test_cipher(),
             0,
+            None,
         );
         let handle = tokio::spawn(async move { actor.run().await });
 
@@ -581,6 +591,7 @@ mod tests {
             &resolved_config(),
             test_cipher(),
             0,
+            None,
         );
         let first = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
@@ -623,6 +634,7 @@ mod tests {
             &resolved_config(),
             test_cipher(),
             0,
+            None,
         );
         let segment = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });
@@ -688,6 +700,7 @@ mod timeout_tests {
                 &zeroize::Zeroizing::new([7u8; 32]),
             )),
             0,
+            None,
         );
         let mut segment = actor.take_segment().expect("first segment");
         let handle = tokio::spawn(async move { actor.run().await });

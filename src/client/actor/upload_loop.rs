@@ -1,10 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, Waker};
-use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -15,10 +13,7 @@ use crate::client::constants::{
     BATCH_BUF_INITIAL_CAPACITY, MAX_BATCH_BYTES, UPLOAD_REQUEST_TIMEOUT,
 };
 use crate::client::utils;
-use crate::crypto::AesFrameCipher;
-use crate::shaper::{self, SealInto};
-
-type ShaperStream = Pin<Box<dyn SealInto + Send>>;
+use crate::shaper::{self, ShaperStream};
 
 enum Phase {
     Batching { batch_buf: Vec<u8> },
@@ -45,20 +40,9 @@ impl UploadLoopActor {
     pub fn new(
         http_client: Arc<wreq::Client>,
         state: Arc<SharedState>,
-        initial_payload: Bytes,
-        read_half: tokio::net::tcp::OwnedReadHalf,
-        cipher: Arc<AesFrameCipher>,
+        shaped: ShaperStream,
         stream_id: Uuid,
-        start_seq: u64,
     ) -> Self {
-        let reader = AsyncReadExt::chain(std::io::Cursor::new(initial_payload), read_half);
-        let traffic_cipher: Arc<dyn shaper::FrameCipher> = cipher;
-        let shaped: ShaperStream = Box::pin(shaper::TrafficShaper::with_seq(
-            reader,
-            &state.resolved_traffic,
-            traffic_cipher,
-            start_seq,
-        ));
         let upload_concurrency = state.upload_concurrency;
         let max_in_flight_bytes = state.max_in_flight_bytes;
         let frame_headroom = shaper::max_encoded_frame_len(state.traffic_config.encoding_type);
@@ -251,12 +235,14 @@ async fn send_upload_post(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::AesFrameCipher;
     use crate::shaper::{
         DecodedFrame, EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig,
         decode_frame,
     };
     use bytes::BytesMut;
     use std::net::SocketAddr;
+    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
@@ -389,6 +375,23 @@ mod tests {
         (read_half, client)
     }
 
+    fn shaped(
+        state: &Arc<SharedState>,
+        payload: Bytes,
+        read_half: tokio::net::tcp::OwnedReadHalf,
+        cipher: Arc<dyn shaper::FrameCipher>,
+        seq: u64,
+    ) -> ShaperStream {
+        let reader = std::io::Cursor::new(payload).chain(read_half);
+        Box::pin(shaper::TrafficShaper::with_inspector(
+            reader,
+            &state.resolved_traffic,
+            cipher,
+            seq,
+            Some(crate::crypto::TlsInspector::new()),
+        ))
+    }
+
     #[tokio::test]
     async fn run_uploads_all_data_with_contiguous_seqs() {
         let (addr, stop_tx, collector) = spawn_collector().await;
@@ -401,15 +404,8 @@ mod tests {
         let mut all = initial.clone();
         all.extend_from_slice(&extra);
 
-        let actor = UploadLoopActor::new(
-            client,
-            state,
-            Bytes::from(initial),
-            read_half,
-            test_cipher(),
-            Uuid::new_v4(),
-            0,
-        );
+        let shaped = shaped(&state, Bytes::from(initial), read_half, test_cipher(), 0);
+        let actor = UploadLoopActor::new(client, state, shaped, Uuid::new_v4());
         let handle = tokio::spawn(async move { actor.run().await });
 
         writer.write_all(&extra).await.unwrap();
@@ -434,15 +430,8 @@ mod tests {
         drop(writer);
 
         let initial = vec![0xABu8; 40_000];
-        let actor = UploadLoopActor::new(
-            client,
-            state,
-            Bytes::from(initial),
-            read_half,
-            test_cipher(),
-            Uuid::new_v4(),
-            7,
-        );
+        let shaped = shaped(&state, Bytes::from(initial), read_half, test_cipher(), 7);
+        let actor = UploadLoopActor::new(client, state, shaped, Uuid::new_v4());
         let handle = tokio::spawn(async move { actor.run().await });
         handle.await.unwrap().unwrap();
 
@@ -482,15 +471,8 @@ mod tests {
         drop(writer);
 
         let initial = vec![0xCDu8; 30_000];
-        let actor = UploadLoopActor::new(
-            client,
-            state,
-            Bytes::from(initial),
-            read_half,
-            test_cipher(),
-            Uuid::new_v4(),
-            0,
-        );
+        let shaped = shaped(&state, Bytes::from(initial), read_half, test_cipher(), 0);
+        let actor = UploadLoopActor::new(client, state, shaped, Uuid::new_v4());
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), actor.run()).await;
         let err = result.expect("upload loop must fail fast").unwrap_err();
         let msg = err.to_string();
@@ -508,15 +490,8 @@ mod tests {
         let (read_half, writer) = tcp_pair().await;
         drop(writer);
 
-        let actor = UploadLoopActor::new(
-            client,
-            state,
-            Bytes::new(),
-            read_half,
-            test_cipher(),
-            Uuid::new_v4(),
-            5,
-        );
+        let shaped = shaped(&state, Bytes::new(), read_half, test_cipher(), 5);
+        let actor = UploadLoopActor::new(client, state, shaped, Uuid::new_v4());
         let handle = tokio::spawn(async move { actor.run().await });
         handle.await.unwrap().unwrap();
 

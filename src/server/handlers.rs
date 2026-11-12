@@ -9,7 +9,7 @@ use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::crypto::{self, AesFrameCipher};
+use crate::crypto::{self, AesFrameCipher, StreamCipher, TlsInspector};
 use crate::error::ServerError;
 use crate::server::actor::tunnel::TunnelCmd;
 use crate::server::actor::upload::UploadCmd;
@@ -175,11 +175,12 @@ async fn setup_tunnel_response(
     actor.set_upload_channel(upload_tx_for_actor, upload_handle);
 
     let body_stream = if direct {
-        let shaper = crate::shaper::TrafficShaper::with_seq(
+        let shaper = crate::shaper::TrafficShaper::with_inspector(
             upstream_read,
             &state.resolved_traffic,
             download_cipher,
             0,
+            Some(TlsInspector::new()),
         );
         let activity = Arc::clone(&last_activity);
         Body::from_stream(shaper.map(move |r| {
@@ -195,6 +196,7 @@ async fn setup_tunnel_response(
             &state.resolved_traffic,
             download_cipher,
             0,
+            Some(TlsInspector::new()),
         );
         Body::from_stream(
             actor
@@ -310,8 +312,8 @@ async fn spawn_encrypted_tunnel(
         .map_err(|_| ServerError::bad_request("invalid port"))?;
     span.record("target", &target);
 
-    let download_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&download_key));
-    let upload_cipher: Arc<dyn FrameCipher> = Arc::new(AesFrameCipher::new(&upload_key));
+    let download_cipher: Arc<dyn FrameCipher> = Arc::new(StreamCipher::new(&download_key));
+    let upload_cipher: Arc<dyn FrameCipher> = Arc::new(StreamCipher::new(&upload_key));
 
     let response = setup_tunnel_response(
         &state,

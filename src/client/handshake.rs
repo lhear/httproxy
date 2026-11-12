@@ -4,14 +4,15 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tracing::{Instrument, info};
 use zeroize::Zeroizing;
 
 use crate::client::actor::download_loop::DownloadLoopActor;
 use crate::client::actor::upload_loop::UploadLoopActor;
 use crate::client::utils;
-use crate::crypto::{self, AesFrameCipher};
-use crate::shaper::{self, MAX_RAW_PAYLOAD};
+use crate::crypto::{self, AesFrameCipher, TlsInspector};
+use crate::shaper::{self, MAX_RAW_PAYLOAD, ShaperStream};
 
 use super::state::SharedState;
 use crate::client::constants::{DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT};
@@ -49,8 +50,10 @@ pub async fn try_pq_connect(
     let stream_id_bytes: [u8; 16] = *stream_id.as_bytes();
     let (upload_key, download_key, target_key) =
         crypto::derive_connection_keys(master, &stream_id_bytes);
-    let upload_cipher = Arc::new(AesFrameCipher::new(&upload_key));
-    let download_cipher = Arc::new(AesFrameCipher::new(&download_key));
+    let upload_cipher: Arc<dyn shaper::FrameCipher> =
+        Arc::new(crate::crypto::StreamCipher::new(&upload_key));
+    let download_cipher: Arc<dyn shaper::FrameCipher> =
+        Arc::new(crate::crypto::StreamCipher::new(&download_key));
 
     let enc_target = crypto::encrypt_bytes(&target_key, target_host.as_bytes())?;
 
@@ -70,6 +73,10 @@ pub async fn try_pq_connect(
         upload_cipher.as_ref(),
         &state.traffic_config,
     )?;
+
+    let early_len = initial_payload.len() - remaining_payload.len();
+    let mut inspector = TlsInspector::new();
+    inspector.feed(&initial_payload[..early_len]);
 
     let mut session_cookie = String::new();
     utils::build_tunnel_cookie(&mut session_cookie, &cookie_val);
@@ -104,16 +111,21 @@ pub async fn try_pq_connect(
 
     let upload_client = Arc::clone(http_client);
     let upload_state = Arc::clone(state);
-    let upload_cipher_clone = Arc::clone(&upload_cipher);
+
+    let reader = std::io::Cursor::new(remaining_payload).chain(read_half);
+    let shaped: ShaperStream = Box::pin(shaper::TrafficShaper::with_inspector(
+        reader,
+        &state.resolved_traffic,
+        upload_cipher,
+        frames_sent,
+        Some(inspector),
+    ));
 
     let upload_actor = UploadLoopActor::new(
         upload_client.clone(),
         upload_state.clone(),
-        remaining_payload,
-        read_half,
-        upload_cipher_clone,
+        shaped,
         stream_id,
-        frames_sent,
     );
     let upload_task =
         tokio::spawn(async move { upload_actor.run().await }.instrument(tracing::Span::current()));
