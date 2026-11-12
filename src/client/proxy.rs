@@ -506,10 +506,9 @@ mod tests {
         let new_len = strip_proxy_headers(&mut buf, head.len());
 
         assert!(
-            String::from_utf8_lossy(&buf[..new_len])
+            !String::from_utf8_lossy(&buf[..new_len])
                 .to_ascii_lowercase()
-                .find("proxy-authorization")
-                .is_none()
+                .contains("proxy-authorization")
         );
         assert!(buf.ends_with(b"body"));
         assert_eq!(buf.len() - new_len, 4);
