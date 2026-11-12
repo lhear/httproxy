@@ -99,14 +99,43 @@ fn build_file_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn write_and_flush(writer: &mut impl Write) {
+        writer.write_all(b"{\"msg\":\"probe\"}\n").unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn log_file_names(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn has_log_file(dir: &std::path::Path, stem: &str) -> bool {
+        log_file_names(dir).iter().any(|name| {
+            name.starts_with(&format!("{stem}."))
+                && name.ends_with(&format!(".{DEFAULT_LOG_EXTENSION}"))
+        })
+    }
 
     #[test]
     fn file_writer_creates_rotating_file() {
         let dir = std::env::temp_dir().join(format!("httproxy_log_test_{}", std::process::id()));
         let path = dir.join("app.log");
-        let (_, guard) = build_file_writer(path.to_str().unwrap(), 3);
-        assert!(dir.exists());
+        let (mut writer, guard) = build_file_writer(path.to_str().unwrap(), 3);
+        write_and_flush(&mut writer);
         drop(guard);
+        assert!(
+            has_log_file(&dir, "app"),
+            "未生成 app.*.log，实际目录内容: {:?}",
+            log_file_names(&dir)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -114,9 +143,14 @@ mod tests {
     fn file_writer_without_extension_uses_fallback_suffix() {
         let dir = std::env::temp_dir().join(format!("httproxy_log_noext_{}", std::process::id()));
         let path = dir.join("noext");
-        let (_, guard) = build_file_writer(path.to_str().unwrap(), 3);
-        assert!(dir.exists());
+        let (mut writer, guard) = build_file_writer(path.to_str().unwrap(), 3);
+        write_and_flush(&mut writer);
         drop(guard);
+        assert!(
+            has_log_file(&dir, "noext"),
+            "缺少扩展名时应回退到 .{DEFAULT_LOG_EXTENSION} 后缀，实际目录内容: {:?}",
+            log_file_names(&dir)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

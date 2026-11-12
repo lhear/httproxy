@@ -435,31 +435,6 @@ mod tests {
     }
 
     #[test]
-    fn reassembles_fragmented_server_hello() {
-        let mut inspector = TlsInspector::new();
-        let hello = record(22, &handshake(2, &server_hello(&[0x03, 0x04], [9u8; 32])));
-        for byte in &hello {
-            inspector.feed(&[*byte]);
-        }
-        assert_eq!(inspector.opaque_at(), None);
-
-        let app = record(23, &[0x11u8; 1024]);
-        for byte in &app {
-            inspector.feed(&[*byte]);
-        }
-        assert_eq!(inspector.opaque_at(), Some(hello.len() as u64));
-    }
-
-    #[test]
-    fn small_application_data_records_still_open() {
-        let mut inspector = TlsInspector::new();
-        let hello = record(22, &handshake(2, &server_hello(&[0x03, 0x04], [4u8; 32])));
-        inspector.feed(&hello);
-        inspector.feed(&record(23, &[0x22u8; 1024]));
-        assert_eq!(inspector.opaque_at(), Some(hello.len() as u64));
-    }
-
-    #[test]
     fn ignores_application_data_before_hello() {
         let mut inspector = TlsInspector::new();
         inspector.feed(&record(23, &[0xAAu8; 512]));

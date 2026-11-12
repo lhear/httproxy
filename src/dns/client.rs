@@ -753,12 +753,22 @@ mod tests {
     #[tokio::test]
     async fn interleave_exhausts_one_side() {
         let c = test_client().await;
-        let v4 = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
-        let v6 = vec![
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        let v4 = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
+            IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3)),
         ];
-        let r = c.interleave_ips(v4, v6);
-        assert_eq!(r.len(), 3);
+        let v6 = vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)];
+        let r = c.interleave_ips(v4.clone(), v6);
+        assert_eq!(
+            r,
+            vec![
+                v4[0],
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                v4[1],
+                v4[2]
+            ],
+            "剩余地址必须按原顺序追加，不能只保留长度"
+        );
     }
 }
