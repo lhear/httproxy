@@ -15,13 +15,12 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use masque::{ConnectRejected, MasqueConfig, MasqueConn, MasqueStream};
+use masque::{MasqueConfig, MasqueConn, MasqueStream};
 
 const DEFAULT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 const DEFAULT_PORT: u16 = 443;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
-const CANCEL_GRACE_SECS: u64 = 3;
 const KEEPALIVE: Duration = Duration::from_secs(25);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const FALLBACK_ENDPOINT: &str = "162.159.192.1";
@@ -198,20 +197,14 @@ impl WarpClient {
         let mut last_error = None;
         for attempt in 0..2 {
             let conn = self.connection().await?;
-            let mut pending = PendingConnect::new(&conn);
             let opened = tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, conn.open(&authority)).await;
-            pending.disarm();
             let error = match opened {
-                Ok(Ok(stream)) => {
-                    conn.note_success();
-                    return Ok(stream);
-                }
+                Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => e,
                 Err(_) => anyhow!("warp: CONNECT {authority} timed out"),
             };
 
-            let refused = error.downcast_ref::<ConnectRejected>().is_some();
-            let retire = !conn.is_usable() || (!refused && conn.note_failure());
+            let retire = !conn.is_usable();
             if retire {
                 self.invalidate(&conn).await;
                 warn!(
@@ -390,42 +383,6 @@ fn family_reachable(v6: bool) -> Option<bool> {
             ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable => Some(false),
             _ => None,
         },
-    }
-}
-
-struct PendingConnect<'a> {
-    conn: &'a Arc<MasqueConn>,
-    started: u64,
-    armed: bool,
-}
-
-impl<'a> PendingConnect<'a> {
-    fn new(conn: &'a Arc<MasqueConn>) -> Self {
-        Self {
-            conn,
-            started: crate::now_secs(),
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PendingConnect<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let elapsed = crate::now_secs().saturating_sub(self.started);
-        if elapsed >= CANCEL_GRACE_SECS {
-            warn!(
-                elapsed,
-                "warp: CONNECT abandoned before completion, connection marked"
-            );
-            self.conn.note_failure();
-        }
     }
 }
 

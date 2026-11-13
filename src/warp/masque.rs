@@ -2,7 +2,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -24,10 +24,6 @@ const MAX_DATA_FRAME: usize = 64 * 1024;
 const MAX_RESPONSE_HEAD_BUFFER: usize = 64 * 1024;
 
 const MAX_CONTROL_BUFFER: usize = 64 * 1024;
-
-const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-
-const SUCCESS_GRACE_SECS: u64 = 60;
 
 const QUIC_ALPN: &[u8] = b"h3";
 
@@ -65,7 +61,7 @@ pub(crate) struct MasqueConn {
     _control: SendStream,
     _qpack_encoder: SendStream,
     _qpack_decoder: SendStream,
-    health: Health,
+    retiring: Arc<AtomicBool>,
     guard: Arc<CloseGuard>,
 }
 
@@ -108,41 +104,6 @@ impl std::fmt::Display for ConnectRejected {
 
 impl std::error::Error for ConnectRejected {}
 
-pub(crate) struct Health {
-    retiring: Arc<AtomicBool>,
-    last_success: AtomicU64,
-    failures: AtomicU32,
-}
-
-impl Health {
-    fn new(now: u64) -> Self {
-        Self {
-            retiring: Arc::new(AtomicBool::new(false)),
-            last_success: AtomicU64::new(now),
-            failures: AtomicU32::new(0),
-        }
-    }
-
-    fn usable(&self) -> bool {
-        !self.retiring.load(Ordering::Acquire)
-    }
-
-    fn success(&self, now: u64) {
-        self.failures.store(0, Ordering::Relaxed);
-        self.last_success.store(now, Ordering::Relaxed);
-    }
-
-    fn failure(&self, now: u64) -> bool {
-        let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-        let silent = now.saturating_sub(self.last_success.load(Ordering::Relaxed));
-        let retire = failures >= MAX_CONSECUTIVE_FAILURES || silent >= SUCCESS_GRACE_SECS;
-        if retire {
-            self.retiring.store(true, Ordering::Release);
-        }
-        retire
-    }
-}
-
 impl MasqueConn {
     pub(crate) async fn establish(
         endpoint: &quinn::Endpoint,
@@ -175,11 +136,8 @@ impl MasqueConn {
 
         debug!(endpoint = %addr, "warp: MASQUE connection established");
 
-        let health = Health::new(crate::now_secs());
-        tokio::spawn(watch_server_streams(
-            conn.clone(),
-            Arc::clone(&health.retiring),
-        ));
+        let retiring = Arc::new(AtomicBool::new(false));
+        tokio::spawn(watch_server_streams(conn.clone(), Arc::clone(&retiring)));
 
         let guard = Arc::new(CloseGuard { conn: conn.clone() });
         Ok(Self {
@@ -187,21 +145,13 @@ impl MasqueConn {
             _control: control,
             _qpack_encoder: qpack_encoder,
             _qpack_decoder: qpack_decoder,
-            health,
+            retiring,
             guard,
         })
     }
 
     pub(crate) fn is_usable(&self) -> bool {
-        self.conn.close_reason().is_none() && self.health.usable()
-    }
-
-    pub(crate) fn note_success(&self) {
-        self.health.success(crate::now_secs());
-    }
-
-    pub(crate) fn note_failure(&self) -> bool {
-        self.health.failure(crate::now_secs())
+        self.conn.close_reason().is_none() && !self.retiring.load(Ordering::Acquire)
     }
 
     pub(crate) async fn open(&self, authority: &str) -> Result<MasqueStream> {
@@ -708,6 +658,7 @@ pub(crate) fn build_tls_config(
         )
         .context("warp: unusable device key for TLS client auth")?;
     config.alpn_protocols = vec![QUIC_ALPN.to_vec()];
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(Arc::new(config))
 }
 
@@ -1162,40 +1113,6 @@ mod tests {
 
         server.close(VarInt::from_u32(0), b"done");
         endpoint.close(VarInt::from_u32(0), b"done");
-    }
-
-    #[test]
-    fn health_retires_after_consecutive_failures() {
-        let h = Health::new(1_000);
-        assert!(!h.failure(1_001));
-        assert!(h.usable());
-        assert!(!h.failure(1_002));
-        assert!(h.failure(1_003));
-        assert!(!h.usable());
-    }
-
-    #[test]
-    fn health_retires_a_connection_that_has_gone_silent() {
-        let h = Health::new(1_000);
-        assert!(h.failure(1_000 + SUCCESS_GRACE_SECS + 1));
-        assert!(!h.usable());
-    }
-
-    #[test]
-    fn health_success_clears_failures() {
-        let h = Health::new(1_000);
-        assert!(h.failure(1_061));
-        h.success(1_062);
-        assert!(!h.failure(1_063));
-        assert!(!h.failure(1_064));
-    }
-
-    #[test]
-    fn health_retiring_flag_marks_connection_unusable() {
-        let h = Health::new(1_000);
-        assert!(h.usable());
-        h.retiring.store(true, Ordering::Release);
-        assert!(!h.usable());
     }
 
     #[test]
