@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::sys::{self, Ptr};
 
-const READ_CHUNK: usize = 64 * 1024;
+const READ_CHUNK: usize = 32 * 1024;
 
 static NEXT_KEY: AtomicUsize = AtomicUsize::new(1);
 
