@@ -44,12 +44,6 @@ sh scripts/build-libcronet.sh x86_64-unknown-linux-gnu
 CRONET_LIB_DIR=cronet/x86_64-unknown-linux-gnu cargo build --release
 ```
 
-On Windows the package holds both `cronet.dll` and `cronet.lib`: the client
-links the archive and ships as a single 13 MB file, and
-`CRONET_WINDOWS_STATIC=0` drops it. A static client grows by tens of megabytes,
-every artifact ships Chromium's licence as `CHROMIUM-LICENSE`, and the server
-needs none of this.
-
 Both binaries read a `config.toml`; every key is documented in
 **[CONFIGURATION.md](CONFIGURATION.md)**.
 
