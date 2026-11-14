@@ -333,7 +333,7 @@ mod tests {
         (addr, stop_tx, handle)
     }
 
-    fn decode_all(received: &[u8]) -> Vec<u8> {
+    fn decode_all(received: &[u8]) -> Vec<(u64, Bytes)> {
         let cipher = test_cipher();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::from(received);
@@ -347,7 +347,7 @@ mod tests {
         .unwrap()
         {
             match frame {
-                DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
+                DecodedFrame::Owned { seq, data } => decoded.push((seq, data)),
                 _ => panic!("unexpected borrowed frame"),
             }
         }
@@ -406,8 +406,16 @@ mod tests {
 
         let _ = stop_tx.send(());
         let received = collector.await.unwrap();
-        assert!(!received.is_empty(), "server must receive upload frames");
-        assert_eq!(decode_all(&received), all);
+        let mut frames = decode_all(&received);
+        assert!(!frames.is_empty(), "server must receive upload frames");
+        frames.sort_by_key(|(seq, _)| *seq);
+        let seqs: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, (0..frames.len() as u64).collect::<Vec<_>>());
+        let mut decoded = Vec::new();
+        for (_, data) in frames {
+            decoded.extend_from_slice(&data);
+        }
+        assert_eq!(decoded, all);
     }
 
     #[tokio::test]
