@@ -331,6 +331,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
+          cp cronet/LICENSE dist/CHROMIUM-LICENSE
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
