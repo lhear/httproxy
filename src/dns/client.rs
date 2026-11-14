@@ -9,19 +9,19 @@ use domain::{
 };
 use moka::future::Cache;
 use rand::seq::SliceRandom;
-use singleflight_async::SingleFlight;
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use tokio::{
     net::TcpStream,
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
     time::{Instant, timeout},
 };
@@ -34,6 +34,7 @@ use crate::warp::WarpClient;
 
 type CacheKey = (String, u16, Option<IpAddr>);
 type SharedDnsResult = Result<(Vec<IpAddr>, Duration), Arc<anyhow::Error>>;
+type InFlight = HashMap<CacheKey, watch::Receiver<Option<SharedDnsResult>>>;
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -46,9 +47,39 @@ struct CacheEntry {
 pub struct DnsClient {
     config: DnsConfig,
     cache: Cache<CacheKey, CacheEntry>,
-    single_flight: SingleFlight<CacheKey, SharedDnsResult>,
+    in_flight: Mutex<InFlight>,
     semaphore: Arc<Semaphore>,
     transport: Transport,
+}
+
+struct InFlightGuard {
+    client: Weak<DnsClient>,
+    key: CacheKey,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.upgrade() {
+            client
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.key);
+        }
+    }
+}
+
+async fn wait_for_lookup(
+    mut receiver: watch::Receiver<Option<SharedDnsResult>>,
+) -> SharedDnsResult {
+    loop {
+        if let Some(result) = receiver.borrow().clone() {
+            return result;
+        }
+        if receiver.changed().await.is_err() {
+            return Err(Arc::new(anyhow!("DNS lookup task ended without a result")));
+        }
+    }
 }
 
 impl DnsClient {
@@ -66,7 +97,7 @@ impl DnsClient {
                     config.options.max_ttl + config.options.swr_ttl,
                 ))
                 .build(),
-            single_flight: SingleFlight::new(),
+            in_flight: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(config.options.max_concurrent_queries)),
             transport,
         }
@@ -102,12 +133,7 @@ impl DnsClient {
                     );
                     tokio::spawn(async move {
                         debug!("background refresh triggered: {} {:?}", dc, rtype);
-                        let _ = sc
-                            .single_flight
-                            .work(kc.clone(), || async {
-                                sc.query_upstream_and_cache(&dc, rtype, ecs, kc).await
-                            })
-                            .await;
+                        let _ = sc.lookup_uncached(dc, rtype, ecs, kc).await;
                         flag.store(false, Ordering::Release);
                     });
                 }
@@ -116,13 +142,68 @@ impl DnsClient {
             }
         }
 
-        self.single_flight
-            .work(key.clone(), || async {
-                self.query_upstream_and_cache(domain, rtype, ecs, key).await
-            })
+        self.lookup_uncached(domain.to_owned(), rtype, ecs, key)
             .await
             .map(|(ips, _)| ips)
             .map_err(|e| anyhow!("DNS resolution error: {}", e))
+    }
+
+    async fn lookup_uncached(
+        self: &Arc<Self>,
+        domain: String,
+        rtype: Rtype,
+        ecs: Option<IpAddr>,
+        key: CacheKey,
+    ) -> SharedDnsResult {
+        let existing = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        if let Some(receiver) = existing {
+            return wait_for_lookup(receiver).await;
+        }
+
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| Arc::new(anyhow!(error)))?;
+
+        let (receiver, sender, leader) = {
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(receiver) = in_flight.get(&key) {
+                (receiver.clone(), None, false)
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                in_flight.insert(key.clone(), receiver.clone());
+                (receiver, Some(sender), true)
+            }
+        };
+
+        if leader {
+            let sender = sender.expect("leader owns the lookup result sender");
+            let client = Arc::clone(self);
+            let cleanup = Arc::downgrade(self);
+            let cleanup_key = key.clone();
+            tokio::spawn(async move {
+                let _cleanup = InFlightGuard {
+                    client: cleanup,
+                    key: cleanup_key,
+                };
+                let result = client
+                    .query_upstream_and_cache(&domain, rtype, ecs, key, permit)
+                    .await;
+                let _ = sender.send(Some(result));
+            });
+        }
+
+        wait_for_lookup(receiver).await
     }
 
     async fn query_upstream_and_cache(
@@ -131,6 +212,7 @@ impl DnsClient {
         rtype: Rtype,
         ecs: Option<IpAddr>,
         key: CacheKey,
+        _permit: OwnedSemaphorePermit,
     ) -> SharedDnsResult {
         let (ips, ttl) = self
             .query_upstream(domain, rtype, ecs)
@@ -152,8 +234,6 @@ impl DnsClient {
         rtype: Rtype,
         ecs: Option<IpAddr>,
     ) -> Result<(Vec<IpAddr>, Duration)> {
-        let _permit = self.semaphore.acquire().await?;
-
         let mut query = self.build_query(domain, rtype, ecs, 0)?;
 
         let (resp, id) = self.transport.send(&mut query).await?;
@@ -489,6 +569,65 @@ mod tests {
             options: DnsOptions::default(),
         };
         DnsClient::new(&cfg).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn canceled_lookup_does_not_leave_an_in_flight_entry() {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = DnsConfig {
+            upstream: upstream.local_addr().unwrap(),
+            tls_domain: None,
+            options: DnsOptions::default(),
+        };
+        let client = Arc::new(DnsClient::new(&config).await.unwrap());
+        let domain = "cancelled-random-query.example";
+        let lookup = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.lookup(domain, Rtype::A, None).await })
+        };
+
+        let mut query = [0u8; 2048];
+        let (length, peer) =
+            tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut query))
+                .await
+                .unwrap()
+                .unwrap();
+        lookup.abort();
+        let _ = lookup.await;
+
+        let id = u16::from_be_bytes([query[0], query[1]]);
+        let response = make_response_for(
+            id,
+            false,
+            Rcode::NOERROR,
+            60,
+            &[Ipv4Addr::new(192, 0, 2, 1)],
+            domain,
+            Rtype::A,
+        );
+        upstream.send_to(&response, peer).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client
+                .in_flight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed lookup must be removed from the in-flight map");
+        assert!(
+            client
+                .cache
+                .get(&(domain.to_owned(), Rtype::A.to_int(), None))
+                .await
+                .is_some(),
+            "detached query must complete and populate the DNS cache"
+        );
+        assert!(length > 0);
     }
 
     #[tokio::test]

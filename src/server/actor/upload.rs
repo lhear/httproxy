@@ -200,8 +200,8 @@ impl UploadActor {
                 }
                 false
             }
-            UploadPhase::Draining { eos_waiters } => {
-                eos_waiters.push(ack);
+            UploadPhase::Draining { .. } => {
+                let _ = ack.send(Err(ServerError::bad_gateway("upload actor is draining")));
                 false
             }
             UploadPhase::Closed => {
@@ -383,6 +383,27 @@ mod tests {
         drop(tx);
         assert!(ack_rx.await.unwrap().is_err());
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn draining_eos_waiters_are_bounded() {
+        let (_rx, server_write) = tcp_pair().await;
+        let (_tx, rx) = mpsc::channel::<UploadCmd>(MAX_EOS_WAITERS + 2);
+        let mut actor = UploadActor::new(rx, server_write, 0);
+        actor.phase = UploadPhase::Draining {
+            eos_waiters: Vec::new(),
+        };
+
+        for _ in 0..=MAX_EOS_WAITERS {
+            let (ack_tx, mut ack_rx) = oneshot::channel();
+            actor.handle_eos(0, ack_tx);
+            assert!(ack_rx.try_recv().unwrap().is_err());
+        }
+
+        let UploadPhase::Draining { eos_waiters } = &actor.phase else {
+            panic!("actor must remain draining");
+        };
+        assert!(eos_waiters.is_empty());
     }
 
     #[tokio::test]

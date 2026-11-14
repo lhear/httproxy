@@ -13,8 +13,8 @@ use uuid::Uuid;
 use crate::now_secs;
 use crate::server::actor::upload::{UploadActor, UploadCmd};
 use crate::server::constants::{
-    ROTATION_STALENESS, SEGMENT_DONE_CHANNEL_CAPACITY, STREAM_IDLE_TIMEOUT_SECS,
-    UPLOAD_CMD_CHANNEL_CAPACITY,
+    MAX_PENDING_CONTINUES, ROTATION_STALENESS, SEGMENT_DONE_CHANNEL_CAPACITY,
+    STREAM_IDLE_TIMEOUT_SECS, UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::server::stream_registry::StreamRegistry;
 use crate::server::upstream::{UpstreamRead, UpstreamWrite};
@@ -365,8 +365,14 @@ impl TunnelActor {
                         }
                     }
                 }
-                Phase::Active if self.segment_active => {
+                Phase::Active
+                    if self.segment_active
+                        && self.pending_continue.len() < MAX_PENDING_CONTINUES =>
+                {
                     self.pending_continue.push(reply);
+                }
+                Phase::Active if self.segment_active => {
+                    let _ = reply.send(None);
                 }
                 _ => {
                     let _ = reply.send(None);
@@ -568,6 +574,26 @@ mod tests {
 
         drop(cmd_tx);
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn pending_continues_are_bounded() {
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
+        let mut actor = new_rotating_actor(cmd_rx, 1000);
+        actor.phase = Phase::Active;
+        actor.segment_active = true;
+
+        let mut overflow = None;
+        for index in 0..=MAX_PENDING_CONTINUES {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            actor.dispatch_cmd(TunnelCmd::Continue { reply: reply_tx });
+            if index == MAX_PENDING_CONTINUES {
+                overflow = Some(reply_rx);
+            }
+        }
+
+        assert_eq!(actor.pending_continue.len(), MAX_PENDING_CONTINUES);
+        assert!(overflow.unwrap().blocking_recv().unwrap().is_none());
     }
 
     #[tokio::test]

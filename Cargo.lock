@@ -998,7 +998,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "singleflight-async",
  "tokio",
  "tokio-rustls",
  "tokio-socks",
@@ -2029,16 +2028,6 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 dependencies = [
  "digest",
  "rand_core",
-]
-
-[[package]]
-name = "singleflight-async"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffae0d841b8012a86beec66a3f9c57b7b331a10366c764cd40bd6faebe3ad77c"
-dependencies = [
- "parking_lot",
- "tokio",
 ]
 
 [[package]]

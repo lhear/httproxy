@@ -6,6 +6,7 @@ pub const MAX_HANDSHAKE_BODY_SIZE: usize = 2 * MAX_FRAME_BUF_SIZE;
 pub const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PENDING_FRAMES: usize = 8 * 1024;
 pub const MAX_EOS_WAITERS: usize = 256;
+pub const MAX_PENDING_CONTINUES: usize = 256;
 pub const MAX_REORDER_SECS: u64 = 10;
 
 pub const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;

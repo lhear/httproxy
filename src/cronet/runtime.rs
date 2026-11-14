@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::sys::{self, Ptr};
+use super::{Callback, Engine};
 
 const READ_CHUNK: usize = 32 * 1024;
 
@@ -41,6 +42,7 @@ enum Command {
     Resume(usize),
     Close(usize),
     Run(Ptr),
+    Collect,
     Stop,
 }
 
@@ -109,11 +111,13 @@ pub(crate) struct Shared {
 pub(crate) struct Executor {
     shared: Arc<Shared>,
     object: Ptr,
+    engine: Arc<Engine>,
+    callback: Arc<Callback>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Executor {
-    pub(crate) fn new(engine: Ptr, callback: Ptr) -> Result<Arc<Self>> {
+    pub(crate) fn new(engine: Arc<Engine>, callback: Arc<Callback>) -> Result<Arc<Self>> {
         let api = sys::api();
         let (commands, inbox) = unbounded_channel();
         let shared = Arc::new(Shared {
@@ -126,11 +130,11 @@ impl Executor {
             bail!("cronet: executor create failed");
         }
         api.executor_set_context(object, Arc::as_ptr(&shared).cast_mut().cast());
-        api.callback_set_context(callback, Arc::as_ptr(&shared).cast_mut().cast());
+        api.callback_set_context(callback.0, Arc::as_ptr(&shared).cast_mut().cast());
 
         let worker = Worker {
-            engine,
-            callback,
+            engine: engine.0,
+            callback: callback.0,
             executor: object,
             shared: Arc::clone(&shared),
         };
@@ -147,6 +151,8 @@ impl Executor {
         Ok(Arc::new(Self {
             shared,
             object,
+            engine,
+            callback,
             thread: Mutex::new(Some(thread)),
         }))
     }
@@ -164,6 +170,11 @@ impl Executor {
 
     pub(crate) fn close(&self, key: usize) {
         let _ = self.shared.commands.send(Command::Close(key));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn engine(&self) -> Ptr {
+        self.engine.0
     }
 
     pub(crate) fn shutdown(&self) {
@@ -187,7 +198,33 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         self.shutdown();
-        sys::api().executor_destroy(self.object);
+        let api = sys::api();
+        self.engine.shutdown();
+        for (_, slot) in self
+            .shared
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+        {
+            api.request_destroy(slot.request);
+            if let Some((provider, data)) = slot.upload {
+                reclaim(&self.shared, provider, data);
+            }
+        }
+        let mut garbage = self
+            .shared
+            .garbage
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (provider, upload) in garbage.drain(..) {
+            api.upload_destroy(provider);
+            unsafe { drop(Box::from_raw(upload.raw().cast::<Upload>())) };
+        }
+        drop(garbage);
+        api.callback_set_context(self.callback.0, std::ptr::null_mut());
+        api.executor_set_context(self.object, std::ptr::null_mut());
+        api.executor_destroy(self.object);
     }
 }
 
@@ -200,7 +237,21 @@ struct Worker {
 
 impl Worker {
     fn run(self, mut inbox: UnboundedReceiver<Command>) {
-        while let Some(command) = inbox.blocking_recv() {
+        let mut stopping = false;
+        loop {
+            if stopping
+                && self
+                    .shared
+                    .slots
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+            {
+                break;
+            }
+            let Some(command) = inbox.blocking_recv() else {
+                break;
+            };
             match command {
                 Command::Run(runnable) => {
                     let api = sys::api();
@@ -210,9 +261,28 @@ impl Worker {
                 Command::Open { key, events, spec } => self.open(key, events, spec),
                 Command::Resume(key) => self.resume(key),
                 Command::Close(key) => self.close(key),
-                Command::Stop => break,
+                Command::Collect => self.collect(),
+                Command::Stop => {
+                    stopping = true;
+                    self.cancel_all();
+                }
             }
             self.collect();
+        }
+    }
+
+    fn cancel_all(&self) {
+        let api = sys::api();
+        let mut slots = self
+            .shared
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for slot in slots.values_mut() {
+            if !slot.closed {
+                slot.closed = true;
+                api.request_cancel(slot.request);
+            }
         }
     }
 
@@ -356,6 +426,7 @@ impl Worker {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get_mut(&key)
+            && !slot.closed
         {
             slot.closed = true;
             sys::api().request_cancel(slot.request);
@@ -396,6 +467,7 @@ fn finish(shared: &Shared, key: usize, event: Event) -> Option<(Ptr, Ptr)> {
         .remove(&key)?;
     sys::api().request_destroy(slot.request);
     let _ = slot.events.send(event);
+    let _ = shared.commands.send(Command::Collect);
     slot.upload
 }
 
@@ -462,14 +534,18 @@ pub(crate) unsafe extern "C" fn on_read_completed(
 }
 
 pub(crate) unsafe extern "C" fn on_succeeded(callback: Ptr, request: Ptr, _info: Ptr) {
-    if let Some(shared) = shared_of(callback) {
-        let _ = finish(shared, key_of(request), Event::End);
+    if let Some(shared) = shared_of(callback)
+        && let Some((provider, data)) = finish(shared, key_of(request), Event::End)
+    {
+        reclaim(shared, provider, data);
     }
 }
 
 pub(crate) unsafe extern "C" fn on_canceled(callback: Ptr, request: Ptr, _info: Ptr) {
-    if let Some(shared) = shared_of(callback) {
-        let _ = finish(shared, key_of(request), Event::End);
+    if let Some(shared) = shared_of(callback)
+        && let Some((provider, data)) = finish(shared, key_of(request), Event::End)
+    {
+        reclaim(shared, provider, data);
     }
 }
 
@@ -488,7 +564,9 @@ pub(crate) unsafe extern "C" fn on_failed(callback: Ptr, request: Ptr, _info: Pt
         })
     };
     let message = message.unwrap_or_else(|| "cronet: request failed".to_owned());
-    let _ = finish(shared, key_of(request), Event::Fail(message));
+    if let Some((provider, data)) = finish(shared, key_of(request), Event::Fail(message)) {
+        reclaim(shared, provider, data);
+    }
 }
 
 unsafe extern "C" fn execute(object: Ptr, runnable: Ptr) {
@@ -551,10 +629,24 @@ unsafe extern "C" fn upload_close(provider: Ptr) {
     if upload.closed.swap(true, Ordering::AcqRel) {
         return;
     }
+    let shared = &upload.shared;
+    let data = Ptr::new(raw);
+    for slot in shared
+        .slots
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values_mut()
+    {
+        if slot.upload.is_some_and(|(_, slot_data)| slot_data == data) {
+            slot.upload = None;
+            break;
+        }
+    }
     upload
         .shared
         .garbage
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push((provider, Ptr::new(raw)));
+        .push((provider, data));
+    let _ = shared.commands.send(Command::Collect);
 }

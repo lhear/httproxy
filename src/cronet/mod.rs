@@ -8,6 +8,7 @@ use http::StatusCode;
 use std::ffi::{CStr, CString};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -36,22 +37,16 @@ fn build_user_agent(version: &str) -> Option<CString> {
 }
 
 pub struct Client {
-    _engine: Engine,
-    _callback: Callback,
     exec: Arc<Executor>,
 }
 
 impl Client {
     pub fn new(resolve: Option<&str>) -> Result<Arc<Self>> {
         sys::load().map_err(|error| anyhow!(error))?;
-        let engine = Engine::start(resolve)?;
-        let callback = Callback::new()?;
-        let exec = Executor::new(engine.0, callback.0)?;
-        Ok(Arc::new(Self {
-            _engine: engine,
-            _callback: callback,
-            exec,
-        }))
+        let engine = Arc::new(Engine::start(resolve)?);
+        let callback = Arc::new(Callback::new()?);
+        let exec = Executor::new(Arc::clone(&engine), Arc::clone(&callback))?;
+        Ok(Arc::new(Self { exec }))
     }
 
     pub fn post(&self, url: &str) -> RequestBuilder {
@@ -75,13 +70,7 @@ impl Client {
     }
 }
 
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.exec.shutdown();
-    }
-}
-
-struct Engine(Ptr);
+pub(crate) struct Engine(Ptr, AtomicBool);
 
 impl Engine {
     fn start(resolve: Option<&str>) -> Result<Self> {
@@ -115,7 +104,13 @@ impl Engine {
             api.engine_destroy(engine);
             bail!("cronet: engine start failed ({result})");
         }
-        Ok(Self(engine))
+        Ok(Self(engine, AtomicBool::new(false)))
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if !self.1.swap(true, Ordering::AcqRel) {
+            let _ = sys::api().engine_shutdown(self.0);
+        }
     }
 }
 
@@ -131,9 +126,8 @@ fn experimental_options(address: &str) -> Result<CString> {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        let api = sys::api();
-        let _ = api.engine_shutdown(self.0);
-        api.engine_destroy(self.0);
+        self.shutdown();
+        sys::api().engine_destroy(self.0);
     }
 }
 
@@ -364,7 +358,7 @@ mod tests {
             .bytes()
             .await
             .unwrap();
-        let expected = build_user_agent(&engine_version(client._engine.0).unwrap()).unwrap();
+        let expected = build_user_agent(&engine_version(client.exec.engine()).unwrap()).unwrap();
         assert_eq!(&body[..], expected.to_bytes());
     }
 

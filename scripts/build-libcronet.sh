@@ -154,18 +154,18 @@ fetch() {
 
 disable_crel() {
     case "$triple" in
-    aarch64-unknown-linux-*) ;;
+    aarch64-unknown-linux-*|x86_64-unknown-linux-*) ;;
     *) return 0 ;;
     esac
     file=$src/build/config/compiler/BUILD.gn
-    if grep -q 'current_cpu != "arm64" && current_cpu != "s390x"' "$file"; then
+    if grep -q 'current_cpu != "x64" && current_cpu != "arm64" && current_cpu != "s390x"' "$file"; then
         return 0
     fi
     if ! grep -q 'current_cpu != "arm" && current_cpu != "s390x"' "$file"; then
         echo "cannot disable CREL for $triple: $file no longer matches" >&2
         return 1
     fi
-    sed -i 's/current_cpu != "arm" && current_cpu != "s390x"/current_cpu != "arm" \&\& current_cpu != "arm64" \&\& current_cpu != "s390x"/' "$file"
+    sed -i 's/current_cpu != "arm" && current_cpu != "s390x"/current_cpu != "arm" \&\& current_cpu != "x64" \&\& current_cpu != "arm64" \&\& current_cpu != "s390x"/' "$file"
 }
 
 value() {
