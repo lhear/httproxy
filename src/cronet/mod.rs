@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use http::StatusCode;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -13,6 +13,27 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use runtime::{Event, Executor, Spec, next_key};
 use sys::Ptr;
+
+fn engine_version(engine: Ptr) -> Result<String> {
+    let raw = sys::api().engine_version(engine);
+    if raw.is_null() {
+        bail!("cronet: engine reported no version");
+    }
+    Ok(unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn build_user_agent(version: &str) -> Option<CString> {
+    let major = version.split('.').next()?;
+    if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    CString::new(format!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ))
+    .ok()
+}
 
 pub struct Client {
     _engine: Engine,
@@ -70,6 +91,11 @@ impl Engine {
         if engine.is_null() {
             bail!("cronet: engine create failed");
         }
+        let version = engine_version(engine).inspect_err(|_| api.engine_destroy(engine))?;
+        let Some(user_agent) = build_user_agent(&version) else {
+            api.engine_destroy(engine);
+            bail!("cronet: cannot derive a user agent from version {version}");
+        };
         let params = api.engine_params_create();
         if params.is_null() {
             api.engine_destroy(engine);
@@ -79,6 +105,7 @@ impl Engine {
         api.engine_params_http2(params, true);
         api.engine_params_brotli(params, true);
         api.engine_params_cache_mode(params, sys::HTTP_CACHE_DISABLED);
+        api.engine_params_user_agent(params, user_agent.as_ptr());
         if let Some(options) = options {
             api.engine_params_experimental(params, options.as_ptr());
         }
@@ -291,6 +318,54 @@ mod tests {
         })
         .await
         .expect("the runtime still owns requests");
+    }
+
+    #[test]
+    fn derives_the_user_agent_from_the_cronet_version() {
+        assert_eq!(
+            build_user_agent("154.0.8037.49").unwrap().to_str().unwrap(),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+        );
+        assert_eq!(
+            build_user_agent("120.0.6099.109")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        );
+        assert!(build_user_agent("").is_none());
+        assert!(build_user_agent("Cronet").is_none());
+    }
+
+    #[tokio::test]
+    async fn sends_the_browser_user_agent() {
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post(|headers: http::HeaderMap| async move {
+                headers
+                    .get(http::header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let client = Client::new(None).unwrap();
+        let url = format!("http://{address}/");
+        let body = client
+            .post(&url)
+            .body(Bytes::from_static(b"payload"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let expected = build_user_agent(&engine_version(client._engine.0).unwrap()).unwrap();
+        assert_eq!(&body[..], expected.to_bytes());
     }
 
     #[tokio::test]
