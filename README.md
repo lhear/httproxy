@@ -20,60 +20,35 @@ traffic.
 
 ## Getting Started
 
-Requires a stable Rust toolchain.
+Requires a stable Rust toolchain; the client also needs Cronet.
 
 ```bash
 cargo build --release        # → target/release/{client,server}
 ```
 
-The client also needs Cronet: either build it with
-`scripts/build-libcronet.sh` and point `CRONET_LIB_DIR` at the result, or leave
-it out and let the client load `libcronet` at startup.
+### Cronet
 
-### Linking Cronet
+`build.rs` links Cronet statically when `CRONET_LIB_DIR` points at a package
+(`libcronet.a`, or `cronet.lib` on Windows); otherwise the client resolves
+`libcronet` at startup through `CRONET_LIB`, the directory next to the binary,
+or the system library path.
 
-The client talks to Chromium's network stack through Cronet. `build.rs` picks
-one of two modes:
-
-- **Static** — point `CRONET_LIB_DIR` at a directory holding a static archive
-  (`libcronet.a` on Linux/macOS, `cronet.lib` on Windows). The archive is
-  linked into `client`, which then has no runtime dependency.
-- **Runtime loading** — leave `CRONET_LIB_DIR` unset and the client resolves
-  `libcronet` at startup: `CRONET_LIB`, then next to the binary, then the
-  system library path.
-
-Cronet is not vendored here: it is compiled from Chromium's `cronet_static`
-target by `scripts/build-libcronet.sh <target-triple>`. `naiveproxy.lock` pins
-the one tree it comes from; the script checks that commit out, runs the tree's
-own `get-clang.sh` (Chromium's clang, GN, PGO profiles, and the Debian or
-OpenWrt sysroot), generates the build with Chromium's Cronet arguments, links
-`cronet_static`, and packs `libcronet.a`, `cronet.link`, `VERSION` and
-Chromium's `LICENSE` into `cronet/<triple>`:
+Packages come from Chromium's `cronet_static` target, built by
+`scripts/build-libcronet.sh <triple>` from the tree pinned in
+`naiveproxy.lock`: glibc and musl against Debian and OpenWrt sysroots, Android
+against the NDK, macOS and Windows. CI builds every target in
+`.github/workflows/libcronet.yml` and hands the packages to the build jobs.
 
 ```bash
 sh scripts/build-libcronet.sh x86_64-unknown-linux-gnu
 CRONET_LIB_DIR=cronet/x86_64-unknown-linux-gnu cargo build --release
 ```
 
-Linux (glibc against Debian sysroots, musl against OpenWrt SDKs), Android
-against the NDK, macOS and Windows are covered — see the matrix in
-`.github/workflows/libcronet.yml`, which builds every target on each run and
-passes the packages to the build jobs as artifacts. The work tree stays in
-`.cronet-build/` (`CRONET_BUILD_DIR` moves it); `CRONET_DRY_RUN=1` prints a
-target's GN arguments and ninja targets without touching the disk. On Windows
-the package carries both `cronet.dll` and `cronet.lib`: the client links the
-archive and ships as a single 13 MB file, while the DLL stays for anything that
-loads Cronet at runtime instead. `CRONET_WINDOWS_STATIC=0` drops the archive
-from the build.
-
-### Using a prebuilt package
-
-A package from another machine only needs `CRONET_LIB_DIR` pointing at its
-directory; nothing here downloads one. Build it where Chromium can be compiled,
-copy `cronet/<triple>` over, and the target machine needs no toolchain.
-
-A statically linked client grows by tens of megabytes; every artifact ships
-Chromium's licence as `CHROMIUM-LICENSE`. The server needs neither mode.
+On Windows the package holds both `cronet.dll` and `cronet.lib`: the client
+links the archive and ships as a single 13 MB file, and
+`CRONET_WINDOWS_STATIC=0` drops it. A static client grows by tens of megabytes,
+every artifact ships Chromium's licence as `CHROMIUM-LICENSE`, and the server
+needs none of this.
 
 Both binaries read a `config.toml`; every key is documented in
 **[CONFIGURATION.md](CONFIGURATION.md)**.
