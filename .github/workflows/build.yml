@@ -32,6 +32,7 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           key: test-ubuntu
       - name: Check formatting
         run: cargo fmt --check
@@ -72,6 +73,7 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           key: ${{ matrix.target_triple }}
       - name: Install base dependencies
         run: |
@@ -133,6 +135,7 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           key: ${{ matrix.target_triple }}
       - name: Install base dependencies
         run: |
@@ -183,6 +186,7 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           key: ${{ matrix.target_triple }}
       - name: Install dependencies
         run: choco install cmake strawberryperl pkgconfiglite llvm nasm -y
@@ -230,6 +234,7 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           key: ${{ matrix.target_triple }}
       - name: Install dependencies
         run: brew install llvm
@@ -272,6 +277,7 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'pull_request' }}
           key: ${{ matrix.target_triple }}
       - name: Install Android Tools
         run: cargo install cargo-ndk
