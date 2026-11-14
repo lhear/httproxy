@@ -84,8 +84,10 @@ api! {
     engine_destroy: Cronet_Engine_Destroy(engine: Ptr);
     engine_start: Cronet_Engine_StartWithParams(engine: Ptr, params: Ptr) -> i32;
     engine_shutdown: Cronet_Engine_Shutdown(engine: Ptr) -> i32;
+    engine_version: Cronet_Engine_GetVersionString(engine: Ptr) -> CronetString;
     engine_params_create: Cronet_EngineParams_Create() -> Ptr;
     engine_params_destroy: Cronet_EngineParams_Destroy(params: Ptr);
+    engine_params_user_agent: Cronet_EngineParams_user_agent_set(params: Ptr, agent: CronetString);
     engine_params_quic: Cronet_EngineParams_enable_quic_set(params: Ptr, enable: bool);
     engine_params_http2: Cronet_EngineParams_enable_http2_set(params: Ptr, enable: bool);
     engine_params_brotli: Cronet_EngineParams_enable_brotli_set(params: Ptr, enable: bool);
