@@ -152,6 +152,22 @@ fetch() {
     git -C "$work/naiveproxy" checkout --quiet --detach "$commit"
 }
 
+disable_crel() {
+    case "$triple" in
+    aarch64-unknown-linux-*) ;;
+    *) return 0 ;;
+    esac
+    file=$src/build/config/compiler/BUILD.gn
+    if grep -q 'current_cpu != "arm64" && current_cpu != "s390x"' "$file"; then
+        return 0
+    fi
+    if ! grep -q 'current_cpu != "arm" && current_cpu != "s390x"' "$file"; then
+        echo "cannot disable CREL for $triple: $file no longer matches" >&2
+        return 1
+    fi
+    sed -i 's/current_cpu != "arm" && current_cpu != "s390x"/current_cpu != "arm" \&\& current_cpu != "arm64" \&\& current_cpu != "s390x"/' "$file"
+}
+
 value() {
     sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$2" | head -n 1
 }
@@ -209,6 +225,7 @@ prelink() {
 }
 
 fetch
+disable_crel
 
 sysroot=$(cd "$src" && EXTRA_FLAGS="$target" OPENWRT_FLAGS="$openwrt" sh -c '. ./get-sysroot.sh >/dev/null && printf %s "${WITH_SYSROOT:-}"')
 
@@ -270,6 +287,11 @@ dll)
     manifest "$out/obj/components/cronet/cronet_sample.ninja" "$package/cronet.link"
     ;;
 esac
+
+if [ "$elf" = 1 ] && grep -q '\.crel\.' "$package/libcronet.a"; then
+    echo "$package/libcronet.a still holds CREL relocations" >&2
+    exit 1
+fi
 
 cp "$work/naiveproxy/CHROMIUM_VERSION" "$package/VERSION"
 cp "$work/naiveproxy/LICENSE" "$package/LICENSE"

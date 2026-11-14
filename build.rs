@@ -2,6 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    link_android_builtins();
     println!("cargo:rerun-if-env-changed=CRONET_LIB_DIR");
     println!("cargo:rustc-check-cfg=cfg(cronet_static)");
 
@@ -69,6 +70,58 @@ fn emit_linkage(directory: &Path) {
             println!("cargo:rustc-link-lib={name}");
         }
     }
+}
+
+fn link_android_builtins() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
+        return;
+    }
+    let arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "aarch64",
+        Ok("x86_64") => "x86_64",
+        _ => return,
+    };
+    let Some(ndk) = ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK"]
+        .into_iter()
+        .filter_map(env::var_os)
+        .map(PathBuf::from)
+        .find(|path| path.is_dir())
+    else {
+        println!("cargo:warning=Android NDK not found; compiler-rt builtins stay unlinked");
+        return;
+    };
+    match builtins(&ndk, arch) {
+        Some(archive) => println!("cargo:rustc-link-arg={}", archive.display()),
+        None => println!(
+            "cargo:warning=no libclang_rt.builtins-{arch}-android.a under {}",
+            ndk.display()
+        ),
+    }
+}
+
+fn builtins(ndk: &Path, arch: &str) -> Option<PathBuf> {
+    let toolchains = ndk.join("toolchains").join("llvm").join("prebuilt");
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for host in std::fs::read_dir(toolchains).ok()?.flatten() {
+        let versions = host.path().join("lib").join("clang");
+        for version in std::fs::read_dir(versions).ok()?.flatten() {
+            let rank = version
+                .file_name()
+                .to_str()
+                .and_then(|name| name.split('.').next())
+                .and_then(|name| name.parse().ok())
+                .unwrap_or(0);
+            let archive = version
+                .path()
+                .join("lib")
+                .join("linux")
+                .join(format!("libclang_rt.builtins-{arch}-android.a"));
+            if archive.is_file() && newest.as_ref().is_none_or(|(best, _)| rank > *best) {
+                newest = Some((rank, archive));
+            }
+        }
+    }
+    Some(newest?.1)
 }
 
 fn default_libraries() -> &'static [&'static str] {
