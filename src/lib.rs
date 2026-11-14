@@ -18,6 +18,7 @@ pub fn unix_now_secs() -> u64 {
 pub mod bypass;
 pub mod client;
 pub mod config;
+pub mod cronet;
 pub mod crypto;
 pub mod dns;
 pub mod error;
