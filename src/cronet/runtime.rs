@@ -82,6 +82,24 @@ struct Upload {
     closed: AtomicBool,
 }
 
+struct Chunk {
+    buffer: Ptr,
+    length: usize,
+}
+
+impl AsRef<[u8]> for Chunk {
+    fn as_ref(&self) -> &[u8] {
+        let data = sys::api().buffer_data(self.buffer).cast::<u8>();
+        unsafe { std::slice::from_raw_parts(data, self.length) }
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        sys::api().buffer_destroy(self.buffer);
+    }
+}
+
 pub(crate) struct Shared {
     commands: UnboundedSender<Command>,
     slots: Mutex<HashMap<usize, Slot>>,
@@ -422,13 +440,13 @@ pub(crate) unsafe extern "C" fn on_read_completed(
     bytes: u64,
 ) {
     let api = sys::api();
-    let chunk = (bytes > 0).then(|| {
-        let data = api.buffer_data(buffer).cast::<u8>();
-        let capacity = api.buffer_size(buffer) as usize;
-        let length = (bytes as usize).min(capacity);
-        unsafe { Bytes::copy_from_slice(std::slice::from_raw_parts(data, length)) }
-    });
-    api.buffer_destroy(buffer);
+    let chunk = if bytes > 0 {
+        let length = (bytes as usize).min(api.buffer_size(buffer) as usize);
+        Some(Bytes::from_owner(Chunk { buffer, length }))
+    } else {
+        api.buffer_destroy(buffer);
+        None
+    };
 
     let Some(shared) = shared_of(callback) else {
         return;
