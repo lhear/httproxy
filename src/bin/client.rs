@@ -1,4 +1,3 @@
-use anyhow::Context;
 use clap::Parser;
 use std::fs;
 use std::sync::Arc;
@@ -32,28 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = config.client.listen.parse()?;
     let listener = TcpListener::bind(addr).await?;
 
-    let remote_url: url::Url = state.remote_str.parse()?;
-    let domain = remote_url.host_str().context("No domain in remote URL")?;
-    let final_addr = config
-        .client
-        .address
-        .clone()
-        .unwrap_or_else(|| domain.to_string());
-
-    let http_client = Arc::new(
-        wreq::Client::builder()
-            .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(45))
-            .tcp_keepalive_interval(Duration::from_secs(45))
-            .pool_idle_timeout(Duration::from_secs(300))
-            .pool_max_idle_per_host(6)
-            .emulation(httproxy::client::chrome_emulation())
-            .no_proxy()
-            .dns_resolver(Arc::new(httproxy::client::state::ManualResolver {
-                target_addr: final_addr,
-            }))
-            .build()?,
-    );
+    let http_client = httproxy::client::build_http_client(&config)?;
 
     info!(listen = %addr, "proxy listening");
 

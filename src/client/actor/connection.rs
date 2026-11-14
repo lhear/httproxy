@@ -10,15 +10,16 @@ use crate::client::constants::{
 };
 use crate::client::proxy;
 use crate::client::state::SharedState;
+use crate::cronet::Client;
 
 pub struct ClientConnectionActor {
     socket: Option<TcpStream>,
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
 }
 
 impl ClientConnectionActor {
-    pub fn new(socket: TcpStream, http_client: Arc<wreq::Client>, state: Arc<SharedState>) -> Self {
+    pub fn new(socket: TcpStream, http_client: Arc<Client>, state: Arc<SharedState>) -> Self {
         socket.set_nodelay(true).ok();
         Self {
             socket: Some(socket),
@@ -206,8 +207,8 @@ mod tests {
         addr
     }
 
-    fn test_client() -> Arc<wreq::Client> {
-        Arc::new(wreq::Client::builder().no_proxy().build().unwrap())
+    fn test_client() -> Arc<Client> {
+        Client::new(None).unwrap()
     }
 
     #[tokio::test]

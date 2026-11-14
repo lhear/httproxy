@@ -8,6 +8,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::client::constants::{MIN_PADDING, PADDING_POOL};
+use crate::cronet::Response;
 use crate::shaper::{self, FrameCipher};
 
 #[inline]
@@ -140,10 +141,7 @@ pub fn is_silent_error(root: &(dyn std::error::Error + 'static)) -> bool {
         .contains("connection closed during header parsing")
 }
 
-pub(crate) async fn check_response_status(
-    response: wreq::Response,
-    context: &str,
-) -> Result<wreq::Response> {
+pub(crate) async fn check_response_status(response: Response, context: &str) -> Result<Response> {
     if !response.status().is_success() {
         let status = response.status();
         let _ = response.bytes().await;

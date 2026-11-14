@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
@@ -9,33 +8,10 @@ use zeroize::Zeroizing;
 use crate::bypass::BypassRules;
 use crate::client::constants::MASTER_RESUME_WINDOW_SECS;
 use crate::client::handshake::{self, PqSessionTicket};
+use crate::cronet::Client;
 use crate::shaper::{ResolvedShaperConfig, TrafficConfig};
 
 pub type InitialMasterEntry = (String, Zeroizing<[u8; 32]>, u64);
-
-pub struct ManualResolver {
-    pub target_addr: String,
-}
-
-impl wreq::dns::Resolve for ManualResolver {
-    fn resolve(&self, _name: wreq::dns::Name) -> wreq::dns::Resolving {
-        let target = self.target_addr.clone();
-        Box::pin(async move {
-            let mut lookup_str = String::with_capacity(target.len() + 2);
-            lookup_str.push_str(&target);
-            lookup_str.push_str(":0");
-            let addrs = tokio::net::lookup_host(lookup_str)
-                .await?
-                .map(|mut s| {
-                    s.set_port(0);
-                    s
-                })
-                .collect::<Vec<_>>();
-            Ok(Box::new(addrs.into_iter())
-                as Box<dyn Iterator<Item = SocketAddr> + Send + 'static>)
-        })
-    }
-}
 
 pub struct SharedState {
     pub remote_str: String,
@@ -103,7 +79,7 @@ impl ClientPqFsm {
 
     pub async fn run(
         mut self,
-        http_client: Arc<wreq::Client>,
+        http_client: Arc<Client>,
         state: Arc<SharedState>,
     ) -> anyhow::Result<()> {
         loop {
@@ -170,7 +146,7 @@ impl ClientPqFsm {
     #[allow(clippy::result_large_err)]
     async fn try_resume(
         resuming: Resuming,
-        http_client: &Arc<wreq::Client>,
+        http_client: &Arc<Client>,
         state: &Arc<SharedState>,
     ) -> std::result::Result<(), (Resuming, anyhow::Error)> {
         let mut read_half = resuming.read_half;

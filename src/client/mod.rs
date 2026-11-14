@@ -9,6 +9,7 @@ pub mod utils;
 
 use crate::client::constants::{MAX_IN_FLIGHT_BYTES, MAX_LOCAL_CONNECTIONS, UPLOAD_CONCURRENCY};
 use crate::config::ClientTopConfig;
+use crate::cronet::Client;
 use crate::crypto;
 use crate::shaper::ResolvedShaperConfig;
 
@@ -17,10 +18,8 @@ use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-pub fn chrome_emulation() -> wreq_util::Emulation {
-    wreq_util::Emulation::builder()
-        .profile(wreq_util::Profile::Chrome149)
-        .build()
+pub fn build_http_client(cfg: &ClientTopConfig) -> Result<Arc<Client>> {
+    Client::new(cfg.client.address.as_deref()).context("failed to start cronet engine")
 }
 
 pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {

@@ -88,7 +88,7 @@ padding_threshold = 500
 | --------------------- | ------- | -------- | ----------- | ----------- |
 | `listen`              | string  | yes      | —           | Local listen address, e.g. `"127.0.0.1:8080"`. |
 | `remote`              | string  | yes      | —           | Server URL including the hidden path. |
-| `address`             | string  | no       | host of `remote` | Connection address override. TLS SNI and `Host` still use the `remote` domain. |
+| `address`             | string  | no       | system DNS  | Connection address override. TLS SNI and `Host` still use the `remote` domain. |
 | `public_key`          | string  | yes      | —           | Server's ML-KEM-768 encapsulation key; required for the tunnel handshake. |
 | `proxy_auth`          | table   | no       | —           | Local proxy authentication (§2.2). |
 | `max_connections`     | integer | no       | `1024`      | Concurrent local connections; excess are refused. |

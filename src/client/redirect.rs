@@ -9,6 +9,7 @@ use tracing::{Instrument, debug, info, warn};
 use crate::client::connection::open_tunnel;
 use crate::client::state::SharedState;
 use crate::config::RedirectSection;
+use crate::cronet::Client;
 
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -57,7 +58,7 @@ impl RedirectRule {
 
 pub async fn spawn(
     rule: RedirectRule,
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
     conn_sem: Arc<Semaphore>,
 ) -> Result<SocketAddr> {
@@ -127,7 +128,7 @@ pub async fn spawn(
 async fn serve(
     socket: TcpStream,
     target: &str,
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
 ) -> Result<()> {
     socket.set_nodelay(true).ok();

@@ -8,11 +8,12 @@ use tracing::info;
 
 use crate::client::state::ClientPqFsm;
 use crate::client::{constants::WRITE_STALL_TIMEOUT, state::SharedState};
+use crate::cronet::Client;
 
 pub(crate) async fn open_tunnel(
     read_half: OwnedReadHalf,
     write_half: OwnedWriteHalf,
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
     payload: Bytes,
     target_host: &str,
@@ -39,7 +40,7 @@ pub(crate) async fn open_tunnel(
 
 pub async fn handle_connection_actor(
     socket: TcpStream,
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
 ) -> Result<()> {
     use crate::client::actor::connection::ClientConnectionActor;

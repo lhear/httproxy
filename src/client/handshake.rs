@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use http_body_util::BodyExt;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tracing::{Instrument, info};
@@ -11,6 +10,7 @@ use zeroize::Zeroizing;
 use crate::client::actor::download_loop::DownloadLoopActor;
 use crate::client::actor::upload_loop::UploadLoopActor;
 use crate::client::utils;
+use crate::cronet::Client;
 use crate::crypto::{self, AesFrameCipher, TlsInspector};
 use crate::shaper::{self, MAX_RAW_PAYLOAD, ShaperStream};
 
@@ -34,7 +34,7 @@ impl std::fmt::Display for RehandshakeRequired {
 impl std::error::Error for RehandshakeRequired {}
 
 pub async fn try_pq_connect(
-    http_client: &Arc<wreq::Client>,
+    http_client: &Arc<Client>,
     state: &Arc<SharedState>,
     ticket: &PqSessionTicket,
     target_host: &str,
@@ -86,7 +86,7 @@ pub async fn try_pq_connect(
         http_client
             .post(state.remote_str.as_str())
             .header("Cookie", &session_cookie)
-            .body(wreq::Body::from(early_data))
+            .body(early_data)
             .send(),
     )
     .await
@@ -143,7 +143,7 @@ pub async fn try_pq_connect(
 }
 
 pub async fn perform_pq_handshake(
-    http_client: &wreq::Client,
+    http_client: &Client,
     state: &SharedState,
     server_pk: &crypto::EncapsulationKey,
 ) -> Result<PqSessionTicket> {
@@ -197,7 +197,7 @@ pub async fn perform_pq_handshake(
         DOWNLOAD_CONNECT_TIMEOUT,
         http_client
             .post(state.remote_str.as_str())
-            .body(wreq::Body::from(handshake_body))
+            .body(Bytes::from(handshake_body))
             .send(),
     )
     .await
@@ -207,7 +207,7 @@ pub async fn perform_pq_handshake(
     let response = utils::check_response_status(response, "server rejected handshake").await?;
 
     let mut body_buf = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
-    let mut stream = response.into_data_stream();
+    let mut stream = response.into_body();
     let server_hello_data = loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
@@ -220,7 +220,7 @@ pub async fn perform_pq_handshake(
                     break data;
                 }
             }
-            Some(Err(e)) => return Err(e.into()),
+            Some(Err(e)) => return Err(e),
             None => return Err(anyhow!("ServerHello not received")),
         }
     };
@@ -265,7 +265,7 @@ pub async fn perform_pq_handshake(
 }
 
 pub async fn full_handshake(
-    http_client: &Arc<wreq::Client>,
+    http_client: &Arc<Client>,
     state: &Arc<SharedState>,
     server_pk: &crypto::EncapsulationKey,
     target_host: &str,
