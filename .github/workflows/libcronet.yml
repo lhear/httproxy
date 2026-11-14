@@ -1,0 +1,68 @@
+name: libcronet
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {triple: x86_64-unknown-linux-gnu, os: ubuntu-22.04}
+          - {triple: aarch64-unknown-linux-gnu, os: ubuntu-22.04}
+          - {triple: x86_64-unknown-linux-musl, os: ubuntu-22.04}
+          - {triple: aarch64-unknown-linux-musl, os: ubuntu-22.04}
+          - {triple: x86_64-apple-darwin, os: macos-latest}
+          - {triple: aarch64-apple-darwin, os: macos-latest}
+          - {triple: x86_64-pc-windows-msvc, os: windows-2022}
+          - {triple: aarch64-pc-windows-msvc, os: windows-2022}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Restore the package
+        id: package
+        uses: actions/cache@v4
+        with:
+          path: cronet/${{ matrix.triple }}
+          key: cronet-package-${{ matrix.triple }}-${{ hashFiles('naiveproxy.lock', 'scripts/build-libcronet.sh') }}-v1
+      - name: Cache the toolchain
+        if: steps.package.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cronet-build/naiveproxy/src/third_party/llvm-build
+            .cronet-build/naiveproxy/src/gn
+            .cronet-build/naiveproxy/src/out/sysroot-build
+          key: cronet-${{ runner.os }}-${{ hashFiles('naiveproxy.lock') }}-v1
+      - name: Install ninja
+        if: steps.package.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+          Linux)
+            sudo apt-get update
+            sudo apt-get install -y ninja-build ccache zstd xz-utils
+            ;;
+          macOS)
+            brew install ninja ccache
+            ;;
+          Windows)
+            choco install ninja -y --no-progress
+            if ! command -v xz >/dev/null 2>&1; then
+              curl -fsSL -o xz.zip https://tukaani.org/xz/xz-5.6.4-windows.zip
+              unzip -q xz.zip -d xz
+              echo "$PWD/xz/bin_x86-64" >> "$GITHUB_PATH"
+            fi
+            ;;
+          esac
+      - name: Build
+        if: steps.package.outputs.cache-hit != 'true'
+        shell: bash
+        run: sh scripts/build-libcronet.sh ${{ matrix.triple }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: libcronet-${{ matrix.triple }}
+          path: cronet/${{ matrix.triple }}

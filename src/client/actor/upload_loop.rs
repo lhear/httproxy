@@ -13,6 +13,7 @@ use crate::client::constants::{
     BATCH_BUF_INITIAL_CAPACITY, MAX_BATCH_BYTES, UPLOAD_REQUEST_TIMEOUT,
 };
 use crate::client::utils;
+use crate::cronet::Client;
 use crate::shaper::{self, ShaperStream};
 
 enum Phase {
@@ -22,7 +23,7 @@ enum Phase {
 }
 
 pub struct UploadLoopActor {
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
     stream_id: Uuid,
     shaped: ShaperStream,
@@ -38,7 +39,7 @@ pub struct UploadLoopActor {
 
 impl UploadLoopActor {
     pub fn new(
-        http_client: Arc<wreq::Client>,
+        http_client: Arc<Client>,
         state: Arc<SharedState>,
         shaped: ShaperStream,
         stream_id: Uuid,
@@ -206,7 +207,7 @@ impl UploadLoopActor {
 
 #[inline]
 async fn send_upload_post(
-    http_client: &wreq::Client,
+    http_client: &Client,
     state: &SharedState,
     body: Bytes,
     stream_id: Uuid,
@@ -220,13 +221,10 @@ async fn send_upload_post(
         .header("Cache-Control", "no-store, no-transform")
         .header("Content-Type", "application/octet-stream")
         .header("Cookie", cookie);
-    let response = tokio::time::timeout(
-        UPLOAD_REQUEST_TIMEOUT,
-        req.body(wreq::Body::from(body)).send(),
-    )
-    .await
-    .context("upload POST timed out")?
-    .context("http post failed")?;
+    let response = tokio::time::timeout(UPLOAD_REQUEST_TIMEOUT, req.body(body).send())
+        .await
+        .context("upload POST timed out")?
+        .context("http post failed")?;
     let response = utils::check_response_status(response, "upstream rejected upload").await?;
     response.bytes().await.context("drain upload response")?;
     Ok(())
@@ -356,8 +354,8 @@ mod tests {
         decoded
     }
 
-    fn test_client() -> Arc<wreq::Client> {
-        Arc::new(wreq::Client::builder().no_proxy().build().unwrap())
+    fn test_client() -> Arc<Client> {
+        Client::new(None).unwrap()
     }
 
     async fn tcp_pair() -> (tokio::net::tcp::OwnedReadHalf, TcpStream) {

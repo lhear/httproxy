@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::StreamExt;
-use http_body_util::BodyExt;
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::sync::Arc;
@@ -18,19 +17,20 @@ use crate::client::constants::{
     PREFETCH_ROTATE_TIMEOUT, WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT, WRITE_STALL_TIMEOUT,
 };
 use crate::client::utils;
+use crate::cronet::{Client, Response};
 use crate::shaper::{self, DecodedFrame, EncodingType, FrameCipher};
 
 enum Phase {
     Streaming {
-        response: Box<wreq::Response>,
+        response: Box<Response>,
         expected_seq: u64,
         prefetch_at: Option<u64>,
         prefetch_trigger: Option<oneshot::Sender<()>>,
-        prefetch_rx: Option<oneshot::Receiver<Result<wreq::Response>>>,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
     },
     Rotating {
         expected_seq: u64,
-        prefetch_rx: Option<oneshot::Receiver<Result<wreq::Response>>>,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
     },
     Done,
 }
@@ -40,7 +40,7 @@ pub struct DownloadLoopActor {
     cipher: Arc<dyn FrameCipher>,
     encoding: EncodingType,
     stream_id: Uuid,
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
     max_bytes: Option<u64>,
     phase: Phase,
@@ -179,11 +179,11 @@ impl DecodeBuffers {
 
 impl DownloadLoopActor {
     pub fn new(
-        initial_response: wreq::Response,
+        initial_response: Response,
         write_half: OwnedWriteHalf,
         cipher: Arc<dyn FrameCipher>,
         stream_id: Uuid,
-        http_client: Arc<wreq::Client>,
+        http_client: Arc<Client>,
         state: Arc<SharedState>,
     ) -> Self {
         let encoding = state.traffic_config.encoding_type;
@@ -251,11 +251,11 @@ impl DownloadLoopActor {
 
     async fn do_streaming(
         &mut self,
-        response: wreq::Response,
+        response: Response,
         expected_seq: u64,
         prefetch_at: Option<u64>,
         prefetch_trigger: Option<oneshot::Sender<()>>,
-        prefetch_rx: Option<oneshot::Receiver<Result<wreq::Response>>>,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
     ) -> Result<Phase> {
         let (bytes, next_seq) = self
             .drain_response(response, expected_seq, prefetch_at, prefetch_trigger)
@@ -274,14 +274,14 @@ impl DownloadLoopActor {
 
     async fn drain_response(
         &mut self,
-        response: wreq::Response,
+        response: Response,
         mut expected_seq: u64,
         prefetch_at: Option<u64>,
         mut prefetch_trigger: Option<oneshot::Sender<()>>,
     ) -> Result<(u64, u64)> {
         let flush_deadline = tokio::time::sleep(WRITE_FLUSH_TIMEOUT);
         tokio::pin!(flush_deadline);
-        let mut data_stream = response.into_data_stream();
+        let mut data_stream = response.into_body();
         let mut bytes_received: u64 = 0;
 
         loop {
@@ -334,7 +334,7 @@ impl DownloadLoopActor {
     async fn do_rotate(
         &mut self,
         expected_seq: u64,
-        prefetch_rx: Option<oneshot::Receiver<Result<wreq::Response>>>,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
     ) -> Result<Phase> {
         let response = if let Some(rx) = prefetch_rx {
             tokio::pin!(rx);
@@ -387,10 +387,10 @@ impl DownloadLoopActor {
 }
 
 async fn send_continue_request(
-    http_client: &wreq::Client,
+    http_client: &Client,
     state: &SharedState,
     stream_id: Uuid,
-) -> Result<wreq::Response> {
+) -> Result<Response> {
     let mut cookie = String::new();
     utils::build_stream_cookie(&mut cookie, stream_id);
     let req = http_client
@@ -405,13 +405,10 @@ async fn send_continue_request(
 }
 
 fn spawn_prefetch_continuation(
-    http_client: &Arc<wreq::Client>,
+    http_client: &Arc<Client>,
     state: &Arc<SharedState>,
     stream_id: Uuid,
-) -> (
-    oneshot::Sender<()>,
-    oneshot::Receiver<Result<wreq::Response>>,
-) {
+) -> (oneshot::Sender<()>, oneshot::Receiver<Result<Response>>) {
     let (trigger_tx, trigger_rx) = oneshot::channel();
     let (result_tx, result_rx) = oneshot::channel();
     let pre_client = Arc::clone(http_client);

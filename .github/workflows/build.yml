@@ -19,8 +19,12 @@ jobs:
         with:
           command: check licenses
 
-  test:
+  libcronet:
     needs: lint-audit
+    uses: ./.github/workflows/libcronet.yml
+
+  test:
+    needs: [lint-audit, libcronet]
     name: cargo test (unit + integration)
     runs-on: ubuntu-latest
     steps:
@@ -33,11 +37,18 @@ jobs:
         run: cargo fmt --check
       - name: Lint with clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Fetch libcronet
+        uses: actions/download-artifact@v8
+        with:
+          name: libcronet-x86_64-unknown-linux-gnu
+          path: cronet
+      - name: Point the loader at it
+        run: echo "CRONET_LIB=$PWD/cronet/libcronet.so" >> "$GITHUB_ENV"
       - name: Run tests
         run: cargo test --all-targets
 
   linux-gnu:
-    needs: [lint-audit, test]
+    needs: [lint-audit, test, libcronet]
     name: Build Linux (GNU)
     runs-on: ubuntu-latest
     strategy:
@@ -71,6 +82,13 @@ jobs:
         run: sudo apt-get install -y ${{ matrix.apt_packages }}
       - name: Add Rust target
         run: rustup target add ${{ matrix.target_triple }}
+      - name: Fetch libcronet
+        uses: actions/download-artifact@v8
+        with:
+          name: libcronet-${{ matrix.target_triple }}
+          path: cronet
+      - name: Point the build at it
+        run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
         env: ${{ matrix.custom_env }}
         run: cargo build --release --target ${{ matrix.target_triple }}
@@ -79,6 +97,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
+          cp cronet/LICENSE dist/CHROMIUM-LICENSE
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
@@ -86,7 +105,7 @@ jobs:
           path: dist/
 
   linux-musl:
-    needs: [lint-audit, test]
+    needs: [lint-audit, test, libcronet]
     name: Build Linux (musl)
     runs-on: ubuntu-latest
     strategy:
@@ -126,6 +145,13 @@ jobs:
           echo "/opt/${{ matrix.package }}/bin/" >> $GITHUB_PATH
       - name: Add Rust target
         run: rustup target add ${{ matrix.target_triple }}
+      - name: Fetch libcronet
+        uses: actions/download-artifact@v8
+        with:
+          name: libcronet-${{ matrix.target_triple }}
+          path: cronet
+      - name: Point the build at it
+        run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
         env: ${{ matrix.custom_env }}
         run: cargo build --release --target ${{ matrix.target_triple }}
@@ -134,6 +160,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
+          cp cronet/LICENSE dist/CHROMIUM-LICENSE
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
@@ -141,7 +168,7 @@ jobs:
           path: dist/
 
   windows:
-    needs: [lint-audit, test]
+    needs: [lint-audit, test, libcronet]
     name: Build Windows
     runs-on: windows-latest
     strategy:
@@ -160,6 +187,14 @@ jobs:
       - name: Install dependencies
         run: choco install cmake strawberryperl pkgconfiglite llvm nasm -y
         shell: cmd
+      - name: Fetch libcronet
+        uses: actions/download-artifact@v8
+        with:
+          name: libcronet-${{ matrix.target_triple }}
+          path: cronet
+      - name: Point the build at it
+        shell: bash
+        run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
@@ -172,6 +207,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item "target\${{ matrix.target_triple }}\release\client.exe" -Destination dist\
           Copy-Item "target\${{ matrix.target_triple }}\release\server.exe" -Destination dist\
+          Copy-Item "cronet\LICENSE" -Destination dist\CHROMIUM-LICENSE
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
@@ -179,7 +215,7 @@ jobs:
           path: dist/
 
   darwin:
-    needs: [lint-audit, test]
+    needs: [lint-audit, test, libcronet]
     name: Build Darwin
     runs-on: macos-latest
     strategy:
@@ -199,6 +235,13 @@ jobs:
         run: brew install llvm
       - name: Add Rust target
         run: rustup target add ${{ matrix.target_triple }}
+      - name: Fetch libcronet
+        uses: actions/download-artifact@v8
+        with:
+          name: libcronet-${{ matrix.target_triple }}
+          path: cronet
+      - name: Point the build at it
+        run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release --target ${{ matrix.target_triple }}
       - name: Archive
@@ -206,6 +249,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target_triple }}/release/client dist/
           cp target/${{ matrix.target_triple }}/release/server dist/
+          cp cronet/LICENSE dist/CHROMIUM-LICENSE
       - name: Upload
         uses: actions/upload-artifact@v6
         with:
@@ -262,6 +306,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
+          pattern: httproxy-*
       - name: Final Packaging
         run: |
           mkdir final_dist
