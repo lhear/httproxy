@@ -89,6 +89,20 @@ jobs:
         with:
           name: libcronet-${{ matrix.target_triple }}
           path: cronet
+      - name: Link with lld
+        if: ${{ matrix.target == 'arm64' }}
+        env: ${{ matrix.custom_env }}
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+          prefix=${CC%-gcc}
+          mkdir -p "$HOME/lld"
+          printf '#!/bin/sh\nexec "%s/rust-lld" -flavor gnu "$@"\n' "$bin" > "$HOME/lld/lld-wrapper"
+          chmod +x "$HOME/lld/lld-wrapper"
+          ln -sf lld-wrapper "$HOME/lld/ld"
+          ln -sf lld-wrapper "$HOME/lld/$prefix-ld"
+          echo "$HOME/lld" >> "$GITHUB_PATH"
+          echo "RUSTFLAGS=-C link-arg=-B$HOME/lld" >> "$GITHUB_ENV"
       - name: Point the build at it
         run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
@@ -153,6 +167,20 @@ jobs:
         with:
           name: libcronet-${{ matrix.target_triple }}
           path: cronet
+      - name: Link with lld
+        if: ${{ matrix.target == 'arm64' }}
+        env: ${{ matrix.custom_env }}
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+          prefix=${CC%-gcc}
+          mkdir -p "$HOME/lld"
+          printf '#!/bin/sh\nexec "%s/rust-lld" -flavor gnu "$@"\n' "$bin" > "$HOME/lld/lld-wrapper"
+          chmod +x "$HOME/lld/lld-wrapper"
+          ln -sf lld-wrapper "$HOME/lld/ld"
+          ln -sf lld-wrapper "$HOME/lld/$prefix-ld"
+          echo "$HOME/lld" >> "$GITHUB_PATH"
+          echo "RUSTFLAGS=-C link-arg=-B$HOME/lld" >> "$GITHUB_ENV"
       - name: Point the build at it
         run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
@@ -198,7 +226,7 @@ jobs:
           path: cronet
       - name: Point the build at it
         shell: bash
-        run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
+        run: echo "CRONET_LIB_DIR=$(cygpath -w "$PWD/cronet")" >> "$GITHUB_ENV"
       - name: Build
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
@@ -288,6 +316,12 @@ jobs:
         with:
           name: libcronet-${{ matrix.target_triple }}
           path: cronet
+      - name: Select the NDK
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -n "$ndk" ]; then
+            echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          fi
       - name: Point the build at it
         run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
