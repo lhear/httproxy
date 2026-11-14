@@ -55,15 +55,16 @@ sh scripts/build-libcronet.sh x86_64-unknown-linux-gnu
 CRONET_LIB_DIR=cronet/x86_64-unknown-linux-gnu cargo build --release
 ```
 
-Linux (glibc against Debian sysroots, musl against OpenWrt SDKs), macOS and
-Windows are covered — see the matrix in `.github/workflows/libcronet.yml`,
-which builds every target on each run and passes the packages to the build jobs
-as artifacts. The work tree stays in `.cronet-build/` (`CRONET_BUILD_DIR` moves
-it); `CRONET_DRY_RUN=1` prints a target's GN arguments and ninja targets
-without touching the disk. On Windows the package carries both `cronet.dll` and
-`cronet.lib`: the client links the archive and ships as a single 13 MB file,
-while the DLL stays for anything that loads Cronet at runtime instead.
-`CRONET_WINDOWS_STATIC=0` drops the archive from the build.
+Linux (glibc against Debian sysroots, musl against OpenWrt SDKs), Android
+against the NDK, macOS and Windows are covered — see the matrix in
+`.github/workflows/libcronet.yml`, which builds every target on each run and
+passes the packages to the build jobs as artifacts. The work tree stays in
+`.cronet-build/` (`CRONET_BUILD_DIR` moves it); `CRONET_DRY_RUN=1` prints a
+target's GN arguments and ninja targets without touching the disk. On Windows
+the package carries both `cronet.dll` and `cronet.lib`: the client links the
+archive and ships as a single 13 MB file, while the DLL stays for anything that
+loads Cronet at runtime instead. `CRONET_WINDOWS_STATIC=0` drops the archive
+from the build.
 
 ### Using a prebuilt package
 

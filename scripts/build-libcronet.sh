@@ -48,6 +48,14 @@ aarch64-unknown-linux-musl)
     openwrt='arch=aarch64_generic release=24.10.0 gcc_ver=13.3.0 target=layerscape subtarget=armv8_64b'
     elf=1
     ;;
+x86_64-linux-android)
+    target='target_os="android" target_cpu="x64" is_desktop_android=true default_min_sdk_version=24 is_high_end_android=true'
+    elf=1
+    ;;
+aarch64-linux-android)
+    target='target_os="android" target_cpu="arm64" is_desktop_android=true default_min_sdk_version=24 is_high_end_android=true'
+    elf=1
+    ;;
 x86_64-apple-darwin)
     target='target_os="mac" target_cpu="x64"'
     mac=1

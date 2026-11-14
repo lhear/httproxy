@@ -257,7 +257,7 @@ jobs:
           path: dist/
 
   android:
-    needs: [lint-audit, test]
+    needs: [lint-audit, test, libcronet]
     name: Build Android
     runs-on: ubuntu-latest
     strategy:
@@ -277,6 +277,13 @@ jobs:
         run: cargo install cargo-ndk
       - name: Add Rust target
         run: rustup target add ${{ matrix.target_triple }}
+      - name: Fetch libcronet
+        uses: actions/download-artifact@v8
+        with:
+          name: libcronet-${{ matrix.target_triple }}
+          path: cronet
+      - name: Point the build at it
+        run: echo "CRONET_LIB_DIR=$PWD/cronet" >> "$GITHUB_ENV"
       - name: Build
         run: cargo ndk --target ${{ matrix.target_triple }} --platform 28 build --release
       - name: Archive
