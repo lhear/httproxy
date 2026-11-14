@@ -4,10 +4,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use bytes::Bytes;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+use crate::cronet::{Client, RequestBuilder};
 
 const API_URL: &str = "https://api.cloudflareclient.com";
 const API_VERSION: &str = "v0a4471";
@@ -112,10 +115,7 @@ async fn save(path: &Path, creds: &WarpCredentials) -> Result<()> {
 }
 
 async fn register(opts: &RegisterOptions<'_>) -> Result<WarpCredentials> {
-    let client = wreq::Client::builder()
-        .no_proxy()
-        .build()
-        .context("warp: build http client")?;
+    let client = Client::new(None).context("warp: build http client")?;
 
     let mut wg_key = [0u8; 32];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut wg_key);
@@ -321,16 +321,15 @@ struct ApiErrorItem {
     message: String,
 }
 
-fn json_body(value: &serde_json::Value) -> Result<wreq::Body> {
-    Ok(wreq::Body::from(serde_json::to_vec(value)?))
+fn json_body(value: &serde_json::Value) -> Result<Bytes> {
+    Ok(Bytes::from(serde_json::to_vec(value)?))
 }
 
-async fn send(req: wreq::RequestBuilder, stage: &str) -> Result<AccountData> {
+async fn send(req: RequestBuilder, stage: &str) -> Result<AccountData> {
     let req = req
         .header("User-Agent", USER_AGENT)
         .header("CF-Client-Version", CLIENT_VERSION)
-        .header("Content-Type", "application/json; charset=UTF-8")
-        .header("Connection", "Keep-Alive");
+        .header("Content-Type", "application/json; charset=UTF-8");
 
     let response = tokio::time::timeout(API_TIMEOUT, req.send())
         .await

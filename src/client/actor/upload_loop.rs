@@ -13,6 +13,7 @@ use crate::client::constants::{
     BATCH_BUF_INITIAL_CAPACITY, MAX_BATCH_BYTES, UPLOAD_REQUEST_TIMEOUT,
 };
 use crate::client::utils;
+use crate::cronet::Client;
 use crate::shaper::{self, ShaperStream};
 
 enum Phase {
@@ -22,7 +23,7 @@ enum Phase {
 }
 
 pub struct UploadLoopActor {
-    http_client: Arc<wreq::Client>,
+    http_client: Arc<Client>,
     state: Arc<SharedState>,
     stream_id: Uuid,
     shaped: ShaperStream,
@@ -38,7 +39,7 @@ pub struct UploadLoopActor {
 
 impl UploadLoopActor {
     pub fn new(
-        http_client: Arc<wreq::Client>,
+        http_client: Arc<Client>,
         state: Arc<SharedState>,
         shaped: ShaperStream,
         stream_id: Uuid,
@@ -206,7 +207,7 @@ impl UploadLoopActor {
 
 #[inline]
 async fn send_upload_post(
-    http_client: &wreq::Client,
+    http_client: &Client,
     state: &SharedState,
     body: Bytes,
     stream_id: Uuid,
@@ -220,13 +221,10 @@ async fn send_upload_post(
         .header("Cache-Control", "no-store, no-transform")
         .header("Content-Type", "application/octet-stream")
         .header("Cookie", cookie);
-    let response = tokio::time::timeout(
-        UPLOAD_REQUEST_TIMEOUT,
-        req.body(wreq::Body::from(body)).send(),
-    )
-    .await
-    .context("upload POST timed out")?
-    .context("http post failed")?;
+    let response = tokio::time::timeout(UPLOAD_REQUEST_TIMEOUT, req.body(body).send())
+        .await
+        .context("upload POST timed out")?
+        .context("http post failed")?;
     let response = utils::check_response_status(response, "upstream rejected upload").await?;
     response.bytes().await.context("drain upload response")?;
     Ok(())
@@ -335,7 +333,7 @@ mod tests {
         (addr, stop_tx, handle)
     }
 
-    fn decode_all(received: &[u8]) -> Vec<u8> {
+    fn decode_all(received: &[u8]) -> Vec<(u64, Bytes)> {
         let cipher = test_cipher();
         let mut json_scratch = Vec::new();
         let mut src = BytesMut::from(received);
@@ -349,15 +347,15 @@ mod tests {
         .unwrap()
         {
             match frame {
-                DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
+                DecodedFrame::Owned { seq, data } => decoded.push((seq, data)),
                 _ => panic!("unexpected borrowed frame"),
             }
         }
         decoded
     }
 
-    fn test_client() -> Arc<wreq::Client> {
-        Arc::new(wreq::Client::builder().no_proxy().build().unwrap())
+    fn test_client() -> Arc<Client> {
+        Client::new(None).unwrap()
     }
 
     async fn tcp_pair() -> (tokio::net::tcp::OwnedReadHalf, TcpStream) {
@@ -408,8 +406,16 @@ mod tests {
 
         let _ = stop_tx.send(());
         let received = collector.await.unwrap();
-        assert!(!received.is_empty(), "server must receive upload frames");
-        assert_eq!(decode_all(&received), all);
+        let mut frames = decode_all(&received);
+        assert!(!frames.is_empty(), "server must receive upload frames");
+        frames.sort_by_key(|(seq, _)| *seq);
+        let seqs: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, (0..frames.len() as u64).collect::<Vec<_>>());
+        let mut decoded = Vec::new();
+        for (_, data) in frames {
+            decoded.extend_from_slice(&data);
+        }
+        assert_eq!(decoded, all);
     }
 
     #[tokio::test]

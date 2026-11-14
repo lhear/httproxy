@@ -1,13 +1,14 @@
 # httproxy
 
-A high-performance HTTP proxy in Rust that emulates Chrome's TLS and HTTP/2
-fingerprints, so tunnel traffic is indistinguishable from ordinary browser
+A high-performance HTTP proxy in Rust that carries tunnel traffic over
+Chromium's own network stack, so it is indistinguishable from ordinary browser
 traffic.
 
 ## Features
 
-- **Fingerprint emulation** — BoringSSL configured with Chrome's TLS and HTTP/2
-  parameters.
+- **Native Chromium fingerprint** — every upstream request is issued by
+  Chromium's network stack (Cronet): the browser's own TLS, HTTP/2 and QUIC
+  implementation, header order and padding, with no emulation layer.
 - **Flexible topology** — works through CDNs, web proxies and middleboxes.
 - **Traffic obfuscation** — configurable padding and inter-frame jitter.
 - **Mandatory authentication and encryption** — tunnel tokens authorise tunnel
@@ -19,10 +20,28 @@ traffic.
 
 ## Getting Started
 
-Requires a stable Rust toolchain.
+Requires a stable Rust toolchain; the client also needs Cronet.
 
 ```bash
 cargo build --release        # → target/release/{client,server}
+```
+
+### Cronet
+
+`build.rs` links Cronet statically when `CRONET_LIB_DIR` points at a package
+(`libcronet.a`, or `cronet.lib` on Windows); otherwise the client resolves
+`libcronet` at startup through `CRONET_LIB`, the directory next to the binary,
+or the system library path.
+
+Packages come from Chromium's `cronet_static` target, built by
+`scripts/build-libcronet.sh <triple>` from the tree pinned in
+`naiveproxy.lock`: glibc and musl against Debian and OpenWrt sysroots, Android
+against the NDK, macOS and Windows. CI builds every target in
+`.github/workflows/libcronet.yml` and hands the packages to the build jobs.
+
+```bash
+sh scripts/build-libcronet.sh x86_64-unknown-linux-gnu
+CRONET_LIB_DIR=cronet/x86_64-unknown-linux-gnu cargo build --release
 ```
 
 Both binaries read a `config.toml`; every key is documented in

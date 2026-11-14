@@ -164,17 +164,7 @@ pub async fn spawn_client_with_redirects(
     let state = httproxy::client::build_state(&cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
-    let http_client = Arc::new(
-        wreq::Client::builder()
-            .tcp_nodelay(true)
-            .emulation(httproxy::client::chrome_emulation())
-            .no_proxy()
-            .dns_resolver(Arc::new(httproxy::client::state::ManualResolver {
-                target_addr: server_addr.ip().to_string(),
-            }))
-            .build()
-            .unwrap(),
-    );
+    let http_client = httproxy::client::build_http_client(&cfg).unwrap();
     let sem = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
 
     let mut redirect_addrs = Vec::new();
