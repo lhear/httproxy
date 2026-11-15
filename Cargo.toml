@@ -1,25 +1,19 @@
-[package]
+[workspace]
+resolver = "3"
+members = [
+  "crates/httproxy-client",
+  "crates/httproxy-core",
+  "crates/httproxy-server",
+  "crates/httproxy-tests",
+]
+
+[workspace.package]
 edition = "2024"
 license = "MPL-2.0"
-name = "httproxy"
 rust-version = "1.99"
 version = "0.5.7"
 
-[[bin]]
-name = "server"
-path = "src/bin/server.rs"
-
-[[bin]]
-name = "client"
-path = "src/bin/client.rs"
-
-[profile.release]
-codegen-units = 1
-lto = true
-panic = "abort"
-strip = true
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0.104"
 aws-lc-rs = "1.19.0"
 axum = {version = "0.8.9", features = ["http2", "macros"]}
@@ -79,20 +73,15 @@ tracing-subscriber = {version = "0.3.23", features = [
 url = "2.5.8"
 uuid = "1.29.2"
 webpki-roots = "1.0.12"
-x25519-dalek = {version = "3.0.0", features = ["static_secrets", "getrandom", "zeroize"]}
+x25519-dalek = {version = "3.0.0", features = [
+  "static_secrets",
+  "getrandom",
+  "zeroize",
+]}
 zeroize = "1.9.1"
 
-[dev-dependencies]
-axum = {version = "0.8.9", features = ["http2", "macros"]}
-quinn = {version = "0.11.12", default-features = false, features = [
-  "runtime-tokio",
-  "rustls-aws-lc-rs",
-]}
-rcgen = {version = "0.14.10", default-features = false, features = [
-  "crypto",
-  "aws_lc_rs",
-]}
-rustls = "0.23.46"
-serde_json = "1.0.154"
-tokio = {version = "1.54.1", features = ["full"]}
-tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true

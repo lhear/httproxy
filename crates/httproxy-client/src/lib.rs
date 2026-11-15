@@ -1,0 +1,148 @@
+pub mod actor;
+pub mod connection;
+pub mod constants;
+pub mod cronet;
+pub mod handshake;
+pub mod proxy;
+pub mod redirect;
+pub mod state;
+pub mod utils;
+
+use crate::constants::{MAX_IN_FLIGHT_BYTES, MAX_LOCAL_CONNECTIONS, UPLOAD_CONCURRENCY};
+use crate::cronet::Client;
+use httproxy_core::config::ClientTopConfig;
+use httproxy_core::crypto;
+use httproxy_core::shaper::ResolvedShaperConfig;
+
+use anyhow::{Context, Result};
+use base64::Engine;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+pub fn build_http_client(cfg: &ClientTopConfig) -> Result<Arc<Client>> {
+    Client::new(cfg.client.address.as_deref()).context("failed to start cronet engine")
+}
+
+pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
+    cfg.traffic_shaping
+        .validate()
+        .context("invalid traffic_shaping config")?;
+
+    let max_in_flight_bytes = cfg
+        .client
+        .max_in_flight_bytes
+        .unwrap_or(MAX_IN_FLIGHT_BYTES);
+    let upload_concurrency = cfg.client.upload_concurrency.unwrap_or(UPLOAD_CONCURRENCY);
+    if max_in_flight_bytes < crate::constants::MIN_IN_FLIGHT_BYTES {
+        return Err(anyhow::anyhow!(
+            "max_in_flight_bytes ({max_in_flight_bytes}) must be at least {} (one maximum-size encoded frame)",
+            crate::constants::MIN_IN_FLIGHT_BYTES
+        ));
+    }
+    if upload_concurrency == 0 {
+        return Err(anyhow::anyhow!("upload_concurrency must be at least 1"));
+    }
+
+    let bypass = if cfg.bypass.bypass_files.is_empty() {
+        None
+    } else {
+        let rules = httproxy_core::bypass::BypassRules::load(&cfg.bypass)
+            .context("failed to load bypass rules")?;
+        if rules.is_empty() {
+            None
+        } else {
+            Some(Arc::new(rules))
+        }
+    };
+
+    let server_public_key = crypto::b64_to_mlkem_public_key(&cfg.client.public_key)
+        .context("invalid client.public_key")?;
+
+    let remote: url::Url = cfg.client.remote.parse().context("invalid server URL")?;
+    let remote_str = remote.as_str().to_owned();
+
+    let proxy_auth = cfg.client.proxy_auth.as_ref().map(|a| {
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", a.username, a.password))
+        );
+        (expected, a.username.clone())
+    });
+
+    Ok(Arc::new(state::SharedState {
+        remote_str,
+        auth_token: cfg.auth.token.clone(),
+        traffic_config: cfg.traffic_shaping.clone(),
+        resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&cfg.traffic_shaping)),
+        bypass,
+        server_public_key: Arc::new(server_public_key),
+        proxy_auth,
+        initial_master: Mutex::new(None),
+        handshake_lock: Mutex::new(()),
+        max_download_bytes: cfg.traffic_shaping.max_download_bytes,
+        max_connections: cfg.client.max_connections.unwrap_or(MAX_LOCAL_CONNECTIONS),
+        max_in_flight_bytes,
+        upload_concurrency,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::{MAX_IN_FLIGHT_BYTES, UPLOAD_CONCURRENCY};
+
+    fn minimal_client_cfg() -> httproxy_core::config::ClientTopConfig {
+        let (_, public_key) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+        let public_key = httproxy_core::crypto::mlkem_public_key_to_b64(&public_key).unwrap();
+        toml::from_str(&format!(
+            r#"
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://example.com/secret"
+public_key = "{public_key}"
+
+[auth]
+token = "tok"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+"#,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn build_state_rejects_tiny_in_flight() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.max_in_flight_bytes = Some(1024);
+        assert!(build_state(&cfg).is_err());
+    }
+
+    #[test]
+    fn build_state_rejects_zero_concurrency() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.upload_concurrency = Some(0);
+        assert!(build_state(&cfg).is_err());
+    }
+
+    #[test]
+    fn build_state_accepts_defaults() {
+        let cfg = minimal_client_cfg();
+        let state = build_state(&cfg).unwrap();
+        assert_eq!(state.max_in_flight_bytes, MAX_IN_FLIGHT_BYTES);
+        assert_eq!(state.upload_concurrency, UPLOAD_CONCURRENCY);
+        assert_eq!(state.max_connections, MAX_LOCAL_CONNECTIONS);
+    }
+
+    #[test]
+    fn build_state_accepts_bounded_config() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.max_in_flight_bytes = Some(256 * 1024);
+        cfg.client.upload_concurrency = Some(4);
+        let state = build_state(&cfg).unwrap();
+        assert_eq!(state.max_in_flight_bytes, 256 * 1024);
+        assert_eq!(state.upload_concurrency, 4);
+    }
+}

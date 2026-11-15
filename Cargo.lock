@@ -968,22 +968,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "httproxy"
+name = "httproxy-client"
+version = "0.5.7"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bytes",
+ "clap",
+ "futures",
+ "h2",
+ "http",
+ "httparse",
+ "httproxy-core",
+ "memchr",
+ "pin-project-lite",
+ "rand",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "httproxy-core"
 version = "0.5.7"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
- "axum",
  "base122-fast",
  "base64",
  "bytes",
- "clap",
- "dashmap",
  "domain",
  "fst",
  "futures",
- "h2",
- "http",
  "httparse",
  "ip_network",
  "ip_network_table",
@@ -1003,15 +1029,64 @@ dependencies = [
  "tokio-socks",
  "tokio-stream",
  "toml",
- "tower",
- "tower-http",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "url",
- "uuid",
  "webpki-roots",
  "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "httproxy-server"
+version = "0.5.7"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "axum",
+ "base64",
+ "bytes",
+ "clap",
+ "dashmap",
+ "futures",
+ "http",
+ "httproxy-core",
+ "memchr",
+ "moka",
+ "pin-project-lite",
+ "rand",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-socks",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "uuid",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "httproxy-tests"
+version = "0.5.7"
+dependencies = [
+ "axum",
+ "base64",
+ "bytes",
+ "domain",
+ "http",
+ "httproxy-client",
+ "httproxy-core",
+ "httproxy-server",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+ "uuid",
  "zeroize",
 ]
 

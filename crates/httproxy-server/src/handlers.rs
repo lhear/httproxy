@@ -1,0 +1,871 @@
+use aws_lc_rs::aead::LessSafeKey;
+use axum::{body::Body, extract::State, http::HeaderMap, response::Response};
+use base64::Engine;
+use bytes::BytesMut;
+use futures::StreamExt;
+use std::io;
+use std::sync::Arc;
+use tracing::{Instrument, info, warn};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use crate::actor::tunnel::TunnelCmd;
+use crate::actor::upload::UploadCmd;
+use crate::connection::connect_upstream;
+use crate::constants::{
+    BODY_READ_TIMEOUT, CONNECT_TIMEOUT, MASTER_EXPIRY, MAX_FRAME_BUF_SIZE, MAX_HANDSHAKE_BODY_SIZE,
+    TOKEN_CACHE_TTL, TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
+};
+use crate::error::ServerError;
+use crate::stream::FrameDecoder;
+use crate::stream_registry::StreamQueryResult;
+use crate::{SessionHandle, utils};
+use httproxy_core::crypto::{self, AesFrameCipher, StreamCipher, TlsInspector};
+use httproxy_core::shaper::{self, FrameCipher};
+use tokio::sync::oneshot;
+
+use super::AppState;
+use crate::stream_registry::StreamRegistry;
+
+struct StreamGuard {
+    registry: Arc<StreamRegistry>,
+    stream_id: Uuid,
+    armed: bool,
+}
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.mark_consumed(self.stream_id);
+        }
+    }
+}
+impl StreamGuard {
+    fn new(registry: Arc<StreamRegistry>, stream_id: Uuid) -> Self {
+        Self {
+            registry,
+            stream_id,
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+struct ActorGuard {
+    actors: Arc<dashmap::DashMap<Uuid, SessionHandle>>,
+    key: Uuid,
+    armed: bool,
+}
+impl Drop for ActorGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.actors.remove(&self.key);
+        }
+    }
+}
+impl ActorGuard {
+    fn new(actors: Arc<dashmap::DashMap<Uuid, SessionHandle>>, key: Uuid) -> Self {
+        Self {
+            actors,
+            key,
+            armed: true,
+        }
+    }
+}
+
+struct TunnelGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+impl TunnelGuard {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+    fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn setup_tunnel_response(
+    state: &Arc<AppState>,
+    body: Body,
+    host: &str,
+    port: u16,
+    stream_id: Uuid,
+    upload_cipher: Arc<dyn FrameCipher>,
+    download_cipher: Arc<dyn FrameCipher>,
+) -> Result<Response, ServerError> {
+    let tunnel_permit = state
+        .tunnel_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ServerError::service_unavailable("too many concurrent tunnels"))?;
+
+    let encoding = state.traffic_config.encoding_type;
+
+    let max_download_bytes = state.traffic_config.max_download_bytes;
+    let direct = max_download_bytes.is_none();
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(httproxy_core::now_secs()));
+
+    let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
+
+    let upstream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_upstream(
+            state.warp.as_ref(),
+            state.dns_client.as_ref(),
+            state.client_subnet,
+            state.socks5_proxy.as_ref(),
+            host,
+            port,
+        ),
+    )
+    .await
+    .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
+    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
+
+    let (upstream_read, upstream_write) = upstream.into_split();
+
+    let (upload_tx, upload_rx) =
+        tokio::sync::mpsc::channel::<UploadCmd>(UPLOAD_CMD_CHANNEL_CAPACITY);
+    let upload_actor = crate::actor::upload::UploadActor::new(upload_rx, upstream_write, 0);
+    let upload_handle =
+        tokio::spawn(async move { upload_actor.run().await }.instrument(tracing::Span::current()));
+
+    let byte_stream = body.into_data_stream().map(|r| r.map_err(io::Error::other));
+    let mut decoder = FrameDecoder::new(
+        byte_stream,
+        upload_cipher.clone(),
+        encoding,
+        MAX_FRAME_BUF_SIZE,
+    );
+
+    let body_deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
+    while let Some(result) = tokio::time::timeout_at(body_deadline, decoder.next())
+        .await
+        .map_err(|_| ServerError::request_timeout("request body read timed out"))?
+    {
+        let (seq, data) =
+            result.map_err(|e| ServerError::bad_request(format!("decode error: {e}")))?;
+        upload_tx
+            .send(UploadCmd::Frame { seq, data })
+            .await
+            .map_err(|_| ServerError::bad_gateway("upload actor closed during initial stream"))?;
+    }
+
+    let upload_tx_for_actor = upload_tx.clone();
+
+    let mut actor = crate::actor::tunnel::TunnelActor::new(
+        actor_rx,
+        stream_id,
+        Arc::clone(&state.stream_registry),
+        max_download_bytes,
+        Arc::clone(&last_activity),
+    );
+    actor.set_upload_channel(upload_tx_for_actor, upload_handle);
+
+    let body_stream = if direct {
+        let shaper = httproxy_core::shaper::TrafficShaper::with_inspector(
+            upstream_read,
+            &state.resolved_traffic,
+            download_cipher,
+            0,
+            Some(TlsInspector::new()),
+        );
+        let activity = Arc::clone(&last_activity);
+        Body::from_stream(shaper.map(move |r| {
+            if r.is_ok() {
+                activity.store(
+                    httproxy_core::now_secs(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            r.map(|(_seq, data)| data)
+        }))
+    } else {
+        actor.on_upstream_connected(
+            upstream_read,
+            None,
+            &state.resolved_traffic,
+            download_cipher,
+            0,
+            Some(TlsInspector::new()),
+        );
+        Body::from_stream(
+            actor
+                .take_segment()
+                .ok_or_else(|| ServerError::internal("download segment unavailable"))?,
+        )
+    };
+
+    let handle = SessionHandle {
+        cmd_tx: actor_tx.clone(),
+        upload_tx: upload_tx.clone(),
+        upload_cipher,
+        encoding,
+    };
+    state.actors.insert(stream_id, handle);
+    let mut early_guard = ActorGuard::new(Arc::clone(&state.actors), stream_id);
+
+    let key = stream_id;
+    let actors_ref2 = Arc::clone(&state.actors);
+    let actor_handle = tokio::spawn(
+        async move {
+            let _permit = tunnel_permit;
+            let _guard = ActorGuard::new(actors_ref2, key);
+            actor.run().await;
+        }
+        .instrument(tracing::Span::current()),
+    );
+
+    let mut tunnel_guard = TunnelGuard::new(actor_handle);
+
+    early_guard.armed = false;
+
+    let padding = utils::random_padding();
+    let response = Response::builder()
+        .header("Cache-Control", "no-store")
+        .header("Set-Cookie", padding)
+        .body(body_stream)
+        .map_err(|e| ServerError::internal(e.to_string()))?;
+
+    tunnel_guard.disarm();
+    Ok(response)
+}
+
+async fn spawn_encrypted_tunnel(
+    state: Arc<AppState>,
+    session_cookie_val: &str,
+    body: Body,
+    span: tracing::Span,
+) -> Result<Response, ServerError> {
+    let Some((session_id, rest)) = session_cookie_val.split_once(':') else {
+        return Err(ServerError::precondition_required(
+            "invalid session cookie format",
+        ));
+    };
+    let Some((enc_target_b64, enc_stream_id_b64)) = rest.split_once(':') else {
+        return Err(ServerError::precondition_required(
+            "invalid session cookie format",
+        ));
+    };
+
+    utils::validate_uuid(session_id)?;
+
+    let entry = state
+        .master_store
+        .get(session_id)
+        .ok_or_else(|| ServerError::precondition_required("session not found"))?;
+    let value_ref = entry.value();
+    let mut master = Zeroizing::new([0u8; 32]);
+    let (username, master_z, created) = value_ref;
+    master.copy_from_slice(&**master_z);
+    let username = Arc::clone(username);
+    let created = *created;
+    if httproxy_core::now_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
+        drop(entry);
+        state.master_store.remove(session_id);
+        return Err(ServerError::precondition_required("master key expired"));
+    }
+    span.record("user", username.as_ref());
+    drop(entry);
+
+    let cookie_stream_key = crypto::derive_cookie_stream_key(&master);
+    let enc_stream_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(enc_stream_id_b64)
+        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
+    let stream_id_bytes = crypto::decrypt_bytes(&cookie_stream_key, &enc_stream_id)
+        .map_err(|_| ServerError::precondition_required("failed to decrypt stream ID"))?;
+    let stream_id_bytes_arr: [u8; 16] = stream_id_bytes
+        .try_into()
+        .map_err(|_| ServerError::precondition_required("invalid stream ID length"))?;
+    let stream_id = Uuid::from_bytes(stream_id_bytes_arr);
+
+    if !state
+        .stream_registry
+        .register(stream_id, httproxy_core::now_secs())
+    {
+        warn!(stream_id = %stream_id, session_id = %session_id, "duplicate stream registration attempt");
+        return Err(ServerError::precondition_required("stream already active"));
+    }
+
+    let mut stream_guard = StreamGuard::new(Arc::clone(&state.stream_registry), stream_id);
+
+    let (upload_key, download_key, target_key) =
+        crypto::derive_connection_keys(&master, stream_id.as_bytes());
+    let enc_target = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(enc_target_b64)
+        .map_err(|_| ServerError::precondition_required("invalid cookie encoding"))?;
+    let target_bytes = crypto::decrypt_bytes(&target_key, &enc_target)
+        .map_err(|_| ServerError::precondition_required("failed to decrypt target"))?;
+    let target = String::from_utf8(target_bytes)
+        .map_err(|_| ServerError::precondition_required("invalid target utf8"))?;
+    let (host, port_str) = target
+        .rsplit_once(':')
+        .ok_or_else(|| ServerError::bad_request("target must be host:port"))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| ServerError::bad_request("invalid port"))?;
+    span.record("target", &target);
+
+    let download_cipher: Arc<dyn FrameCipher> = Arc::new(StreamCipher::new(&download_key));
+    let upload_cipher: Arc<dyn FrameCipher> = Arc::new(StreamCipher::new(&upload_key));
+
+    let response = setup_tunnel_response(
+        &state,
+        body,
+        host,
+        port,
+        stream_id,
+        upload_cipher,
+        download_cipher,
+    )
+    .await?;
+
+    stream_guard.disarm();
+
+    info!(stream_id = %stream_id, session_id = %session_id, "tunnel established");
+    Ok(response)
+}
+
+async fn dispatch_to_actor(handle: SessionHandle, body: Body) -> Result<Response, ServerError> {
+    let byte_stream = body.into_data_stream().map(|r| r.map_err(io::Error::other));
+    let mut decoder = FrameDecoder::new(
+        byte_stream,
+        handle.upload_cipher.clone(),
+        handle.encoding,
+        MAX_FRAME_BUF_SIZE,
+    );
+
+    let mut max_seq: u64 = 0;
+    let mut frame_count = 0;
+
+    let body_deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
+    while let Some(result) = tokio::time::timeout_at(body_deadline, decoder.next())
+        .await
+        .map_err(|_| ServerError::request_timeout("request body read timed out"))?
+    {
+        let (seq, data) =
+            result.map_err(|e| ServerError::bad_request(format!("frame decode error: {e}")))?;
+        max_seq = max_seq.max(seq);
+        handle
+            .upload_tx
+            .send(UploadCmd::Frame { seq, data })
+            .await
+            .map_err(|_| ServerError::bad_gateway("upload actor closed"))?;
+        frame_count += 1;
+    }
+
+    if frame_count == 0 {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(TunnelCmd::Continue { reply: reply_tx })
+            .await
+            .map_err(|_| ServerError::bad_gateway("actor closed"))?;
+
+        match tokio::time::timeout(crate::constants::UPLOAD_DONE_TIMEOUT, reply_rx).await {
+            Ok(Ok(Some(segment))) => {
+                let padding = utils::random_padding();
+                return Response::builder()
+                    .header("Cache-Control", "no-store")
+                    .header("Set-Cookie", padding)
+                    .body(Body::from_stream(segment))
+                    .map_err(|e| ServerError::internal(e.to_string()));
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                let padding = utils::random_padding();
+                return Response::builder()
+                    .header("Cache-Control", "no-store")
+                    .header("Set-Cookie", padding)
+                    .status(axum::http::StatusCode::NO_CONTENT)
+                    .body(Body::empty())
+                    .map_err(|e| ServerError::internal(e.to_string()));
+            }
+            Err(_) => {
+                return Err(ServerError::gateway_timeout("continue timed out"));
+            }
+        }
+    }
+
+    let (ack_tx, ack_rx) = oneshot::channel();
+    handle
+        .upload_tx
+        .send(UploadCmd::Eos {
+            max_seq,
+            ack: ack_tx,
+        })
+        .await
+        .map_err(|_| ServerError::bad_gateway("upload actor closed"))?;
+
+    match tokio::time::timeout(crate::constants::UPLOAD_DONE_TIMEOUT, ack_rx).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => return Err(e),
+        Ok(Err(_)) => return Err(ServerError::bad_gateway("actor closed before upload ack")),
+        Err(_) => return Err(ServerError::gateway_timeout("upload drain timeout")),
+    }
+
+    let padding = utils::random_padding();
+    Response::builder()
+        .header("Cache-Control", "no-store")
+        .header("Set-Cookie", padding)
+        .status(axum::http::StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .map_err(|e| ServerError::internal(e.to_string()))
+}
+
+pub async fn dispatch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ServerError> {
+    let span = tracing::Span::current();
+
+    if let Some(stream_cookie_val) = utils::extract_cookie_value(&headers, "stream") {
+        let stream_id = Uuid::parse_str(stream_cookie_val)
+            .map_err(|_| ServerError::precondition_required("invalid stream id"))?;
+
+        if let Some(handle) = state.actors.get(&stream_id).map(|r| r.value().clone()) {
+            return dispatch_to_actor(handle, body).await;
+        }
+
+        return handle_stream_not_found(&state, stream_id);
+    }
+
+    if let Some(session_val) = utils::extract_cookie_value(&headers, "session") {
+        if !session_val.contains(':') {
+            return Err(ServerError::precondition_required(
+                "invalid session cookie: encrypted session required",
+            ));
+        }
+        return spawn_encrypted_tunnel(state, session_val, body, span).await;
+    }
+
+    handle_fresh_handshake(state, body, span).await
+}
+
+fn handle_stream_not_found(
+    state: &Arc<AppState>,
+    stream_id: Uuid,
+) -> Result<Response, ServerError> {
+    match state.stream_registry.check(stream_id) {
+        StreamQueryResult::Consumed => {
+            warn!(stream_id = %stream_id, "replay attempt on consumed stream");
+            Err(ServerError::precondition_required(
+                "stream already consumed",
+            ))
+        }
+        StreamQueryResult::Active => {
+            warn!(stream_id = %stream_id, "stream registered but initial tunnel setup did not complete");
+            Err(ServerError::precondition_required(
+                "stream setup incomplete",
+            ))
+        }
+        StreamQueryResult::Fresh => {
+            warn!(stream_id = %stream_id, "upload for unknown stream");
+            Err(ServerError::precondition_required("stream not found"))
+        }
+    }
+}
+
+async fn handle_fresh_handshake(
+    state: Arc<AppState>,
+    body: Body,
+    span: tracing::Span,
+) -> Result<Response, ServerError> {
+    info!("handshake: received ClientHello");
+
+    let body_bytes = tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(body, MAX_HANDSHAKE_BODY_SIZE),
+    )
+    .await
+    .map_err(|_| ServerError::request_timeout("request body read timed out"))?
+    .map_err(|e| ServerError::payload_too_large(format!("request body error: {e}")))?;
+
+    let mut buf = BytesMut::from(&body_bytes[..]);
+    let Some((_seq, static_ct)) = shaper::decode_from_buffer(
+        &mut buf,
+        &crypto::PlainFrameCipher,
+        state.traffic_config.encoding_type,
+    )?
+    else {
+        return Err(ServerError::bad_request("invalid ML-KEM ciphertext frame"));
+    };
+
+    let static_ss = crypto::mlkem_decapsulate(&state.private_key, &static_ct)
+        .map_err(|e| ServerError::bad_request(format!("invalid ML-KEM ciphertext: {e}")))?;
+    let handshake_key = crypto::derive_handshake_key(&static_ss);
+    let handshake_cipher = AesFrameCipher::new(&handshake_key);
+
+    let Some((_seq, client_hello_data)) = shaper::decode_from_buffer(
+        &mut buf,
+        &handshake_cipher,
+        state.traffic_config.encoding_type,
+    )?
+    else {
+        return Err(ServerError::bad_request("invalid ClientHello frame"));
+    };
+
+    if client_hello_data.len() < 2 {
+        return Err(ServerError::bad_request("ClientHello too short"));
+    }
+
+    let token_len = u16::from_be_bytes([client_hello_data[0], client_hello_data[1]]) as usize;
+    let token_end = 2 + token_len;
+    if client_hello_data.len() < token_end {
+        return Err(ServerError::bad_request(
+            "ClientHello truncated (token part)",
+        ));
+    }
+    let token = std::str::from_utf8(&client_hello_data[2..token_end])
+        .map_err(|_| ServerError::unauthorized("invalid token"))?;
+    let user = validate_token_if_needed(token, &state.token_key, &state.token_cache).await?;
+    span.record("user", &*user);
+
+    if client_hello_data.len() < token_end + 2 {
+        return Err(ServerError::bad_request(
+            "ClientHello truncated (no KEM part)",
+        ));
+    }
+    let len_kem = u16::from_be_bytes([
+        client_hello_data[token_end],
+        client_hello_data[token_end + 1],
+    ]) as usize;
+    let kem_end = token_end + 2 + len_kem;
+    if client_hello_data.len() < kem_end {
+        return Err(ServerError::bad_request("ClientHello truncated (KEM part)"));
+    }
+    let kem_pk_bytes = &client_hello_data[token_end + 2..kem_end];
+    let kem_pk = crypto::bytes_to_encapsulation_key(kem_pk_bytes)
+        .map_err(|e| ServerError::bad_request(format!("invalid mlkem public key: {e}")))?;
+
+    if client_hello_data.len() < kem_end + 2 {
+        return Err(ServerError::bad_request(
+            "ClientHello truncated (no X25519 part)",
+        ));
+    }
+    let len_x25519 =
+        u16::from_be_bytes([client_hello_data[kem_end], client_hello_data[kem_end + 1]]) as usize;
+    let x25519_end = kem_end + 2 + len_x25519;
+    if client_hello_data.len() < x25519_end {
+        return Err(ServerError::bad_request(
+            "ClientHello truncated (X25519 part)",
+        ));
+    }
+    let eph_pk_b_bytes = &client_hello_data[kem_end + 2..x25519_end];
+    let eph_pk_b: [u8; 32] = eph_pk_b_bytes
+        .try_into()
+        .map_err(|_| ServerError::bad_request("invalid client x25519 pk length"))?;
+    let client_eph_pk_b = x25519_dalek::PublicKey::from(eph_pk_b);
+
+    let (ct, ss_mlkem) = crypto::mlkem_encapsulate(&kem_pk)
+        .map_err(|e| ServerError::internal(format!("ML-KEM encapsulation failed: {e}")))?;
+    let (server_eph_sk, server_eph_pk) = crypto::generate_keypair();
+
+    let master = {
+        let ss_x25519 = crypto::diffie_hellman(&server_eph_sk, &client_eph_pk_b);
+        crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
+    };
+
+    let session_id = Uuid::new_v4().to_string();
+    state.master_store.insert(
+        session_id.clone(),
+        (user, master, httproxy_core::now_secs()),
+    );
+
+    info!(session_id = %session_id, "handshake: master key derived");
+
+    let sid_bytes = session_id.as_bytes();
+    let mut server_hello = Vec::with_capacity(2 + sid_bytes.len() + ct.as_ref().len() + 32);
+    server_hello.extend_from_slice(&(sid_bytes.len() as u16).to_be_bytes());
+    server_hello.extend_from_slice(sid_bytes);
+    server_hello.extend_from_slice(ct.as_ref());
+    server_hello.extend_from_slice(server_eph_pk.as_bytes());
+
+    let server_hello_frame = shaper::encode_frame(
+        &server_hello,
+        0,
+        &handshake_cipher,
+        state.traffic_config.global.padding_threshold,
+        state.traffic_config.global.padding_range,
+        state.traffic_config.encoding_type,
+    )
+    .map_err(|e| ServerError::internal(format!("encode ServerHello: {e}")))?;
+
+    drop(handshake_key);
+
+    info!(session_id = %session_id, "handshake: ServerHello sent");
+
+    let padding = utils::random_padding();
+    let resp = Response::builder()
+        .header("Cache-Control", "no-store")
+        .header("Set-Cookie", padding)
+        .body(Body::from(server_hello_frame))
+        .map_err(|e| ServerError::internal(e.to_string()))?;
+
+    Ok(resp)
+}
+
+pub async fn validate_token_if_needed(
+    token: &str,
+    key: &LessSafeKey,
+    cache: &moka::future::Cache<Box<str>, Arc<str>>,
+) -> Result<Arc<str>, ServerError> {
+    if token.is_empty() || token.len() > crate::token::MAX_TOKEN_LEN {
+        warn!("rejected: invalid token length");
+        return Err(ServerError::unauthorized("invalid token"));
+    }
+
+    if let Some(user) = cache.get(token).await {
+        return Ok(user);
+    }
+
+    let claims = crate::token::open(key, token).map_err(|e| {
+        warn!("rejected: invalid token - {e}");
+        ServerError::unauthorized("invalid token")
+    })?;
+
+    let user: Arc<str> = Arc::from(claims.sub);
+    let now = httproxy_core::unix_now_secs();
+    if claims.exp > now.saturating_add(TOKEN_CACHE_TTL.as_secs()) {
+        cache
+            .insert(token.to_owned().into_boxed_str(), Arc::clone(&user))
+            .await;
+    }
+    Ok(user)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::http::StatusCode;
+
+    async fn test_state() -> Arc<AppState> {
+        test_state_with_public_key().await.0
+    }
+
+    async fn test_state_with_public_key() -> (Arc<AppState>, httproxy_core::crypto::EncapsulationKey)
+    {
+        let (private_key, public_key) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+        let mut cfg = httproxy_core::config::ServerTopConfig {
+            server: httproxy_core::config::ServerSection {
+                listen: "127.0.0.1:0".to_string(),
+                path: "/secret".to_string(),
+                private_key: httproxy_core::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
+                max_tunnels: None,
+            },
+            auth: httproxy_core::config::AuthSection {
+                secret: "test-secret".to_string(),
+            },
+            proxy: None,
+            log: None,
+            dns: None,
+            warp: None,
+            traffic_shaping: httproxy_core::shaper::TrafficConfig {
+                global: httproxy_core::shaper::PaddingConfig {
+                    padding_threshold: 0,
+                    padding_range: [0, 0],
+                },
+                stages: vec![],
+                encoding_type: httproxy_core::shaper::EncodingType::Binary,
+                max_download_bytes: None,
+            },
+        };
+        let state = crate::build_state(&mut cfg).await.unwrap();
+        (state, public_key)
+    }
+
+    fn valid_token() -> String {
+        crate::token::issue(
+            &crate::token::key_from_secret(b"test-secret"),
+            &crate::Claims {
+                sub: "user".to_string(),
+                exp: 4_102_444_800,
+            },
+        )
+    }
+
+    fn token_with_exp(exp: u64) -> String {
+        crate::token::issue(
+            &crate::token::key_from_secret(b"test-secret"),
+            &crate::Claims {
+                sub: "user".to_string(),
+                exp,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn valid_token_is_cached_and_reused() {
+        let state = test_state().await;
+        let token = valid_token();
+
+        let first = validate_token_if_needed(&token, &state.token_key, &state.token_cache)
+            .await
+            .unwrap();
+        assert_eq!(&*first, "user");
+        let cached = state
+            .token_cache
+            .get(token.as_str())
+            .await
+            .expect("valid token must be cached");
+        assert_eq!(&*cached, "user");
+
+        let second = validate_token_if_needed(&token, &state.token_key, &state.token_cache)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hit must reuse the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tokens_are_never_cached() {
+        let state = test_state().await;
+        assert!(
+            validate_token_if_needed("not-a-token", &state.token_key, &state.token_cache)
+                .await
+                .is_err()
+        );
+        assert!(state.token_cache.get("not-a-token").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn token_close_to_expiry_is_not_cached() {
+        let state = test_state().await;
+        let token = token_with_exp(httproxy_core::unix_now_secs() + 5);
+        assert!(
+            validate_token_if_needed(&token, &state.token_key, &state.token_cache)
+                .await
+                .is_ok()
+        );
+        assert!(state.token_cache.get(token.as_str()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_without_cookies_or_target() {
+        let state = test_state().await;
+        let err = dispatch(State(state), HeaderMap::new(), Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_malformed_stream_cookie() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", "stream=not-a-uuid".parse().unwrap());
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_unknown_stream() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("stream={}", Uuid::new_v4()).parse().unwrap(),
+        );
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    fn encrypted_client_hello(
+        state: &Arc<AppState>,
+        server_pk: &httproxy_core::crypto::EncapsulationKey,
+        token: &str,
+    ) -> Body {
+        let (static_ct, static_ss) = httproxy_core::crypto::mlkem_encapsulate(server_pk).unwrap();
+        let handshake_key = httproxy_core::crypto::derive_handshake_key(&static_ss);
+        let cipher = AesFrameCipher::new(&handshake_key);
+
+        let mut hello = Vec::with_capacity(2 + token.len());
+        hello.extend_from_slice(&(token.len() as u16).to_be_bytes());
+        hello.extend_from_slice(token.as_bytes());
+        let client_hello_frame = shaper::encode_frame(
+            &hello,
+            0,
+            &cipher,
+            state.traffic_config.global.padding_threshold,
+            state.traffic_config.global.padding_range,
+            state.traffic_config.encoding_type,
+        )
+        .unwrap();
+        let static_ct_frame = shaper::encode_frame(
+            static_ct.as_ref(),
+            0,
+            &httproxy_core::crypto::PlainFrameCipher,
+            state.traffic_config.global.padding_threshold,
+            state.traffic_config.global.padding_range,
+            state.traffic_config.encoding_type,
+        )
+        .unwrap();
+
+        let mut body = static_ct_frame;
+        body.extend_from_slice(&client_hello_frame);
+        Body::from(body)
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_bad_token_in_client_hello() {
+        let (state, public_key) = test_state_with_public_key().await;
+        let body = encrypted_client_hello(&state, &public_key, "invalid-token");
+        let err = dispatch(State(state), HeaderMap::new(), body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_plaintext_tunnel() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Target", "127.0.0.1:1".parse().unwrap());
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_malformed_session_cookie() {
+        let state = test_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", "session=abc".parse().unwrap());
+        let err = dispatch(State(state), headers, Body::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_expired_token_on_handshake_path() {
+        let (state, public_key) = test_state_with_public_key().await;
+        let body = encrypted_client_hello(&state, &public_key, &token_with_exp(1));
+        let err = dispatch(State(state), HeaderMap::new(), body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+}

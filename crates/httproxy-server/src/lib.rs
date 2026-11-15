@@ -1,0 +1,240 @@
+pub mod actor;
+pub mod connection;
+pub mod constants;
+pub mod error;
+pub mod handlers;
+pub mod janitor;
+pub mod stream;
+pub mod stream_registry;
+pub mod token;
+pub mod upstream;
+pub mod utils;
+
+use httproxy_core::config::ServerTopConfig;
+use httproxy_core::crypto;
+use httproxy_core::dns::{self, DnsClient};
+use httproxy_core::shaper::{EncodingType, FrameCipher, ResolvedShaperConfig, TrafficConfig};
+use httproxy_core::warp::WarpClient;
+
+use anyhow::Context;
+use aws_lc_rs::aead::LessSafeKey;
+use axum::serve::ListenerExt;
+use axum::{Router, body::Body, routing::post};
+use dashmap::DashMap;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+use stream_registry::StreamRegistry;
+use tokio::sync::{Semaphore, mpsc};
+use tower::ServiceBuilder;
+use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
+use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::actor::tunnel::TunnelCmd;
+use crate::actor::upload::UploadCmd;
+use crate::constants::{MAX_TUNNELS, TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
+
+pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
+
+#[derive(Debug)]
+pub struct Claims {
+    pub sub: String,
+    pub exp: u64,
+}
+
+#[derive(Clone)]
+pub struct SessionHandle {
+    pub cmd_tx: mpsc::Sender<TunnelCmd>,
+    pub upload_tx: mpsc::Sender<UploadCmd>,
+    pub upload_cipher: Arc<dyn FrameCipher>,
+    pub encoding: EncodingType,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub token_key: Arc<LessSafeKey>,
+    pub socks5_proxy: Option<Arc<str>>,
+    pub dns_client: Option<Arc<DnsClient>>,
+    pub warp: Option<Arc<WarpClient>>,
+    pub client_subnet: Option<IpAddr>,
+    pub traffic_config: Arc<TrafficConfig>,
+    pub resolved_traffic: Arc<ResolvedShaperConfig>,
+    pub private_key: Arc<httproxy_core::crypto::DecapsulationKey>,
+    pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
+    pub stream_registry: Arc<StreamRegistry>,
+    pub actors: Arc<DashMap<Uuid, SessionHandle>>,
+    pub tunnel_semaphore: Arc<Semaphore>,
+    pub stream_id_counter: Arc<AtomicU64>,
+    pub token_cache: moka::future::Cache<Box<str>, Arc<str>>,
+}
+
+pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<AppState>> {
+    config
+        .traffic_shaping
+        .validate()
+        .context("invalid traffic_shaping config")?;
+
+    let warp = match config.warp.as_ref() {
+        Some(section) if section.enabled => Some(
+            WarpClient::init(section)
+                .await
+                .context("warp initialization failed")?,
+        ),
+        Some(_) => {
+            info!("warp: disabled by config");
+            None
+        }
+        None => None,
+    };
+
+    let mut dns_config = config.dns.clone();
+    if dns_config.is_none() && warp.is_some() {
+        warn!("warp: no [dns] section, resolving names via 1.1.1.1:53 over WARP");
+        dns_config = Some(httproxy_core::dns::DnsConfig::public_default());
+    }
+    let (dns_client, client_subnet) = match dns_config {
+        Some(mut dc) => {
+            let client = dns::init_dns(&mut dc, warp.as_ref()).await?;
+            (Some(client), dc.options.client_subnet)
+        }
+        None => (None, None),
+    };
+
+    let private_key = crypto::b64_to_mlkem_private_key(&config.server.private_key);
+    config.server.private_key.zeroize();
+    let private_key = private_key.context("invalid server.private_key")?;
+
+    let token_key = token::key_from_secret(config.auth.secret.as_bytes());
+    config.auth.secret.zeroize();
+
+    let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
+
+    Ok(Arc::new(AppState {
+        token_key: Arc::new(token_key),
+        socks5_proxy: config
+            .proxy
+            .as_ref()
+            .and_then(|p| p.socks5.as_deref())
+            .map(Arc::from),
+        dns_client,
+        warp,
+        client_subnet,
+        traffic_config: Arc::new(config.traffic_shaping.clone()),
+        resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&config.traffic_shaping)),
+        private_key: Arc::new(private_key),
+        master_store: Arc::new(DashMap::new()),
+        stream_registry: Arc::new(StreamRegistry::new()),
+        actors: Arc::new(DashMap::new()),
+        tunnel_semaphore: Arc::new(Semaphore::new(max_tunnels)),
+        stream_id_counter: Arc::new(AtomicU64::new(1)),
+        token_cache: moka::future::Cache::builder()
+            .max_capacity(TOKEN_CACHE_CAPACITY)
+            .time_to_live(TOKEN_CACHE_TTL)
+            .build(),
+    }))
+}
+
+pub fn build_router(state: Arc<AppState>, path: &str) -> Router {
+    use tracing::field::Empty;
+    let span_state = Arc::clone(&state);
+    Router::new()
+        .route(path, post(handlers::dispatch))
+        .layer(
+            ServiceBuilder::new().layer(TraceLayer::new_for_http().make_span_with(
+                move |req: &axum::http::Request<Body>| {
+                    let id = span_state.stream_id_counter.fetch_add(1, Ordering::Relaxed);
+                    let client = req
+                        .headers()
+                        .get("X-Forwarded-For")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("-");
+                    tracing::info_span!("session", id, client, user = Empty, target = Empty)
+                },
+            )),
+        )
+        .with_state(state)
+}
+
+pub async fn run_server(app: Router, listen: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if listen.contains('/') || listen.ends_with(".sock") {
+        let path = std::path::Path::new(listen);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        let listener = tokio::net::UnixListener::bind(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+        info!("listening on unix:{listen}");
+        return Ok(axum::serve(listener, app.into_make_service()).await?);
+    }
+    let addr: SocketAddr = listen.parse().context("invalid bind address")?;
+    info!("listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await?
+        .tap_io(|tcp_stream| {
+            let _ = tcp_stream.set_nodelay(true);
+        });
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+pub fn spawn_janitors(
+    state: &Arc<AppState>,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let master_jh = tokio::spawn(janitor::master_and_stream_janitor(
+        Arc::clone(&state.master_store),
+        Arc::clone(&state.stream_registry),
+    ));
+    let stream_jh = tokio::spawn(janitor::stream_janitor(Arc::clone(&state.actors)));
+    (master_jh, stream_jh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httproxy_core::config::{AuthSection, ServerSection};
+    use httproxy_core::shaper;
+
+    #[test]
+    fn build_state_with_minimal_config() {
+        let (private_key, public_key) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+        let mut cfg = ServerTopConfig {
+            server: ServerSection {
+                listen: "0.0.0.0:0".into(),
+                path: "/t".into(),
+                private_key: httproxy_core::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
+                max_tunnels: None,
+            },
+            auth: AuthSection {
+                secret: "test-key".into(),
+            },
+            proxy: None,
+            log: None,
+            dns: None,
+            warp: None,
+            traffic_shaping: TrafficConfig {
+                global: shaper::PaddingConfig {
+                    padding_threshold: 100,
+                    padding_range: [0, 50],
+                },
+                stages: vec![],
+                encoding_type: Default::default(),
+                max_download_bytes: None,
+            },
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let state = rt.block_on(build_state(&mut cfg)).unwrap();
+        assert!(state.dns_client.is_none());
+        let (ct, shared) = httproxy_core::crypto::mlkem_encapsulate(&public_key).unwrap();
+        let decapsulated =
+            httproxy_core::crypto::mlkem_decapsulate(&state.private_key, ct.as_ref()).unwrap();
+        assert_eq!(*shared, *decapsulated);
+    }
+}

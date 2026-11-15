@@ -1,0 +1,121 @@
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+use std::sync::Arc;
+
+use tokio::net::TcpStream;
+use tokio_socks::tcp::Socks5Stream;
+use tracing::debug;
+
+use crate::upstream::Upstream;
+use httproxy_core::dns::DnsClient;
+use httproxy_core::warp::WarpClient;
+
+const MAX_ADDRESS_ATTEMPTS: usize = 4;
+
+pub(crate) async fn connect_upstream(
+    warp: Option<&Arc<WarpClient>>,
+    dns_client: Option<&Arc<DnsClient>>,
+    client_subnet: Option<IpAddr>,
+    socks5_proxy: Option<&Arc<str>>,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<Upstream> {
+    let Some(warp) = warp else {
+        let upstream = connect_direct(dns_client, client_subnet, socks5_proxy, host, port).await?;
+        return Ok(Upstream::Direct(upstream));
+    };
+
+    let addresses = resolve_target(dns_client, client_subnet, host).await?;
+    let force_direct = warp.is_direct_name(host);
+
+    let mut last_error = None;
+    for ip in addresses.into_iter().take(MAX_ADDRESS_ATTEMPTS) {
+        let attempt = if force_direct || warp.is_direct_ip(ip) {
+            connect_ip(socks5_proxy, ip, port)
+                .await
+                .map(Upstream::Direct)
+        } else {
+            warp.dial(ip, port).await.map(Upstream::Warp)
+        };
+        match attempt {
+            Ok(upstream) => return Ok(upstream),
+            Err(e) => {
+                debug!(addr = %ip, port, error = %e, "upstream connect failed");
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no address to connect for {host}")))
+}
+
+async fn resolve_target(
+    dns_client: Option<&Arc<DnsClient>>,
+    client_subnet: Option<IpAddr>,
+    host: &str,
+) -> anyhow::Result<Vec<IpAddr>> {
+    if let Ok(ip) = IpAddr::from_str(host) {
+        return Ok(vec![ip]);
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(vec![
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ]);
+    }
+    let Some(dns) = dns_client else {
+        anyhow::bail!("warp: `{host}` needs a DNS resolver but none is configured");
+    };
+    dns.resolve(host, client_subnet).await
+}
+
+async fn connect_ip(
+    socks5_proxy: Option<&Arc<str>>,
+    ip: IpAddr,
+    port: u16,
+) -> anyhow::Result<TcpStream> {
+    let addr = SocketAddr::new(ip, port);
+    let stream = match socks5_proxy {
+        Some(proxy) => Socks5Stream::connect(proxy.as_ref(), addr)
+            .await
+            .map(Socks5Stream::into_inner)
+            .map_err(|e| anyhow::anyhow!("socks5 connect: {e}"))?,
+        None => TcpStream::connect(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("tcp connect: {e}"))?,
+    };
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+async fn connect_direct(
+    dns_client: Option<&Arc<DnsClient>>,
+    client_subnet: Option<IpAddr>,
+    socks5_proxy: Option<&Arc<str>>,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<TcpStream> {
+    let upstream = if let Some(client) = dns_client {
+        client
+            .connect(
+                host,
+                port,
+                client_subnet,
+                socks5_proxy.map(|s| s.to_string()),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("dns error: {e}"))?
+    } else {
+        match socks5_proxy {
+            Some(p) => Socks5Stream::connect(p.as_ref(), (host, port))
+                .await
+                .map(Socks5Stream::into_inner)
+                .map_err(|e| anyhow::anyhow!("socks5 connect: {e}"))?,
+            None => TcpStream::connect((host, port))
+                .await
+                .map_err(|e| anyhow::anyhow!("tcp connect: {e}"))?,
+        }
+    };
+    upstream.set_nodelay(true)?;
+    Ok(upstream)
+}

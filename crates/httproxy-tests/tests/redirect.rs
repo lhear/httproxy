@@ -1,0 +1,143 @@
+mod common;
+
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+async fn spawn_tcp_echo() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+async fn spawn_redirect(
+    traffic: httproxy_core::shaper::TrafficConfig,
+    keys: &common::TestKeys,
+) -> SocketAddr {
+    let echo = spawn_tcp_echo().await;
+    let server = common::spawn_server(common::server_config(traffic.clone(), keys, None)).await;
+
+    let mut cfg = common::client_config(traffic, keys, None, vec![]);
+    cfg.redirect = vec![httproxy_core::config::RedirectSection {
+        listen: "127.0.0.1:0".to_string(),
+        target: echo.to_string(),
+    }];
+
+    let (_proxy, redirects) = common::spawn_client_with_redirects(cfg, server).await;
+    assert_eq!(redirects.len(), 1, "one redirect listener expected");
+    redirects[0]
+}
+
+#[tokio::test]
+async fn redirect_forwards_raw_tcp() {
+    common::init_logging();
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, None), &keys).await;
+
+    let mut stream = TcpStream::connect(redirect).await.unwrap();
+    stream.write_all(b"hello redirect\n").await.unwrap();
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("echo timed out")
+        .unwrap();
+    assert_eq!(&buf[..n], b"hello redirect\n");
+}
+
+#[tokio::test]
+async fn redirect_handles_many_roundtrips() {
+    common::init_logging();
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, None), &keys).await;
+    let mut stream = TcpStream::connect(redirect).await.unwrap();
+
+    for i in 0..8u8 {
+        let payload = [i; 32];
+        stream.write_all(&payload).await.unwrap();
+        let mut buf = [0u8; 32];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("echo timed out")
+            .unwrap();
+        assert_eq!(buf, payload);
+    }
+}
+
+#[tokio::test]
+async fn redirect_forwards_large_bidirectional_stream() {
+    common::init_logging();
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, None), &keys).await;
+    let stream = TcpStream::connect(redirect).await.unwrap();
+
+    let payload: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    let writer = tokio::spawn(async move {
+        write_half.write_all(&payload).await.unwrap();
+        write_half.shutdown().await.unwrap();
+    });
+
+    let mut got = Vec::with_capacity(expected.len());
+    let mut buf = [0u8; 16 * 1024];
+    while got.len() < expected.len() {
+        let n = tokio::time::timeout(Duration::from_secs(10), read_half.read(&mut buf))
+            .await
+            .expect("read timed out")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    writer.await.unwrap();
+
+    assert_eq!(got.len(), expected.len());
+    assert_eq!(got, expected);
+}
+
+#[tokio::test]
+async fn redirect_survives_download_rotation() {
+    common::init_logging();
+    let keys = common::test_keys();
+    let redirect = spawn_redirect(common::traffic(true, Some(2 * 1024 * 1024)), &keys).await;
+
+    let mut stream = TcpStream::connect(redirect).await.unwrap();
+    let payload: Vec<u8> = (0..128 * 1024u32).map(|i| (i % 241) as u8).collect();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let mut got = Vec::with_capacity(payload.len());
+    let mut buf = [0u8; 16 * 1024];
+    while got.len() < payload.len() {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .expect("read timed out")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got, payload);
+}

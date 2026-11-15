@@ -1,0 +1,652 @@
+use anyhow::{Context, Result, anyhow};
+use bytes::{Buf, Bytes, BytesMut};
+use futures::StreamExt;
+use std::collections::VecDeque;
+use std::io::IoSlice;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::oneshot;
+use tracing::{Instrument, warn};
+use uuid::Uuid;
+
+use super::super::state::SharedState;
+use crate::constants::{
+    DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, MAX_WRITE_IOV, PREFETCH_LEAD_BYTES,
+    PREFETCH_ROTATE_TIMEOUT, WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT, WRITE_STALL_TIMEOUT,
+};
+use crate::cronet::{Client, Response};
+use crate::utils;
+use httproxy_core::shaper::{self, DecodedFrame, EncodingType, FrameCipher};
+
+enum Phase {
+    Streaming {
+        response: Box<Response>,
+        expected_seq: u64,
+        prefetch_at: Option<u64>,
+        prefetch_trigger: Option<oneshot::Sender<()>>,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
+    },
+    Rotating {
+        expected_seq: u64,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
+    },
+    Done,
+}
+
+pub struct DownloadLoopActor {
+    write_half: OwnedWriteHalf,
+    cipher: Arc<dyn FrameCipher>,
+    encoding: EncodingType,
+    stream_id: Uuid,
+    http_client: Arc<Client>,
+    state: Arc<SharedState>,
+    max_bytes: Option<u64>,
+    phase: Phase,
+    buffers: DecodeBuffers,
+}
+
+struct DecodeBuffers {
+    input: BytesMut,
+    json_scratch: Vec<u8>,
+    pending: VecDeque<Bytes>,
+    pending_bytes: usize,
+}
+
+impl DecodeBuffers {
+    fn new() -> Self {
+        Self {
+            input: BytesMut::with_capacity(DECODE_BUF_CAPACITY),
+            json_scratch: Vec::new(),
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        chunk: Bytes,
+        cipher: &dyn FrameCipher,
+        encoding: EncodingType,
+        expected_seq: &mut u64,
+    ) -> Result<()> {
+        if self.input.is_empty() {
+            match chunk.try_into_mut() {
+                Ok(chunk_mut) => self.input = chunk_mut,
+                Err(chunk) => {
+                    self.input.clear();
+                    self.input.extend_from_slice(&chunk);
+                }
+            }
+        } else {
+            self.input.extend_from_slice(&chunk);
+        }
+
+        let Self {
+            input,
+            json_scratch,
+            pending,
+            pending_bytes,
+            ..
+        } = self;
+
+        while let Some(frame) = shaper::decode_frame(input, json_scratch, cipher, encoding)? {
+            let (seq, data) = match frame {
+                DecodedFrame::Owned { seq, data } => (seq, data),
+                DecodedFrame::InJsonScratch { seq, start, end } => {
+                    let plain = shaper::pooled_frame_bytes(std::mem::take(json_scratch));
+                    (seq, plain.slice(start..end))
+                }
+            };
+            if seq != *expected_seq {
+                return Err(anyhow!(
+                    "download frame seq {seq} out of order, expected {expected_seq}"
+                ));
+            }
+            *expected_seq += 1;
+            *pending_bytes += data.len();
+            pending.push_back(data);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn has_pending(&self) -> bool {
+        self.pending_bytes > 0
+    }
+
+    #[inline]
+    fn needs_flush(&self) -> bool {
+        self.pending_bytes >= WRITE_BUF_CAPACITY
+    }
+
+    async fn flush<W>(&mut self, write_half: &mut W, timeout: Duration) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        while !self.pending.is_empty() {
+            let written = {
+                let mut slices: [IoSlice<'_>; MAX_WRITE_IOV] =
+                    std::array::from_fn(|_| IoSlice::new(&[]));
+                let mut count = 0;
+                let mut total = 0;
+                for chunk in &self.pending {
+                    slices[count] = IoSlice::new(chunk);
+                    count += 1;
+                    total += chunk.len();
+                    if count == MAX_WRITE_IOV || total >= WRITE_BUF_CAPACITY {
+                        break;
+                    }
+                }
+                match tokio::time::timeout(timeout, write_half.write_vectored(&slices[..count]))
+                    .await
+                {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "local socket write stalled for {}s",
+                            timeout.as_secs()
+                        ));
+                    }
+                }
+            };
+            if written == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            self.consume(written);
+        }
+        Ok(())
+    }
+
+    fn consume(&mut self, mut n: usize) {
+        while n > 0 {
+            let Some(front) = self.pending.front_mut() else {
+                break;
+            };
+            if front.len() <= n {
+                n -= front.len();
+                self.pending_bytes -= front.len();
+                self.pending.pop_front();
+            } else {
+                front.advance(n);
+                self.pending_bytes -= n;
+                n = 0;
+            }
+        }
+    }
+}
+
+impl DownloadLoopActor {
+    pub fn new(
+        initial_response: Response,
+        write_half: OwnedWriteHalf,
+        cipher: Arc<dyn FrameCipher>,
+        stream_id: Uuid,
+        http_client: Arc<Client>,
+        state: Arc<SharedState>,
+    ) -> Self {
+        let encoding = state.traffic_config.encoding_type;
+        let cipher_dyn: Arc<dyn FrameCipher> = cipher;
+        let max_bytes = state.max_download_bytes;
+        let rotate_enabled = max_bytes.is_some_and(|m| m > 0);
+        let prefetch_at = max_bytes.map(|m| m.saturating_sub(PREFETCH_LEAD_BYTES));
+        let use_prefetch = prefetch_at.is_some_and(|at| at > 0);
+
+        let (prefetch_trigger, prefetch_rx) = if rotate_enabled && use_prefetch {
+            let (tx, rx) = spawn_prefetch_continuation(&http_client, &state, stream_id);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        Self {
+            write_half,
+            cipher: cipher_dyn,
+            encoding,
+            stream_id,
+            http_client,
+            state,
+            max_bytes,
+            phase: Phase::Streaming {
+                response: Box::new(initial_response),
+                expected_seq: 0,
+                prefetch_at,
+                prefetch_trigger,
+                prefetch_rx,
+            },
+            buffers: DecodeBuffers::new(),
+        }
+    }
+
+    pub async fn run(mut self) -> Result<()> {
+        loop {
+            self.phase = match std::mem::replace(&mut self.phase, Phase::Done) {
+                Phase::Streaming {
+                    response,
+                    expected_seq,
+                    prefetch_at,
+                    prefetch_trigger,
+                    prefetch_rx,
+                } => {
+                    self.do_streaming(
+                        *response,
+                        expected_seq,
+                        prefetch_at,
+                        prefetch_trigger,
+                        prefetch_rx,
+                    )
+                    .await?
+                }
+                Phase::Rotating {
+                    expected_seq,
+                    prefetch_rx,
+                } => self.do_rotate(expected_seq, prefetch_rx).await?,
+                Phase::Done => break,
+            };
+        }
+        let _ = self.write_half.shutdown().await;
+        Ok(())
+    }
+
+    async fn do_streaming(
+        &mut self,
+        response: Response,
+        expected_seq: u64,
+        prefetch_at: Option<u64>,
+        prefetch_trigger: Option<oneshot::Sender<()>>,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
+    ) -> Result<Phase> {
+        let (bytes, next_seq) = self
+            .drain_response(response, expected_seq, prefetch_at, prefetch_trigger)
+            .await?;
+
+        let should_rotate = bytes > 0 && self.max_bytes.is_some_and(|m| bytes >= m);
+        if !should_rotate {
+            return Ok(Phase::Done);
+        }
+
+        Ok(Phase::Rotating {
+            expected_seq: next_seq,
+            prefetch_rx,
+        })
+    }
+
+    async fn drain_response(
+        &mut self,
+        response: Response,
+        mut expected_seq: u64,
+        prefetch_at: Option<u64>,
+        mut prefetch_trigger: Option<oneshot::Sender<()>>,
+    ) -> Result<(u64, u64)> {
+        let flush_deadline = tokio::time::sleep(WRITE_FLUSH_TIMEOUT);
+        tokio::pin!(flush_deadline);
+        let mut data_stream = response.into_body();
+        let mut bytes_received: u64 = 0;
+
+        loop {
+            tokio::select! {
+                chunk = data_stream.next() => {
+                    let Some(chunk) = chunk else { break };
+                    let chunk = chunk.context("response read error")?;
+                    bytes_received += chunk.len() as u64;
+
+                    if let Some(at) = prefetch_at
+                        && bytes_received >= at
+                        && let Some(tx) = prefetch_trigger.take()
+                    {
+                        let _ = tx.send(());
+                    }
+
+                    self.buffers
+                        .ingest(chunk, &*self.cipher, self.encoding, &mut expected_seq)?;
+
+                    if self.buffers.needs_flush() {
+                        self.buffers.flush(&mut self.write_half, WRITE_STALL_TIMEOUT).await?;
+                        flush_deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT);
+                    }
+                }
+                _ = &mut flush_deadline, if self.buffers.has_pending() => {
+                    self.buffers.flush(&mut self.write_half, WRITE_STALL_TIMEOUT).await?;
+                    flush_deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + WRITE_FLUSH_TIMEOUT);
+                }
+            }
+        }
+
+        self.buffers
+            .flush(&mut self.write_half, WRITE_STALL_TIMEOUT)
+            .await?;
+
+        if !self.buffers.input.is_empty() {
+            warn!(
+                remaining = self.buffers.input.len(),
+                "download stream ended with undecoded data"
+            );
+            self.buffers.input.clear();
+        }
+        Ok((bytes_received, expected_seq))
+    }
+
+    async fn do_rotate(
+        &mut self,
+        expected_seq: u64,
+        prefetch_rx: Option<oneshot::Receiver<Result<Response>>>,
+    ) -> Result<Phase> {
+        let response = if let Some(rx) = prefetch_rx {
+            tokio::pin!(rx);
+            match tokio::time::timeout(PREFETCH_ROTATE_TIMEOUT, &mut rx).await {
+                Ok(Ok(Ok(resp))) => resp,
+                Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                    send_continue_request(&self.http_client, &self.state, self.stream_id).await?
+                }
+                Err(_elapsed) => {
+                    warn!("prefetch slow, waiting one more window");
+                    match tokio::time::timeout(PREFETCH_ROTATE_TIMEOUT, &mut rx).await {
+                        Ok(Ok(Ok(resp))) => resp,
+                        _ => {
+                            return Err(anyhow!(
+                                "prefetch continuation timed out after {}s",
+                                2 * PREFETCH_ROTATE_TIMEOUT.as_secs()
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            send_continue_request(&self.http_client, &self.state, self.stream_id).await?
+        };
+
+        let use_prefetch = self
+            .max_bytes
+            .map(|m| m.saturating_sub(PREFETCH_LEAD_BYTES))
+            .is_some_and(|at| at > 0);
+        let (prefetch_trigger, prefetch_rx) = if use_prefetch {
+            let (tx, rx) =
+                spawn_prefetch_continuation(&self.http_client, &self.state, self.stream_id);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let prefetch_at = self
+            .max_bytes
+            .map(|m| m.saturating_sub(PREFETCH_LEAD_BYTES));
+
+        Ok(Phase::Streaming {
+            response: Box::new(response),
+            expected_seq,
+            prefetch_at,
+            prefetch_trigger,
+            prefetch_rx,
+        })
+    }
+}
+
+async fn send_continue_request(
+    http_client: &Client,
+    state: &SharedState,
+    stream_id: Uuid,
+) -> Result<Response> {
+    let mut cookie = String::new();
+    utils::build_stream_cookie(&mut cookie, stream_id);
+    let req = http_client
+        .post(state.remote_str.as_str())
+        .header("Cookie", cookie);
+    let resp = tokio::time::timeout(DOWNLOAD_CONNECT_TIMEOUT, req.send())
+        .await
+        .context("continuation timed out")?
+        .context("continuation failed")?;
+    let resp = utils::check_response_status(resp, "continuation rejected").await?;
+    Ok(resp)
+}
+
+fn spawn_prefetch_continuation(
+    http_client: &Arc<Client>,
+    state: &Arc<SharedState>,
+    stream_id: Uuid,
+) -> (oneshot::Sender<()>, oneshot::Receiver<Result<Response>>) {
+    let (trigger_tx, trigger_rx) = oneshot::channel();
+    let (result_tx, result_rx) = oneshot::channel();
+    let pre_client = Arc::clone(http_client);
+    let pre_state = Arc::clone(state);
+    tokio::spawn(
+        async move {
+            if trigger_rx.await.is_err() {
+                return;
+            }
+            match send_continue_request(&pre_client, &pre_state, stream_id).await {
+                Ok(resp) => {
+                    let _ = result_tx.send(Ok(resp));
+                }
+                Err(e) => {
+                    warn!(error = %e, "prefetch failed");
+                    let _ = result_tx.send(Err(e));
+                }
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+    (trigger_tx, result_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httproxy_core::test_support::{cipher_with_key, test_cipher};
+
+    fn buffers() -> DecodeBuffers {
+        DecodeBuffers::new()
+    }
+
+    fn queued(bufs: &DecodeBuffers) -> Vec<u8> {
+        bufs.pending
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect()
+    }
+
+    fn frame(data: &[u8], seq: u64) -> Bytes {
+        Bytes::from(
+            shaper::encode_frame(data, seq, &test_cipher(), 0, [0, 0], EncodingType::Binary)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn ingest_accepts_frames_in_order() {
+        let cipher = test_cipher();
+        let mut bufs = buffers();
+        let mut expected_seq = 0u64;
+        bufs.ingest(
+            frame(b"abc", 0),
+            &cipher,
+            EncodingType::Binary,
+            &mut expected_seq,
+        )
+        .unwrap();
+        bufs.ingest(
+            frame(b"de", 1),
+            &cipher,
+            EncodingType::Binary,
+            &mut expected_seq,
+        )
+        .unwrap();
+
+        assert_eq!(queued(&bufs), b"abcde");
+        assert_eq!(bufs.pending_bytes, 5);
+        assert_eq!(expected_seq, 2);
+        assert!(bufs.input.is_empty());
+    }
+
+    #[test]
+    fn ingest_hands_over_frames_without_copying() {
+        let cipher = test_cipher();
+        let mut bufs = buffers();
+        let mut expected_seq = 0u64;
+        let raw = frame(&[0xAB; 512], 0);
+        let raw_ptr = raw.as_ptr();
+        bufs.ingest(raw, &cipher, EncodingType::Binary, &mut expected_seq)
+            .unwrap();
+
+        let head = bufs.pending.front().expect("one pending chunk");
+        assert_eq!(head.len(), 512);
+        assert_eq!(
+            head.as_ptr(),
+            raw_ptr.wrapping_add(2 + httproxy_core::crypto::NONCE_LEN + 10),
+            "payload must alias the input buffer, not a copy"
+        );
+    }
+
+    #[test]
+    fn ingest_handles_split_frames() {
+        let cipher = test_cipher();
+        let mut bufs = buffers();
+        let mut expected_seq = 0u64;
+        let raw = shaper::encode_frame(b"hello world", 0, &cipher, 0, [0, 0], EncodingType::Binary)
+            .unwrap();
+        let split = raw.len() / 2;
+
+        bufs.ingest(
+            Bytes::from(raw[..split].to_vec()),
+            &cipher,
+            EncodingType::Binary,
+            &mut expected_seq,
+        )
+        .unwrap();
+        assert!(!bufs.has_pending());
+        assert!(!bufs.input.is_empty());
+
+        bufs.ingest(
+            Bytes::from(raw[split..].to_vec()),
+            &cipher,
+            EncodingType::Binary,
+            &mut expected_seq,
+        )
+        .unwrap();
+        assert_eq!(queued(&bufs), b"hello world");
+        assert!(bufs.input.is_empty());
+    }
+
+    #[test]
+    fn ingest_rejects_out_of_order() {
+        let cipher = test_cipher();
+        let mut bufs = buffers();
+        let mut expected_seq = 0u64;
+        assert!(
+            bufs.ingest(
+                frame(b"x", 5),
+                &cipher,
+                EncodingType::Binary,
+                &mut expected_seq
+            )
+            .is_err()
+        );
+        assert!(!bufs.has_pending());
+        assert_eq!(expected_seq, 0);
+    }
+
+    #[test]
+    fn ingest_rejects_undecryptable_frame() {
+        let cipher = test_cipher();
+        let other = cipher_with_key(9);
+        let raw = Bytes::from(
+            shaper::encode_frame(b"secret", 0, &other, 0, [0, 0], EncodingType::Binary).unwrap(),
+        );
+
+        let mut bufs = buffers();
+        let mut expected_seq = 0u64;
+        assert!(
+            bufs.ingest(raw, &cipher, EncodingType::Binary, &mut expected_seq)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn consume_walks_partial_chunks() {
+        let mut bufs = buffers();
+        bufs.pending.push_back(Bytes::from_static(b"aaa"));
+        bufs.pending.push_back(Bytes::from_static(b"bbb"));
+        bufs.pending.push_back(Bytes::from_static(b"ccc"));
+        bufs.pending_bytes = 9;
+
+        bufs.consume(4);
+        assert_eq!(bufs.pending_bytes, 5);
+        assert_eq!(bufs.pending.len(), 2);
+        assert_eq!(&bufs.pending[0][..], b"bb");
+        assert_eq!(&bufs.pending[1][..], b"ccc");
+
+        bufs.consume(5);
+        assert_eq!(bufs.pending_bytes, 0);
+        assert!(bufs.pending.is_empty());
+        assert!(!bufs.has_pending());
+    }
+
+    #[test]
+    fn ingest_leaves_no_state_behind_across_chunks() {
+        let cipher = test_cipher();
+        let mut bufs = buffers();
+        let mut expected_seq = 0u64;
+        for i in 0..8u64 {
+            bufs.ingest(
+                frame(&[0xAA; 1024], i),
+                &cipher,
+                EncodingType::Binary,
+                &mut expected_seq,
+            )
+            .unwrap();
+            let written = bufs.pending_bytes;
+            bufs.consume(written);
+            assert!(
+                bufs.input.is_empty(),
+                "no leftover input after a full frame"
+            );
+            assert!(!bufs.has_pending());
+        }
+        assert_eq!(expected_seq, 8);
+    }
+
+    struct StalledWriter;
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_times_out_when_local_socket_stalls() {
+        let mut bufs = buffers();
+        bufs.pending.push_back(Bytes::from_static(b"blocked"));
+        bufs.pending_bytes = 7;
+
+        let mut writer = StalledWriter;
+        let err = bufs
+            .flush(&mut writer, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+        assert_eq!(bufs.pending_bytes, 7, "unwritten data stays queued");
+    }
+}
