@@ -23,8 +23,6 @@ struct BypassFile {
     ip_cidr: Vec<String>,
 }
 
-const MAX_DOMAIN_LEN: usize = 253;
-
 #[inline]
 fn domain_to_fst_key(domain: &str) -> Option<Box<[u8]>> {
     let domain = domain.trim_matches('.');
@@ -81,29 +79,26 @@ impl DomainFst {
             return false;
         }
 
-        let bytes = domain.as_bytes();
-        let mut buf = Vec::with_capacity(bytes.len().min(MAX_DOMAIN_LEN));
-        let mut end = bytes.len();
+        let fst = self.set.as_fst();
+        let mut node = fst.root();
         let mut first = true;
-
-        while end > 0 {
-            let mut start = end;
-            while start > 0 && bytes[start - 1] != b'.' {
-                start -= 1;
-            }
-
+        for label in domain.rsplit('.') {
             if !first {
-                buf.push(b'\x00');
+                let Some(index) = node.find_input(0) else {
+                    return false;
+                };
+                node = fst.node(node.transition_addr(index));
             }
             first = false;
-
-            buf.extend(bytes[start..end].iter().map(|b| b.to_ascii_lowercase()));
-
-            if self.set.contains(&buf) {
+            for byte in label.bytes() {
+                let Some(index) = node.find_input(byte.to_ascii_lowercase()) else {
+                    return false;
+                };
+                node = fst.node(node.transition_addr(index));
+            }
+            if node.is_final() {
                 return true;
             }
-
-            end = if start > 0 { start - 1 } else { 0 };
         }
 
         false
@@ -309,6 +304,11 @@ mod tests {
         assert!(r.match_domain("example.com"));
         assert!(r.match_domain("Sub.Example.Com"));
         assert!(!r.match_domain("other.net"));
+        assert!(r.match_domain(".deep.Sub.Example.Com."));
+        assert!(!r.match_domain("example.computer"));
+        assert!(!r.match_domain("example.com.other"));
+        assert!(!r.match_domain(""));
+        assert!(!r.match_domain("..."));
     }
 
     #[test]

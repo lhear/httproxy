@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -69,16 +69,14 @@ async fn handle_bypass_direct(
     let up = async {
         let res = copy_with_write_timeout(&mut read_half, &mut remote_write).await;
         let _ = remote_write.shutdown().await;
-        res
+        res.context("bypass client->remote")
     };
     let down = async {
         let res = copy_with_write_timeout(&mut remote_read, &mut write_half).await;
         let _ = write_half.shutdown().await;
-        res
+        res.context("bypass remote->client")
     };
-    let (up_res, down_res) = tokio::join!(up, down);
-    up_res.context("bypass client->remote")?;
-    down_res.context("bypass remote->client")?;
+    tokio::try_join!(up, down)?;
     info!(target = %target, "bypass connection closed");
     Ok(())
 }
@@ -112,16 +110,54 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; COPY_BUF_SIZE];
+    let mut buf = BytesMut::with_capacity(COPY_BUF_SIZE);
     let mut copied = 0u64;
     loop {
-        let n = match reader.read(&mut buf).await {
+        let n = match reader.read_buf(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => return Err(e),
         };
         write_with_timeout(writer, &buf[..n]).await?;
         copied += n as u64;
+        buf.clear();
     }
     Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httproxy_core::test_support::connected_pair;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn bypass_write_error_cancels_the_idle_upload() {
+        let (proxy, client) = connected_pair().await;
+        let (read_half, mut write_half) = proxy.into_split();
+        write_half.shutdown().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                handle_bypass_direct(read_half, write_half, &target, Bytes::new()),
+                async {
+                    let (mut upstream, _) = listener.accept().await.unwrap();
+                    upstream.write_all(b"response").await.unwrap();
+                    assert_eq!(upstream.read(&mut [0; 1]).await.unwrap(), 0);
+                },
+            )
+            .0
+        })
+        .await
+        .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("bypass remote->client")
+        );
+        drop(client);
+    }
 }

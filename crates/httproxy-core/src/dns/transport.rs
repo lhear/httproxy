@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpStream, UdpSocket},
     sync::{mpsc, oneshot},
+    task::JoinHandle,
     time::timeout,
 };
 use tokio_rustls::{
@@ -30,10 +31,18 @@ const UDP_RECV_BUF: usize = 2048;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_TIMEOUT: Duration = Duration::from_secs(5);
 
-type PendingMap = Arc<StdMutex<HashMap<u16, oneshot::Sender<Result<Vec<u8>>>>>>;
+type PendingMap = Arc<StdMutex<HashMap<u16, Option<oneshot::Sender<Result<Vec<u8>>>>>>>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 type Connector = Arc<dyn Fn() -> BoxFuture<Result<DnsStream>> + Send + Sync>;
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 struct PendingGuard {
     pending: PendingMap,
@@ -53,17 +62,22 @@ fn assign_id_and_register(
     pending: &PendingMap,
     data: &mut [u8],
     tx: oneshot::Sender<Result<Vec<u8>>>,
-) -> u16 {
+) -> Result<u16> {
+    anyhow::ensure!(
+        (2..=u16::MAX as usize).contains(&data.len()),
+        "invalid DNS query length"
+    );
     let mut map = pending.lock().unwrap_or_else(PoisonError::into_inner);
+    anyhow::ensure!(map.len() <= u16::MAX as usize, "DNS query IDs exhausted");
     let id = loop {
         let candidate: u16 = rand::random();
-        if !map.contains_key(&candidate) {
+        if let Entry::Vacant(entry) = map.entry(candidate) {
+            entry.insert(Some(tx));
             break candidate;
         }
     };
     data[0..2].copy_from_slice(&id.to_be_bytes());
-    map.insert(id, tx);
-    id
+    Ok(id)
 }
 
 pub(super) struct UdpTransport {
@@ -131,6 +145,7 @@ impl AsyncWrite for DnsStream {
 pub(super) struct StreamTransport {
     tx: mpsc::Sender<(Vec<u8>, u16)>,
     pending: PendingMap,
+    _task: AbortOnDrop,
 }
 
 impl StreamTransport {
@@ -139,9 +154,9 @@ impl StreamTransport {
         let actor_pending = pending.clone();
         let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u16)>(32);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut writer: Option<tokio::io::WriteHalf<DnsStream>> = None;
-            let mut reader_task: Option<tokio::task::JoinHandle<()>> = None;
+            let mut reader_task: Option<AbortOnDrop> = None;
 
             loop {
                 tokio::select! {
@@ -154,14 +169,15 @@ impl StreamTransport {
                                     let (r, w) = tokio::io::split(s);
                                     writer = Some(w);
                                     let pm = actor_pending.clone();
-                                    reader_task = Some(tokio::spawn(Self::reader_loop(r, pm)));
+                                    reader_task = Some(AbortOnDrop(tokio::spawn(Self::reader_loop(r, pm))));
                                     debug!("DNS stream transport connected");
                                 }
                                 Err(e) => {
                                     if let Some(tx) = actor_pending
                                         .lock()
                                         .unwrap_or_else(PoisonError::into_inner)
-                                        .remove(&id)
+                                        .get_mut(&id)
+                                        .and_then(Option::take)
                                     {
                                         let _ = tx.send(Err(anyhow!("connect failed: {}", e)));
                                     }
@@ -181,21 +197,22 @@ impl StreamTransport {
                         if !matches!(write_result, Ok(Ok(()))) {
                             warn!("DNS upstream write failed or timed out, dropping connection");
 
-                            for (_, tx) in actor_pending
+                            for tx in actor_pending
                                 .lock()
                                 .unwrap_or_else(PoisonError::into_inner)
-                                .drain()
+                                .values_mut()
+                                .filter_map(Option::take)
                             {
                                 let _ = tx.send(Err(anyhow!("write failed, connection reset")));
                             }
                             writer = None;
-                            if let Some(t) = reader_task.take() { t.abort(); }
+                            reader_task = None;
                         }
                     }
 
                     _ = async {
                         if let Some(ref mut t) = reader_task {
-                            t.await.ok();
+                            (&mut t.0).await.ok();
                         } else {
                             std::future::pending::<()>().await;
                         }
@@ -204,10 +221,11 @@ impl StreamTransport {
                         writer = None;
                         reader_task = None;
 
-                        for (_, tx) in actor_pending
+                        for tx in actor_pending
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
-                            .drain()
+                            .values_mut()
+                            .filter_map(Option::take)
                         {
                             let _ = tx.send(Err(anyhow!("connection reset by remote")));
                         }
@@ -216,7 +234,11 @@ impl StreamTransport {
             }
         });
 
-        Self { tx, pending }
+        Self {
+            tx,
+            pending,
+            _task: AbortOnDrop(task),
+        }
     }
 
     async fn reader_loop(mut r: tokio::io::ReadHalf<DnsStream>, pending: PendingMap) {
@@ -240,7 +262,8 @@ impl StreamTransport {
                 if let Some(tx) = pending
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&id)
+                    .get_mut(&id)
+                    .and_then(Option::take)
                 {
                     let _ = tx.send(Ok(buf));
                 }
@@ -248,24 +271,26 @@ impl StreamTransport {
         }
     }
 
-    pub(super) async fn send(&self, data: &mut [u8]) -> Result<(Vec<u8>, u16)> {
+    pub(super) async fn send(&self, mut data: Vec<u8>) -> Result<(Vec<u8>, u16)> {
         let (tx, rx) = oneshot::channel();
 
-        let id = assign_id_and_register(&self.pending, data, tx);
+        let id = assign_id_and_register(&self.pending, &mut data, tx)?;
         let _pending_guard = PendingGuard {
             pending: Arc::clone(&self.pending),
             id,
         };
 
-        if self.tx.send((data.to_vec(), id)).await.is_err() {
-            return Err(anyhow!("DNS transport actor closed"));
-        }
-
-        match timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(res)) => Ok((res?, id)),
-            Ok(Err(_)) => Err(anyhow!("DNS response channel closed")),
-            Err(_) => Err(anyhow!("DNS query timeout")),
-        }
+        let response = timeout(Duration::from_secs(5), async {
+            self.tx
+                .send((data, id))
+                .await
+                .map_err(|_| anyhow!("DNS transport actor closed"))?;
+            rx.await
+                .map_err(|_| anyhow!("DNS response channel closed"))?
+        })
+        .await
+        .context("DNS query timeout")??;
+        Ok((response, id))
     }
 }
 
@@ -275,9 +300,9 @@ pub(super) enum Transport {
 }
 
 impl Transport {
-    pub(super) async fn send(&self, data: &mut [u8]) -> Result<(Vec<u8>, u16)> {
+    pub(super) async fn send(&self, mut data: Vec<u8>) -> Result<(Vec<u8>, u16)> {
         match self {
-            Transport::Udp(t) => t.send(data).await,
+            Transport::Udp(t) => t.send(&mut data).await,
             Transport::Stream(t) => t.send(data).await,
         }
     }
@@ -436,7 +461,7 @@ mod tests {
     async fn stream_transport_uses_length_prefixed_framing() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut len_buf = [0u8; 2];
             socket.read_exact(&mut len_buf).await.unwrap();
@@ -446,7 +471,7 @@ mod tests {
             socket.write_all(&len_buf).await.unwrap();
             socket.write_all(&msg).await.unwrap();
             socket.flush().await.unwrap();
-            std::future::pending::<()>().await;
+            assert_eq!(socket.read(&mut len_buf).await.unwrap(), 0);
         });
 
         let connector: Connector = Arc::new(move || {
@@ -458,9 +483,14 @@ mod tests {
         let t = StreamTransport::new(connector);
 
         let mut query = vec![0u8; 12];
-        let (resp, id) = t.send(&mut query).await.unwrap();
-        assert_eq!(id, u16::from_be_bytes([query[0], query[1]]));
+        let (resp, id) = t.send(query.clone()).await.unwrap();
+        query[..2].copy_from_slice(&id.to_be_bytes());
         assert_eq!(resp, query);
+        drop(t);
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -476,7 +506,42 @@ mod tests {
             })
         });
         let t = StreamTransport::new(connector);
-        let mut query = [0u8; 12];
-        assert!(t.send(&mut query).await.is_err());
+        assert!(t.send(vec![0u8; 12]).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_queries_time_out_and_release_a_stalled_connector() {
+        let owner = Arc::new(());
+        let watch = Arc::downgrade(&owner);
+        let connector: Connector = Arc::new(move || {
+            let owner = Arc::clone(&owner);
+            Box::pin(async move {
+                let _owner = owner;
+                std::future::pending().await
+            })
+        });
+        let transport = StreamTransport::new(connector);
+        let results = timeout(
+            Duration::from_secs(6),
+            futures::future::join_all((0..64).map(|_| transport.send(vec![0; 12]))),
+        )
+        .await
+        .unwrap();
+        assert!(results.into_iter().all(|result| {
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("DNS query timeout")
+        }));
+        assert!(transport.pending.lock().unwrap().is_empty());
+        drop(transport);
+        tokio::time::resume();
+        timeout(Duration::from_secs(1), async {
+            while watch.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

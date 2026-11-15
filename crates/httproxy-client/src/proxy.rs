@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use http::uri::Authority;
 use tokio::io::AsyncReadExt;
 use url::Url;
@@ -25,12 +25,13 @@ pub async fn parse_proxy_request(
         if let Some(request) = try_parse_head(buffer, expected_auth)? {
             return Ok(request);
         }
-        if buffer.len() > MAX_HEADER_LEN {
+        if buffer.len() >= MAX_HEADER_LEN {
             return Err(anyhow!("header too large"));
         }
 
-        buffer.reserve(READ_RESERVE);
-        if reader.read_buf(buffer).await? == 0 {
+        let remaining = MAX_HEADER_LEN - buffer.len();
+        buffer.reserve(READ_RESERVE.min(remaining));
+        if reader.take(remaining as u64).read_buf(buffer).await? == 0 {
             return Err(anyhow!("connection closed during header parsing"));
         }
     }
@@ -41,6 +42,7 @@ fn try_parse_head(buffer: &BytesMut, expected_auth: Option<&str>) -> Result<Opti
     let mut req = httparse::Request::new(&mut headers);
     match req.parse(buffer)? {
         httparse::Status::Complete(amt) => {
+            anyhow::ensure!(amt <= MAX_HEADER_LEN, "header too large");
             let method = req.method.context("no method")?;
             let target = req.path.context("no path")?;
             let authorized = match expected_auth {
@@ -157,26 +159,15 @@ pub fn rewrite_request_line(
 
     let new_line_len = method.len() + 1 + origin_path.len() + 1 + version.len() + 2;
     if new_line_len <= old_line_len {
-        let total = buf.len();
-        let delta = old_line_len - new_line_len;
-        buf.copy_within(old_line_len..total, new_line_len);
+        buf.advance(old_line_len - new_line_len);
         write_request_line(&mut buf[..new_line_len], method, origin_path, version);
-        buf.truncate(total - delta);
         return Ok(());
     }
 
-    let mut new_line = Vec::with_capacity(new_line_len);
-    new_line.extend_from_slice(method.as_bytes());
-    new_line.push(b' ');
-    new_line.extend_from_slice(origin_path.as_bytes());
-    new_line.push(b' ');
-    new_line.extend_from_slice(version);
-    new_line.extend_from_slice(b"\r\n");
-
-    let rest = buf.split_off(old_line_len);
-    buf.clear();
-    buf.put_slice(&new_line);
-    buf.unsplit(rest);
+    let total = buf.len();
+    buf.resize(total + new_line_len - old_line_len, 0);
+    buf.copy_within(old_line_len..total, new_line_len);
+    write_request_line(&mut buf[..new_line_len], method, origin_path, version);
 
     Ok(())
 }
@@ -196,52 +187,48 @@ fn is_proxy_only_header(line: &[u8]) -> bool {
 
 pub fn strip_proxy_headers(buf: &mut BytesMut, header_len: usize) -> usize {
     let head_end = header_len.min(buf.len());
-    let head = buf[..head_end].to_vec();
-
-    let Some(request_line_end) = memchr::memchr(b'\n', &head).map(|pos| pos + 1) else {
+    let Some(request_line_end) = memchr::memchr(b'\n', &buf[..head_end]).map(|pos| pos + 1) else {
         return header_len;
     };
 
-    let mut kept = Vec::with_capacity(head.len());
-    kept.extend_from_slice(&head[..request_line_end]);
-
+    let mut written = request_line_end;
     let mut dropping = false;
     let mut cursor = request_line_end;
-    while cursor < head.len() {
-        let rest = &head[cursor..];
+    while cursor < head_end {
+        let rest = &buf[cursor..head_end];
         let Some(rel) = memchr::memchr(b'\n', rest) else {
-            kept.extend_from_slice(rest);
+            buf.copy_within(cursor..head_end, written);
+            written += head_end - cursor;
             break;
         };
         let line_end = cursor + rel + 1;
-        let line = &head[cursor..line_end];
-        if matches!(line.first(), Some(b' ') | Some(b'\t')) {
-            if !dropping {
-                kept.extend_from_slice(line);
-            }
-        } else {
+        let line = &buf[cursor..line_end];
+        if !matches!(line.first(), Some(b' ') | Some(b'\t')) {
             dropping = is_proxy_only_header(line);
-            if !dropping {
-                kept.extend_from_slice(line);
+        }
+        if !dropping {
+            if written != cursor {
+                buf.copy_within(cursor..line_end, written);
             }
+            written += line_end - cursor;
         }
         cursor = line_end;
     }
 
-    if kept.len() == head.len() {
+    if written == head_end {
         return header_len;
     }
 
-    let new_len = kept.len();
-    buf[..new_len].copy_from_slice(&kept);
-    if buf.len() > header_len {
-        buf.copy_within(header_len.., new_len);
-        let tail_len = buf.len() - header_len;
-        buf.truncate(new_len + tail_len);
+    let tail_len = buf.len() - head_end;
+    if tail_len > written {
+        let removed = head_end - written;
+        buf.copy_within(..written, removed);
+        buf.advance(removed);
     } else {
-        buf.truncate(new_len);
+        buf.copy_within(head_end.., written);
+        buf.truncate(written + tail_len);
     }
-    new_len
+    written
 }
 
 #[inline]
@@ -285,72 +272,30 @@ mod tests {
     }
 
     #[test]
-    fn resolve_http_url() {
-        let (host, path) = resolve_request("GET", "http://example.com/path").unwrap();
-        assert_eq!(host, "example.com:80");
-        assert_eq!(path.as_deref(), Some("/path"));
-    }
-
-    #[test]
-    fn resolve_https_url() {
-        let (host, _) = resolve_request("GET", "https://example.com/path").unwrap();
-        assert_eq!(host, "example.com:443");
-    }
-
-    #[test]
     fn resolve_connect_no_port_fails() {
         assert!(resolve_request("CONNECT", "example.com").is_err());
     }
 
     #[test]
     fn rewrite_absolute_to_origin() {
-        let mut buf = BytesMut::from(
-            &b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
-        );
-        handle_request(&mut buf, "GET", "http://example.com/path").unwrap();
-        let result = String::from_utf8(buf.to_vec()).unwrap();
-        assert!(
-            result.starts_with("GET /path HTTP/1.1\r\n"),
-            "got: {result}"
-        );
-        assert!(result.contains("Host: example.com"));
-    }
-
-    #[test]
-    fn rewrite_with_query_string() {
-        let mut buf = BytesMut::from(
-            &b"GET http://example.com/search?q=rust&lang=en HTTP/1.1\r\nHost: example.com\r\n\r\n"
-                [..],
-        );
-        handle_request(&mut buf, "GET", "http://example.com/search?q=rust&lang=en").unwrap();
-        let result = String::from_utf8(buf.to_vec()).unwrap();
-        assert!(
-            result.starts_with("GET /search?q=rust&lang=en HTTP/1.1\r\n"),
-            "got: {result}"
-        );
-    }
-
-    #[test]
-    fn rewrite_root_path() {
-        let mut buf =
-            BytesMut::from(&b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n"[..]);
-        handle_request(&mut buf, "GET", "http://example.com/").unwrap();
-        let result = String::from_utf8(buf.to_vec()).unwrap();
-        assert!(result.starts_with("GET / HTTP/1.1\r\n"), "got: {result}");
-    }
-
-    #[test]
-    fn rewrite_strips_port() {
-        let mut buf = BytesMut::from(
-            &b"GET http://example.com:8080/path HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"[..],
-        );
-        handle_request(&mut buf, "GET", "http://example.com:8080/path").unwrap();
-        let result = String::from_utf8(buf.to_vec()).unwrap();
-        assert!(
-            result.starts_with("GET /path HTTP/1.1\r\n"),
-            "got: {result}"
-        );
-        assert!(result.contains("Host: example.com:8080"));
+        for (authority, path) in [
+            ("example.com", "/path"),
+            ("example.com", "/search?q=rust&lang=en"),
+            ("example.com", "/"),
+            ("example.com:8080", "/path"),
+        ] {
+            let target = format!("http://{authority}{path}");
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+            );
+            let mut buf = BytesMut::from(request.as_bytes());
+            handle_request(&mut buf, "GET", &target).unwrap();
+            assert_eq!(
+                &buf[..],
+                format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+                "{target}"
+            );
+        }
     }
 
     #[test]
@@ -370,7 +315,12 @@ mod tests {
         request.extend_from_slice(body);
 
         let mut buf = BytesMut::from(&request[..]);
+        let body_pointer = buf.as_ptr().wrapping_add(buf.len() - body.len());
         handle_request(&mut buf, "POST", "http://example.com/api").unwrap();
+        assert_eq!(
+            buf.as_ptr().wrapping_add(buf.len() - body.len()),
+            body_pointer
+        );
         let result = buf.to_vec();
 
         let result_str = String::from_utf8(result.clone()).unwrap();
@@ -383,17 +333,16 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_drops_proxy_authorization() {
-        let mut buf = BytesMut::from(
-            &b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"[..],
-        );
-        handle_request(&mut buf, "GET", "http://example.com/path").unwrap();
-        let result = String::from_utf8(buf.to_vec()).unwrap();
-        assert!(
-            !result.to_ascii_lowercase().contains("proxy-authorization"),
-            "代理凭据不能被转发给上游: {result}"
-        );
-        assert!(result.contains("Host: example.com"));
+    fn rewrite_longer_request_line_preserves_headers_and_body() {
+        for path in ["/", "/a/longer/path?key=value"] {
+            let mut buf = BytesMut::from(&b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody"[..]);
+            let header_len = head_len(&buf);
+            rewrite_request_line(&mut buf, header_len, "POST", path).unwrap();
+            assert_eq!(
+                &buf[..],
+                format!("POST {path} HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody").as_bytes()
+            );
+        }
     }
 
     #[test]
@@ -406,25 +355,25 @@ mod tests {
 
     #[test]
     fn resolve_request_returns_origin_form() {
-        let (host, path) = resolve_request("GET", "http://example.com:8080/a/b?q=1&r=2").unwrap();
-        assert_eq!(host, "example.com:8080");
-        assert_eq!(path.as_deref(), Some("/a/b?q=1&r=2"));
+        for (target, expected_host, expected_path) in [
+            ("http://example.com/path", "example.com:80", "/path"),
+            ("https://example.com/path", "example.com:443", "/path"),
+            (
+                "http://example.com:8080/a/b?q=1&r=2",
+                "example.com:8080",
+                "/a/b?q=1&r=2",
+            ),
+            ("http://example.com/a#frag", "example.com:80", "/a"),
+            ("http://example.com", "example.com:80", "/"),
+        ] {
+            let (host, path) = resolve_request("GET", target).unwrap();
+            assert_eq!(host, expected_host, "{target}");
+            assert_eq!(path.as_deref(), Some(expected_path), "{target}");
+        }
 
         let (host, path) = resolve_request("CONNECT", "example.com:443").unwrap();
         assert_eq!(host, "example.com:443");
         assert!(path.is_none());
-    }
-
-    #[test]
-    fn resolve_request_drops_fragment() {
-        let (_, path) = resolve_request("GET", "http://example.com/a#frag").unwrap();
-        assert_eq!(path.as_deref(), Some("/a"));
-    }
-
-    #[test]
-    fn resolve_request_defaults_empty_path_to_slash() {
-        let (_, path) = resolve_request("GET", "http://example.com").unwrap();
-        assert_eq!(path.as_deref(), Some("/"));
     }
 
     #[tokio::test]
@@ -491,6 +440,37 @@ mod tests {
         assert_eq!(&buf[..req.header_len], &raw[..]);
     }
 
+    #[tokio::test]
+    async fn proxy_header_limit_excludes_the_body() {
+        let mut header = b"POST http://example.com/ HTTP/1.1\r\nX-Pad: ".to_vec();
+        header.resize(MAX_HEADER_LEN - 4, b'x');
+        header.extend_from_slice(b"\r\n\r\n");
+        let mut buffered = BytesMut::from(&header[..]);
+        buffered.extend_from_slice(&vec![0; MAX_HEADER_LEN]);
+        let request = parse_proxy_request(&mut tokio::io::empty(), &mut buffered, None)
+            .await
+            .unwrap();
+        assert_eq!(request.header_len, MAX_HEADER_LEN);
+
+        header.insert(MAX_HEADER_LEN - 4, b'x');
+        for prebuffered in [false, true] {
+            let mut buffer = if prebuffered {
+                BytesMut::from(&header[..])
+            } else {
+                BytesMut::new()
+            };
+            let mut reader = &header[..];
+            let error = parse_proxy_request(&mut reader, &mut buffer, None)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("header too large"));
+            if !prebuffered {
+                assert_eq!(buffer.len(), MAX_HEADER_LEN);
+            }
+        }
+    }
+
     #[test]
     fn strip_proxy_headers_drops_credentials() {
         let raw = b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
@@ -508,20 +488,26 @@ mod tests {
 
     #[test]
     fn strip_proxy_headers_keeps_body() {
-        let head = b"POST http://example.com/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic YQ==\r\nContent-Length: 4\r\n\r\n";
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(head);
-        buf.extend_from_slice(b"body");
-
-        let new_len = strip_proxy_headers(&mut buf, head.len());
-
-        assert!(
-            !String::from_utf8_lossy(&buf[..new_len])
-                .to_ascii_lowercase()
-                .contains("proxy-authorization")
-        );
-        assert!(buf.ends_with(b"body"));
-        assert_eq!(buf.len() - new_len, 4);
+        for body_len in [4, 8192] {
+            let head = format!(
+                "POST http://example.com/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic YQ==\r\nContent-Length: {body_len}\r\n\r\n"
+            );
+            let body = vec![b'x'; body_len];
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(head.as_bytes());
+            buf.extend_from_slice(&body);
+            let body_pointer = buf.as_ptr().wrapping_add(head.len());
+            let new_len = strip_proxy_headers(&mut buf, head.len());
+            assert!(
+                !String::from_utf8_lossy(&buf[..new_len])
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization")
+            );
+            assert_eq!(&buf[new_len..], &body);
+            if body_len == 8192 {
+                assert_eq!(buf.as_ptr().wrapping_add(new_len), body_pointer);
+            }
+        }
     }
 
     #[test]

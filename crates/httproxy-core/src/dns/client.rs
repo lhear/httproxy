@@ -7,6 +7,7 @@ use domain::{
     },
     rdata::{A, Aaaa},
 };
+use futures::{StreamExt, stream::FuturesUnordered};
 use moka::future::Cache;
 use rand::seq::SliceRandom;
 use std::{
@@ -22,7 +23,6 @@ use std::{
 use tokio::{
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore, watch},
-    task::JoinSet,
     time::{Instant, timeout},
 };
 use tokio_socks::tcp::Socks5Stream;
@@ -234,9 +234,9 @@ impl DnsClient {
         rtype: Rtype,
         ecs: Option<IpAddr>,
     ) -> Result<(Vec<IpAddr>, Duration)> {
-        let mut query = self.build_query(domain, rtype, ecs, 0)?;
+        let query = self.build_query(domain, rtype, ecs, 0)?;
 
-        let (resp, id) = self.transport.send(&mut query).await?;
+        let (resp, id) = self.transport.send(query).await?;
 
         self.parse_response(&resp, id, rtype, domain)
     }
@@ -430,38 +430,35 @@ impl DnsClient {
         if ips.is_empty() {
             return Err(anyhow!("no IPs to connect"));
         }
-        let mut set = JoinSet::new();
+        let mut attempts = FuturesUnordered::new();
         let mut iter = ips.into_iter();
-        let proxy = Arc::new(proxy);
 
-        set.spawn(Self::connect_single(
+        attempts.push(Self::connect_single(
             iter.next().unwrap(),
             port,
-            (*proxy).clone(),
+            proxy.as_deref(),
         ));
 
         let delay = Duration::from_millis(self.config.options.happy_eyeballs_delay_ms);
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
-        let mut all_started = false;
-
         loop {
             tokio::select! {
-                Some(result) = set.join_next() => {
+                Some(result) = attempts.next() => {
                     match result {
-                        Ok(Ok(stream)) => return Ok(stream),
-                        Ok(Err(e)) => debug!("connection attempt failed: {}", e),
-                        Err(e) => warn!("connection task panicked: {}", e),
+                        Ok(stream) => return Ok(stream),
+                        Err(error) => debug!("connection attempt failed: {}", error),
                     }
 
-                    if all_started && set.is_empty() { break; }
-                },
-                () = &mut sleep, if !all_started => match iter.next() {
-                    Some(ip) => {
-                        set.spawn(Self::connect_single(ip, port, (*proxy).clone()));
+                    if attempts.is_empty() {
+                        let Some(ip) = iter.next() else { break; };
+                        attempts.push(Self::connect_single(ip, port, proxy.as_deref()));
                         sleep.as_mut().reset(Instant::now() + delay);
                     }
-                    None => { all_started = true; }
+                },
+                () = &mut sleep, if iter.len() > 0 => {
+                    attempts.push(Self::connect_single(iter.next().unwrap(), port, proxy.as_deref()));
+                    sleep.as_mut().reset(Instant::now() + delay);
                 },
                 else => break,
             }
@@ -469,11 +466,11 @@ impl DnsClient {
 
         Err(anyhow!(
             "all connection attempts failed (via proxy: {:?})",
-            *proxy
+            proxy
         ))
     }
 
-    async fn connect_single(ip: IpAddr, port: u16, proxy: Option<String>) -> Result<TcpStream> {
+    async fn connect_single(ip: IpAddr, port: u16, proxy: Option<&str>) -> Result<TcpStream> {
         let addr = SocketAddr::new(ip, port);
         let t = Duration::from_secs(10);
         let stream = match proxy {
@@ -481,7 +478,7 @@ impl DnsClient {
                 let proxy_addr = url
                     .strip_prefix("socks5://")
                     .or_else(|| url.strip_prefix("socks5h://"))
-                    .unwrap_or(&url);
+                    .unwrap_or(url);
                 timeout(t, Socks5Stream::connect(proxy_addr, addr))
                     .await
                     .context("connect timeout")?
@@ -569,6 +566,25 @@ mod tests {
             options: DnsOptions::default(),
         };
         DnsClient::new(&cfg).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_address_does_not_delay_the_next_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = test_client().await;
+        client.config.options.happy_eyeballs_delay_ms = 60_000;
+        let stream = timeout(
+            Duration::from_secs(10),
+            client.happy_eyeballs_connect(
+                vec!["127.0.0.2".parse().unwrap(), "127.0.0.1".parse().unwrap()],
+                listener.local_addr().unwrap().port(),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
     }
 
     #[tokio::test]
