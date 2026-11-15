@@ -78,11 +78,20 @@ pub fn encode_initial_payload(
     Ok((shaper::pooled_frame_bytes(body), remaining, seq))
 }
 
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub async fn race_upload_download<F: Future<Output = Result<()>>>(
     mut upload_task: JoinHandle<Result<()>>,
     download_fut: F,
     download_label: Option<&'static str>,
 ) -> Result<()> {
+    let _upload_guard = AbortOnDrop(upload_task.abort_handle());
     tokio::pin!(download_fut);
     tokio::select! {
         biased;
@@ -141,10 +150,9 @@ pub fn is_silent_error(root: &(dyn std::error::Error + 'static)) -> bool {
         .contains("connection closed during header parsing")
 }
 
-pub(crate) async fn check_response_status(response: Response, context: &str) -> Result<Response> {
+pub(crate) fn check_response_status(response: Response, context: &str) -> Result<Response> {
     if !response.status().is_success() {
         let status = response.status();
-        let _ = response.bytes().await;
         return Err(anyhow!("{context}: {status}"));
     }
     Ok(response)
@@ -154,6 +162,28 @@ pub(crate) async fn check_response_status(response: Response, context: &str) -> 
 mod tests {
     use super::*;
     use httproxy_core::test_support::test_cipher;
+
+    #[tokio::test]
+    async fn cancelling_the_connection_aborts_the_upload_task() {
+        let (released, receiver) = tokio::sync::oneshot::channel::<()>();
+        let upload = tokio::spawn(async move {
+            let _released = released;
+            std::future::pending::<Result<()>>().await
+        });
+        let mut connection = Box::pin(race_upload_download(
+            upload,
+            std::future::pending::<Result<()>>(),
+            None,
+        ));
+        assert!(futures::poll!(&mut connection).is_pending());
+        drop(connection);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
 
     #[test]
     fn build_cookie_contains_session() {

@@ -219,13 +219,13 @@ async fn send_upload_post(
         .header("Cache-Control", "no-store, no-transform")
         .header("Content-Type", "application/octet-stream")
         .header("Cookie", cookie);
-    let response = tokio::time::timeout(UPLOAD_REQUEST_TIMEOUT, req.body(body).send())
-        .await
-        .context("upload POST timed out")?
-        .context("http post failed")?;
-    let response = utils::check_response_status(response, "upstream rejected upload").await?;
-    response.bytes().await.context("drain upload response")?;
-    Ok(())
+    tokio::time::timeout(UPLOAD_REQUEST_TIMEOUT, async {
+        let response = req.body(body).send().await.context("http post failed")?;
+        let response = utils::check_response_status(response, "upstream rejected upload")?;
+        response.discard().await.context("drain upload response")
+    })
+    .await
+    .context("upload POST timed out")?
 }
 
 #[cfg(test)]
@@ -493,5 +493,46 @@ mod tests {
         let _ = stop_tx.send(());
         let received = collector.await.unwrap();
         assert!(received.is_empty(), "empty input must not send any POST");
+    }
+
+    #[tokio::test]
+    async fn upload_timeout_covers_a_stalled_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = test_state(&format!("http://{address}/"), 64 * 1024);
+        let client = test_client();
+        let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0; 4096];
+            while !received.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                received.extend_from_slice(&buffer[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+                .await
+                .unwrap();
+            headers_sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let upload = tokio::spawn(async move {
+            send_upload_post(&client, &state, Bytes::from_static(b"x"), Uuid::new_v4()).await
+        });
+        headers_received.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::pause();
+        tokio::time::advance(UPLOAD_REQUEST_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), upload).await;
+        server.abort();
+        let error = result
+            .expect("response drain must have a deadline")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
     }
 }

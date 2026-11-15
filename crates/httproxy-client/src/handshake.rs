@@ -94,13 +94,12 @@ pub async fn try_pq_connect(
     .context("session resumption POST failed")?;
 
     if response.status().as_u16() == 428 {
-        let _ = tokio::time::timeout(DOWNLOAD_CONNECT_TIMEOUT, response.bytes()).await;
+        let _ = tokio::time::timeout(DOWNLOAD_CONNECT_TIMEOUT, response.discard()).await;
         return Err(anyhow::Error::new(RehandshakeRequired(
             "server requests re-handshake (428)".into(),
         )));
     }
-    let response =
-        utils::check_response_status(response, "server rejected session resumption").await?;
+    let response = utils::check_response_status(response, "server rejected session resumption")?;
 
     let read_half = read_half
         .take()
@@ -204,7 +203,7 @@ pub async fn perform_pq_handshake(
     .context("handshake download connect timed out")?
     .context("handshake POST failed")?;
 
-    let response = utils::check_response_status(response, "server rejected handshake").await?;
+    let response = utils::check_response_status(response, "server rejected handshake")?;
 
     let mut body_buf = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
     let mut stream = response.into_body();

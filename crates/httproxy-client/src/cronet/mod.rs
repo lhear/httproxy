@@ -281,6 +281,13 @@ impl Response {
         }
         Ok(collected.freeze())
     }
+
+    pub async fn discard(mut self) -> Result<()> {
+        while let Some(chunk) = self.body.next().await {
+            chunk?;
+        }
+        Ok(())
+    }
 }
 
 pub struct Body {
@@ -439,5 +446,31 @@ mod tests {
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS.len();
         assert_eq!(pem.matches("-----BEGIN CERTIFICATE-----").count(), roots);
         assert_eq!(pem.matches("-----END CERTIFICATE-----").count(), roots);
+    }
+
+    #[tokio::test]
+    async fn body_chunks_stay_mutable_after_the_runtime_is_dropped() {
+        let client = Client::new(None).unwrap();
+        let watch = client.exec.watch();
+        let address = upstream().await;
+        let mut body = client
+            .post(&format!("http://{address}/"))
+            .body(Bytes::from_static(b"payload"))
+            .send()
+            .await
+            .unwrap()
+            .into_body();
+        let chunk = body.next().await.unwrap().unwrap();
+        assert_eq!(&chunk[..], b"7");
+        let pointer = chunk.as_ptr();
+        drop(body);
+        drop(client);
+        assert_eq!(watch.strong_count(), 0);
+        let mut writable = chunk
+            .try_into_mut()
+            .expect("native reads must transfer ownership");
+        assert_eq!(writable.as_ptr(), pointer);
+        writable[0] = b'8';
+        assert_eq!(&writable[..], b"8");
     }
 }

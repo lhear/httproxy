@@ -364,14 +364,12 @@ pub fn encode_frame_into(
             cipher.seal_frame(out, nonce_start, ct_start, false)?;
         }
         EncodingType::Json => {
-            let mut payload = Vec::with_capacity(payload_len);
-            payload.extend_from_slice(&seq.to_be_bytes());
-            payload.extend_from_slice(&(raw_len as u16).to_be_bytes());
-            payload.extend_from_slice(data);
-            payload.resize(payload_len, 0u8);
             let mut sealed = Vec::with_capacity(payload_len + NONCE_LEN + TAG_LEN);
             sealed.resize(NONCE_LEN, 0u8);
-            sealed.extend_from_slice(&payload);
+            sealed.extend_from_slice(&seq.to_be_bytes());
+            sealed.extend_from_slice(&(raw_len as u16).to_be_bytes());
+            sealed.extend_from_slice(data);
+            sealed.resize(NONCE_LEN + payload_len, 0);
             cipher.seal_frame(&mut sealed, 0, NONCE_LEN, false)?;
             let mut encoded = Vec::with_capacity(sealed.len() + sealed.len() / 6 + 16);
             base122_fast::encode_into(&sealed, &mut encoded);
@@ -412,6 +410,26 @@ pub enum DecodedFrame {
     Owned { seq: u64, data: Bytes },
 }
 
+pub fn append_frame_chunk(input: &mut BytesMut, chunk: &mut Bytes, encoding: EncodingType) {
+    if input.is_empty() {
+        match std::mem::take(chunk).try_into_mut() {
+            Ok(owned) => *input = owned,
+            Err(shared) => input.extend_from_slice(&shared),
+        }
+        return;
+    }
+    let needed = match encoding {
+        EncodingType::Binary if input.len() < 2 => 2 - input.len(),
+        EncodingType::Binary => (2 + read_u16_be(input) as usize).saturating_sub(input.len()),
+        EncodingType::Json => memchr::memchr(DELIMITER, chunk)
+            .map_or(chunk.len(), |position| position + 1)
+            .min((MAX_JSON_LINE_LEN + 1).saturating_sub(input.len())),
+    };
+    let take = needed.min(chunk.len());
+    input.extend_from_slice(&chunk[..take]);
+    chunk.advance(take);
+}
+
 pub fn decode_frame(
     src: &mut BytesMut,
     json_scratch: &mut Vec<u8>,
@@ -439,7 +457,7 @@ pub fn decode_frame(
 
             let range = cipher.open_frame(&mut view)?;
             let offset = range.start;
-            let (seq, start, end) = extract_frame_range(&view[offset..])?;
+            let (seq, start, end) = extract_frame_range(&view[range])?;
             let data = view.freeze().slice(offset + start..offset + end);
             Ok(Some(DecodedFrame::Owned { seq, data }))
         }
@@ -463,8 +481,8 @@ pub fn decode_frame(
                         return Err(Error::new(ErrorKind::InvalidData, "empty frame line"));
                     }
 
-                    if json_scratch.capacity() < MAX_JSON_LINE_LEN {
-                        *json_scratch = bufpool::take(MAX_JSON_LINE_LEN);
+                    if json_scratch.capacity() < line.len() {
+                        *json_scratch = bufpool::take(line.len().max(1024));
                     }
                     parse_json_payload_into(&line, json_scratch)?;
 
@@ -660,7 +678,8 @@ impl<R> TrafficShaper<R> {
         this.frame[ct + 8..ct + 10].copy_from_slice(&(raw_len as u16).to_be_bytes());
         if *this.encoding == EncodingType::Binary {
             let wire_len = NONCE_LEN + HEADER_LEN + raw_len + padding_len + TAG_LEN;
-            this.frame[..2].copy_from_slice(&(wire_len as u16).to_be_bytes());
+            this.frame[head - HEAD_BINARY..head - HEAD_BINARY + 2]
+                .copy_from_slice(&(wire_len as u16).to_be_bytes());
         }
 
         this.cipher
@@ -708,6 +727,29 @@ impl<R: AsyncRead> TrafficShaper<R> {
         out: &mut Vec<u8>,
     ) -> Poll<std::io::Result<Option<u64>>> {
         let mut this = self.project();
+        if *this.encoding == EncodingType::Binary {
+            let start = out.len();
+            let head = *this.head;
+            out.extend_from_slice(this.frame);
+            std::mem::swap(this.frame, out);
+            *this.head += start;
+            let result = match Self::poll_fill_proj(&mut this, cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(Fill::Eof)) => Poll::Ready(Ok(None)),
+                Poll::Ready(Ok(Fill::Frame)) => Poll::Ready(Self::finalize(&mut this).map(Some)),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            };
+            *this.head = head;
+            out.truncate(head);
+            if result.is_pending() {
+                out.extend_from_slice(&this.frame[start + head..]);
+            }
+            if !matches!(result, Poll::Ready(Ok(Some(_)))) {
+                this.frame.truncate(start);
+            }
+            std::mem::swap(this.frame, out);
+            return result;
+        }
         match Self::poll_fill_proj(&mut this, cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(Fill::Eof)) => Poll::Ready(Ok(None)),
@@ -818,6 +860,109 @@ mod tests {
     use crate::test_support::{stream_cipher_arc, test_cipher, test_cipher_dyn as test_cipher_arc};
     use std::io::Cursor;
     use zeroize::Zeroizing;
+
+    #[tokio::test]
+    async fn binary_upload_reads_directly_into_the_batch() {
+        struct RecordingReader {
+            cursor: Cursor<Vec<u8>>,
+            pointer: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl AsyncRead for RecordingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let this = self.get_mut();
+                this.pointer.store(
+                    buf.initialize_unfilled().as_ptr() as usize,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Pin::new(&mut this.cursor).poll_read(cx, buf)
+            }
+        }
+
+        let pointer = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let payload = vec![0x35; MAX_FRAME_PAYLOAD];
+        let reader = RecordingReader {
+            cursor: Cursor::new(payload.clone()),
+            pointer: Arc::clone(&pointer),
+        };
+        let cipher = test_cipher_arc();
+        let config = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_seq(
+            reader,
+            &config,
+            Arc::clone(&cipher),
+            0,
+        ));
+        let mut batch = Vec::with_capacity(64 * 1024);
+        batch.extend_from_slice(b"prefix");
+        let expected = batch.as_ptr().wrapping_add(6 + HEAD_BINARY) as usize;
+        std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut batch))
+            .await
+            .unwrap();
+        assert_eq!(pointer.load(std::sync::atomic::Ordering::Relaxed), expected);
+        assert_eq!(&batch[..6], b"prefix");
+        let mut input = BytesMut::from(&batch[6..]);
+        let (_, decoded) = decode_from_buffer(&mut input, cipher.as_ref(), EncodingType::Binary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&decoded[..], &payload);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_binary_frame_survives_switching_batch_buffers() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let cipher = test_cipher_arc();
+        let config = ResolvedShaperConfig::resolve(&test_config());
+        let mut shaper = Box::pin(TrafficShaper::with_seq(
+            reader,
+            &config,
+            Arc::clone(&cipher),
+            7,
+        ));
+        writer.write_all(b"first").await.unwrap();
+        let mut original = b"previous batch".to_vec();
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            shaper
+                .as_mut()
+                .poll_seal_into(&mut context, &mut original)
+                .is_pending()
+        );
+        assert_eq!(&original, b"previous batch");
+        drop(original);
+        writer.write_all(b"second").await.unwrap();
+        drop(writer);
+        let mut next = Vec::new();
+        assert_eq!(
+            std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut next))
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        let mut input = BytesMut::from(&next[..]);
+        let (seq, decoded) = decode_from_buffer(&mut input, cipher.as_ref(), EncodingType::Binary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 7);
+        assert_eq!(&decoded[..], b"firstsecond");
+    }
+
+    #[test]
+    fn binary_payload_length_cannot_include_the_authentication_tag() {
+        let cipher = test_cipher();
+        let mut header = [0; HEADER_LEN];
+        header[HEADER_LEN - 1] = 1;
+        let encrypted = cipher.encrypt(&header).unwrap();
+        let mut input = BytesMut::new();
+        input.put_u16(encrypted.len() as u16);
+        input.extend_from_slice(&encrypted);
+        assert!(decode_from_buffer(&mut input, &cipher, EncodingType::Binary).is_err());
+    }
 
     fn test_config() -> TrafficConfig {
         TrafficConfig {

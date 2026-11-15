@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use super::super::state::SharedState;
 use crate::constants::{
-    DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT, MAX_WRITE_IOV, PREFETCH_LEAD_BYTES,
-    PREFETCH_ROTATE_TIMEOUT, WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT, WRITE_STALL_TIMEOUT,
+    DOWNLOAD_CONNECT_TIMEOUT, MAX_WRITE_IOV, PREFETCH_LEAD_BYTES, PREFETCH_ROTATE_TIMEOUT,
+    WRITE_BUF_CAPACITY, WRITE_FLUSH_TIMEOUT, WRITE_STALL_TIMEOUT,
 };
 use crate::cronet::{Client, Response};
 use crate::utils;
@@ -57,7 +57,7 @@ struct DecodeBuffers {
 impl DecodeBuffers {
     fn new() -> Self {
         Self {
-            input: BytesMut::with_capacity(DECODE_BUF_CAPACITY),
+            input: BytesMut::new(),
             json_scratch: Vec::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
@@ -66,23 +66,11 @@ impl DecodeBuffers {
 
     fn ingest(
         &mut self,
-        chunk: Bytes,
+        mut chunk: Bytes,
         cipher: &dyn FrameCipher,
         encoding: EncodingType,
         expected_seq: &mut u64,
     ) -> Result<()> {
-        if self.input.is_empty() {
-            match chunk.try_into_mut() {
-                Ok(chunk_mut) => self.input = chunk_mut,
-                Err(chunk) => {
-                    self.input.clear();
-                    self.input.extend_from_slice(&chunk);
-                }
-            }
-        } else {
-            self.input.extend_from_slice(&chunk);
-        }
-
         let Self {
             input,
             json_scratch,
@@ -91,7 +79,14 @@ impl DecodeBuffers {
             ..
         } = self;
 
-        while let Some(frame) = shaper::decode_frame(input, json_scratch, cipher, encoding)? {
+        loop {
+            let Some(frame) = shaper::decode_frame(input, json_scratch, cipher, encoding)? else {
+                if chunk.is_empty() {
+                    break;
+                }
+                shaper::append_frame_chunk(input, &mut chunk, encoding);
+                continue;
+            };
             let (seq, data) = match frame {
                 DecodedFrame::Owned { seq, data } => (seq, data),
                 DecodedFrame::InJsonScratch { seq, start, end } => {
@@ -105,8 +100,13 @@ impl DecodeBuffers {
                 ));
             }
             *expected_seq += 1;
-            *pending_bytes += data.len();
-            pending.push_back(data);
+            if !data.is_empty() {
+                *pending_bytes += data.len();
+                pending.push_back(data);
+            }
+        }
+        if input.is_empty() {
+            *input = BytesMut::new();
         }
         Ok(())
     }
@@ -118,7 +118,7 @@ impl DecodeBuffers {
 
     #[inline]
     fn needs_flush(&self) -> bool {
-        self.pending_bytes >= WRITE_BUF_CAPACITY
+        self.pending_bytes >= WRITE_BUF_CAPACITY || self.pending.len() >= MAX_WRITE_IOV
     }
 
     async fn flush<W>(&mut self, write_half: &mut W, timeout: Duration) -> Result<()>
@@ -400,7 +400,7 @@ async fn send_continue_request(
         .await
         .context("continuation timed out")?
         .context("continuation failed")?;
-    let resp = utils::check_response_status(resp, "continuation rejected").await?;
+    let resp = utils::check_response_status(resp, "continuation rejected")?;
     Ok(resp)
 }
 
@@ -410,7 +410,7 @@ fn spawn_prefetch_continuation(
     stream_id: Uuid,
 ) -> (oneshot::Sender<()>, oneshot::Receiver<Result<Response>>) {
     let (trigger_tx, trigger_rx) = oneshot::channel();
-    let (result_tx, result_rx) = oneshot::channel();
+    let (mut result_tx, result_rx) = oneshot::channel();
     let pre_client = Arc::clone(http_client);
     let pre_state = Arc::clone(state);
     tokio::spawn(
@@ -418,7 +418,11 @@ fn spawn_prefetch_continuation(
             if trigger_rx.await.is_err() {
                 return;
             }
-            match send_continue_request(&pre_client, &pre_state, stream_id).await {
+            let result = tokio::select! {
+                _ = result_tx.closed() => return,
+                result = send_continue_request(&pre_client, &pre_state, stream_id) => result,
+            };
+            match result {
                 Ok(resp) => {
                     let _ = result_tx.send(Ok(resp));
                 }
@@ -610,6 +614,55 @@ mod tests {
     }
 
     struct StalledWriter;
+
+    #[test]
+    fn empty_frames_do_not_accumulate_pending_allocations() {
+        let cipher = test_cipher();
+        let mut bufs = buffers();
+        let mut expected_seq = 0;
+        for seq in 0..1024 {
+            bufs.ingest(
+                frame(b"", seq),
+                &cipher,
+                EncodingType::Binary,
+                &mut expected_seq,
+            )
+            .unwrap();
+        }
+        assert_eq!(expected_seq, 1024);
+        assert!(bufs.pending.is_empty());
+        assert_eq!(bufs.input.capacity(), 0);
+    }
+
+    #[test]
+    fn split_frame_does_not_copy_the_following_complete_frame() {
+        let cipher = test_cipher();
+        let mut bufs = buffers();
+        let mut expected_seq = 0;
+        let first = frame(b"first", 0);
+        let second = frame(b"second", 1);
+        let mut next = first[5..].to_vec();
+        let payload_offset = next.len() + 2 + httproxy_core::crypto::NONCE_LEN + 10;
+        next.extend_from_slice(&second);
+        let pointer = next.as_ptr().wrapping_add(payload_offset);
+        bufs.ingest(
+            Bytes::copy_from_slice(&first[..5]),
+            &cipher,
+            EncodingType::Binary,
+            &mut expected_seq,
+        )
+        .unwrap();
+        bufs.ingest(
+            Bytes::from(next),
+            &cipher,
+            EncodingType::Binary,
+            &mut expected_seq,
+        )
+        .unwrap();
+        assert_eq!(queued(&bufs), b"firstsecond");
+        assert_eq!(bufs.pending[1].as_ptr(), pointer);
+        assert_eq!(bufs.input.capacity(), 0);
+    }
 
     impl AsyncWrite for StalledWriter {
         fn poll_write(

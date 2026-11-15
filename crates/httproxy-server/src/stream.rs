@@ -13,6 +13,7 @@ pin_project! {
         #[pin]
         inner: S,
         buf: BytesMut,
+        chunk: Bytes,
         json_scratch: Vec<u8>,
         cipher: Arc<dyn FrameCipher>,
         encoding: EncodingType,
@@ -34,6 +35,7 @@ where
         Self {
             inner,
             buf: BytesMut::new(),
+            chunk: Bytes::new(),
             json_scratch: Vec::new(),
             cipher,
             encoding,
@@ -60,6 +62,9 @@ where
                 *this.encoding,
             ) {
                 Ok(Some(frame)) => {
+                    if this.buf.is_empty() {
+                        *this.buf = BytesMut::new();
+                    }
                     let (seq, data) = match frame {
                         DecodedFrame::InJsonScratch { seq, start, end } => {
                             let plain =
@@ -74,6 +79,11 @@ where
                 Err(e) => {
                     return Poll::Ready(Some(Err(e)));
                 }
+            }
+
+            if !this.chunk.is_empty() {
+                shaper::append_frame_chunk(this.buf, this.chunk, *this.encoding);
+                continue;
             }
 
             if *this.eos {
@@ -96,17 +106,7 @@ where
 
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    if this.buf.is_empty() {
-                        match chunk.try_into_mut() {
-                            Ok(chunk_mut) => *this.buf = chunk_mut,
-                            Err(chunk) => {
-                                this.buf.clear();
-                                this.buf.extend_from_slice(&chunk);
-                            }
-                        }
-                    } else {
-                        this.buf.extend_from_slice(&chunk);
-                    }
+                    *this.chunk = chunk;
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(e)));
@@ -157,6 +157,43 @@ mod tests {
         assert_eq!(seq, 0);
         assert_eq!(&data[..], b"hello");
         assert!(decoder.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fragmented_binary_and_json_frames_roundtrip() {
+        for encoding in [EncodingType::Binary, EncodingType::Json] {
+            let mut wire = Vec::new();
+            let payloads = [vec![], vec![0x31; 37], vec![0x75; 8192], vec![0x92; 13]];
+            for (seq, payload) in payloads.iter().enumerate() {
+                shaper::encode_frame_into(
+                    payload,
+                    seq as u64,
+                    &test_cipher(),
+                    0,
+                    [0, 0],
+                    encoding,
+                    &mut wire,
+                )
+                .unwrap();
+            }
+            for size in [1, 2, 7, 1024, 4096, 16384] {
+                let chunks = wire
+                    .chunks(size)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)));
+                let mut decoder = FrameDecoder::new(
+                    stream::iter(chunks),
+                    Arc::new(test_cipher()),
+                    encoding,
+                    18781,
+                );
+                for (expected_seq, expected) in payloads.iter().enumerate() {
+                    let (seq, payload) = decoder.next().await.unwrap().unwrap();
+                    assert_eq!(seq, expected_seq as u64);
+                    assert_eq!(&payload[..], expected);
+                }
+                assert!(decoder.next().await.is_none());
+            }
+        }
     }
 
     #[tokio::test]

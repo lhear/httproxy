@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use anyhow::{Result, bail};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::sys::{self, Ptr};
@@ -55,57 +55,106 @@ struct Slot {
 }
 
 impl Slot {
-    fn fill(&mut self) {
+    fn fill(&mut self, callback: &Arc<ReadCallback>) {
         if self.reading || self.closed {
             return;
         }
         let api = sys::api();
-        let buffer = api.buffer_create();
-        if buffer.is_null() {
+        let Some(buffer) = ReadBuffer::create(callback) else {
+            let _ = self
+                .events
+                .send(Event::Fail("cronet: read buffer create failed".to_owned()));
+            self.closed = true;
+            api.request_cancel(self.request);
             return;
-        }
-        api.buffer_alloc(buffer, READ_CHUNK as u64);
-        if api.buffer_size(buffer) < READ_CHUNK as u64 {
-            api.buffer_destroy(buffer);
-            return;
-        }
+        };
         if api.request_read(self.request, buffer) == sys::RESULT_SUCCESS {
             self.reading = true;
         } else {
             api.buffer_destroy(buffer);
+            let _ = self
+                .events
+                .send(Event::Fail("cronet: read failed".to_owned()));
+            self.closed = true;
+            api.request_cancel(self.request);
         }
     }
 }
 
 struct Upload {
     shared: Arc<Shared>,
+    key: usize,
     body: Bytes,
     position: usize,
     closed: AtomicBool,
 }
 
-struct Chunk {
-    buffer: Ptr,
-    length: usize,
-}
+struct ReadCallback(Ptr);
 
-impl AsRef<[u8]> for Chunk {
-    fn as_ref(&self) -> &[u8] {
-        let data = sys::api().buffer_data(self.buffer).cast::<u8>();
-        unsafe { std::slice::from_raw_parts(data, self.length) }
-    }
-}
-
-impl Drop for Chunk {
+impl Drop for ReadCallback {
     fn drop(&mut self) {
-        sys::api().buffer_destroy(self.buffer);
+        sys::api().buffer_callback_destroy(self.0);
     }
+}
+
+struct ReadBuffer {
+    bytes: BytesMut,
+    _callback: Arc<ReadCallback>,
+}
+
+impl ReadBuffer {
+    fn create(callback: &Arc<ReadCallback>) -> Option<Ptr> {
+        let api = sys::api();
+        let buffer = api.buffer_create();
+        if buffer.is_null() {
+            return None;
+        }
+        let mut owned = Box::new(Self {
+            bytes: BytesMut::with_capacity(READ_CHUNK),
+            _callback: Arc::clone(callback),
+        });
+        api.buffer_init(
+            buffer,
+            owned.bytes.as_mut_ptr().cast(),
+            READ_CHUNK as u64,
+            callback.0,
+        );
+        api.buffer_set_context(buffer, Box::into_raw(owned).cast());
+        Some(buffer)
+    }
+
+    fn take(buffer: Ptr) -> Option<Box<Self>> {
+        let api = sys::api();
+        let context = api.buffer_get_context(buffer);
+        if context.is_null() {
+            return None;
+        }
+        api.buffer_set_context(buffer, std::ptr::null_mut());
+        Some(unsafe { Box::from_raw(context.cast::<Self>()) })
+    }
+
+    fn complete(buffer: Ptr, length: u64) -> Option<Bytes> {
+        let api = sys::api();
+        let owned = Self::take(buffer);
+        api.buffer_destroy(buffer);
+        let mut owned = owned?;
+        if length == 0 || length > READ_CHUNK as u64 {
+            return None;
+        }
+        unsafe { owned.bytes.set_len(length as usize) };
+        Some(owned.bytes.freeze())
+    }
+}
+
+unsafe extern "C" fn on_buffer_destroy(_callback: Ptr, buffer: Ptr) {
+    drop(ReadBuffer::take(buffer));
 }
 
 pub(crate) struct Shared {
     commands: UnboundedSender<Command>,
     slots: Mutex<HashMap<usize, Slot>>,
     garbage: Mutex<Vec<(Ptr, Ptr)>>,
+    read_callback: Arc<ReadCallback>,
 }
 
 pub(crate) struct Executor {
@@ -119,11 +168,16 @@ pub(crate) struct Executor {
 impl Executor {
     pub(crate) fn new(engine: Arc<Engine>, callback: Arc<Callback>) -> Result<Arc<Self>> {
         let api = sys::api();
+        let read_callback = api.buffer_callback_create(Some(on_buffer_destroy));
+        if read_callback.is_null() {
+            bail!("cronet: buffer callback create failed");
+        }
         let (commands, inbox) = unbounded_channel();
         let shared = Arc::new(Shared {
             commands,
             slots: Mutex::new(HashMap::new()),
             garbage: Mutex::new(Vec::new()),
+            read_callback: Arc::new(ReadCallback(read_callback)),
         });
         let object = api.executor_create(Some(execute));
         if object.is_null() {
@@ -321,6 +375,7 @@ impl Worker {
         if let Some(body) = spec.body.filter(|body| !body.is_empty()) {
             let owned = Box::into_raw(Box::new(Upload {
                 shared: Arc::clone(&self.shared),
+                key,
                 body,
                 position: 0,
                 closed: AtomicBool::new(false),
@@ -415,7 +470,7 @@ impl Worker {
             .unwrap_or_else(PoisonError::into_inner)
             .get_mut(&key)
         {
-            slot.fill();
+            slot.fill(&self.shared.read_callback);
         }
     }
 
@@ -497,7 +552,7 @@ pub(crate) unsafe extern "C" fn on_response_started(callback: Ptr, request: Ptr,
     let key = key_of(request);
     let mut slots = shared.slots.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(slot) = slots.get_mut(&key) {
-        slot.fill();
+        slot.fill(&shared.read_callback);
         let _ = slot
             .events
             .send(Event::Status(status.clamp(0, u16::MAX as i32) as u16));
@@ -511,14 +566,7 @@ pub(crate) unsafe extern "C" fn on_read_completed(
     buffer: Ptr,
     bytes: u64,
 ) {
-    let api = sys::api();
-    let chunk = if bytes > 0 {
-        let length = (bytes as usize).min(api.buffer_size(buffer) as usize);
-        Some(Bytes::from_owner(Chunk { buffer, length }))
-    } else {
-        api.buffer_destroy(buffer);
-        None
-    };
+    let chunk = ReadBuffer::complete(buffer, bytes);
 
     let Some(shared) = shared_of(callback) else {
         return;
@@ -631,16 +679,14 @@ unsafe extern "C" fn upload_close(provider: Ptr) {
     }
     let shared = &upload.shared;
     let data = Ptr::new(raw);
-    for slot in shared
+    if let Some(slot) = shared
         .slots
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .values_mut()
+        .get_mut(&upload.key)
+        && slot.upload.is_some_and(|(_, slot_data)| slot_data == data)
     {
-        if slot.upload.is_some_and(|(_, slot_data)| slot_data == data) {
-            slot.upload = None;
-            break;
-        }
+        slot.upload = None;
     }
     upload
         .shared
@@ -649,4 +695,37 @@ unsafe extern "C" fn upload_close(provider: Ptr) {
         .unwrap_or_else(PoisonError::into_inner)
         .push((provider, data));
     let _ = shared.commands.send(Command::Collect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_callback() -> Arc<ReadCallback> {
+        sys::load().unwrap();
+        let callback = sys::api().buffer_callback_create(Some(on_buffer_destroy));
+        assert!(!callback.is_null());
+        Arc::new(ReadCallback(callback))
+    }
+
+    #[test]
+    fn destroying_an_unfinished_read_releases_its_owner() {
+        let callback = read_callback();
+        let watch = Arc::downgrade(&callback);
+        let buffer = ReadBuffer::create(&callback).unwrap();
+        drop(callback);
+        assert_eq!(watch.strong_count(), 1);
+        sys::api().buffer_destroy(buffer);
+        assert_eq!(watch.strong_count(), 0);
+    }
+
+    #[test]
+    fn empty_and_invalid_reads_release_their_allocations() {
+        let callback = read_callback();
+        for length in [0, READ_CHUNK as u64 + 1, u64::MAX] {
+            let buffer = ReadBuffer::create(&callback).unwrap();
+            assert!(ReadBuffer::complete(buffer, length).is_none());
+            assert_eq!(Arc::strong_count(&callback), 1);
+        }
+    }
 }

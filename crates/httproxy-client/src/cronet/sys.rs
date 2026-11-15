@@ -33,6 +33,7 @@ pub(crate) type OnSucceeded = unsafe extern "C" fn(Ptr, Ptr, Ptr);
 pub(crate) type OnFailed = unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr);
 pub(crate) type OnCanceled = unsafe extern "C" fn(Ptr, Ptr, Ptr);
 pub(crate) type OnExecute = unsafe extern "C" fn(Ptr, Ptr);
+pub(crate) type OnBufferDestroy = unsafe extern "C" fn(Ptr, Ptr);
 pub(crate) type UploadLength = unsafe extern "C" fn(Ptr) -> i64;
 pub(crate) type UploadRead = unsafe extern "C" fn(Ptr, Ptr, Ptr);
 pub(crate) type UploadRewind = unsafe extern "C" fn(Ptr, Ptr);
@@ -145,7 +146,11 @@ api! {
     error_message: Cronet_Error_message_get(error: Ptr) -> CronetString;
     buffer_create: Cronet_Buffer_Create() -> Ptr;
     buffer_destroy: Cronet_Buffer_Destroy(buffer: Ptr);
-    buffer_alloc: Cronet_Buffer_InitWithAlloc(buffer: Ptr, size: u64);
+    buffer_init: Cronet_Buffer_InitWithDataAndCallback(buffer: Ptr, data: *mut c_void, size: u64, callback: Ptr);
+    buffer_set_context: Cronet_Buffer_SetClientContext(buffer: Ptr, context: *mut c_void);
+    buffer_get_context: Cronet_Buffer_GetClientContext(buffer: Ptr) -> *mut c_void;
+    buffer_callback_create: Cronet_BufferCallback_CreateWith(destroy: Option<OnBufferDestroy>) -> Ptr;
+    buffer_callback_destroy: Cronet_BufferCallback_Destroy(callback: Ptr);
     buffer_data: Cronet_Buffer_GetData(buffer: Ptr) -> *mut c_void;
     buffer_size: Cronet_Buffer_GetSize(buffer: Ptr) -> u64;
     upload_create: Cronet_UploadDataProvider_CreateWith(

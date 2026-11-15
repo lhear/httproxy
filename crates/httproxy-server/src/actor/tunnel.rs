@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use futures::Stream;
+use futures::task::AtomicWaker;
 use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,6 +39,19 @@ enum Phase {
 type ShaperStream = Pin<Box<TrafficShaper<UpstreamRead>>>;
 type ShaperSlot = Arc<StdMutex<Option<ShaperStream>>>;
 
+#[derive(Default)]
+struct Cancellation {
+    cancelled: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl Cancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+}
+
 pub type SegmentStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
 #[inline]
@@ -52,7 +66,7 @@ struct Segment {
     max_bytes: Option<u64>,
     activity: Arc<AtomicU64>,
     done_tx: Option<mpsc::Sender<()>>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Arc<Cancellation>,
     pause_on_drop: bool,
     ended: bool,
 }
@@ -63,7 +77,7 @@ impl Segment {
         max_bytes: Option<u64>,
         activity: Arc<AtomicU64>,
         done_tx: mpsc::Sender<()>,
-        cancelled: Arc<AtomicBool>,
+        cancelled: Arc<Cancellation>,
     ) -> Option<Self> {
         let shaper = slot_lock(&slot).take()?;
         Some(Self {
@@ -106,8 +120,9 @@ impl Stream for Segment {
         if this.ended {
             return Poll::Ready(None);
         }
-        if this.cancelled.load(Ordering::Acquire) {
+        if this.cancelled.cancelled.load(Ordering::Acquire) {
             this.ended = true;
+            this.shaper = None;
             return Poll::Ready(None);
         }
         let Some(shaper) = this.shaper.as_mut() else {
@@ -133,7 +148,16 @@ impl Stream for Segment {
                 this.ended = true;
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                this.cancelled.waker.register(cx.waker());
+                if this.cancelled.cancelled.load(Ordering::Acquire) {
+                    this.ended = true;
+                    this.shaper = None;
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 }
@@ -148,7 +172,7 @@ pub struct TunnelActor {
     pending_continue: Vec<oneshot::Sender<Option<SegmentStream>>>,
     segment_done_tx: mpsc::Sender<()>,
     segment_done_rx: mpsc::Receiver<()>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Arc<Cancellation>,
     stream_id: Uuid,
     stream_registry: Arc<StreamRegistry>,
     shutdown_signal: Arc<Notify>,
@@ -177,7 +201,7 @@ impl TunnelActor {
             pending_continue: Vec::new(),
             segment_done_tx: seg_tx,
             segment_done_rx: seg_rx,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(Cancellation::default()),
             stream_id,
             stream_registry,
             shutdown_signal: Arc::new(Notify::new()),
@@ -385,11 +409,11 @@ impl TunnelActor {
     async fn cleanup(&mut self) {
         self.phase = Phase::Closed;
         self.consume_stream();
-        self.cancelled.store(true, Ordering::Release);
+        self.cancelled.cancel();
         if let Some(slot) = self.shaper_slot.take() {
             slot_lock(&slot).take();
         }
-        if let Some(handle) = self.upload_handle.take() {
+        if let Some(handle) = self.upload_handle.as_mut() {
             if let Some(ref tx) = self.upload_tx {
                 let _ = tx.send(UploadCmd::Shutdown).await;
             }
@@ -398,6 +422,7 @@ impl TunnelActor {
                 warn!(stream_id = %self.stream_id, error = %join_err, "upload actor panicked");
             }
         }
+        self.upload_handle = None;
         info!(stream_id = %self.stream_id, "tunnel actor closed");
     }
 
@@ -409,6 +434,13 @@ impl TunnelActor {
 impl Drop for TunnelActor {
     fn drop(&mut self) {
         self.consume_stream();
+        self.cancelled.cancel();
+        if let Some(slot) = self.shaper_slot.take() {
+            slot_lock(&slot).take();
+        }
+        if let Some(handle) = self.upload_handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -664,6 +696,45 @@ mod tests {
             .expect("tunnel must close when the response body is dropped")
             .unwrap();
         drop(cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn dropping_actor_aborts_upload_and_wakes_an_idle_segment() {
+        let (read_half, _client_write, _upstream_write) = tcp_pair().await;
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let mut actor = new_rotating_actor(cmd_rx, u64::MAX);
+        actor.on_upstream_connected(
+            read_half.into(),
+            None,
+            &resolved_config(),
+            test_cipher(),
+            0,
+            None,
+        );
+        let (upload_tx, _upload_rx) = mpsc::channel(8);
+        let (released, receiver) = oneshot::channel::<()>();
+        let upload_handle = tokio::spawn(async move {
+            let _released = released;
+            std::future::pending::<()>().await;
+        });
+        actor.set_upload_channel(upload_tx, upload_handle);
+        let mut segment = actor.take_segment().unwrap();
+        let body = tokio::spawn(async move { segment.next().await });
+        tokio::task::yield_now().await;
+        drop(actor);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), body)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 }
 
