@@ -8,7 +8,7 @@ traffic.
 
 - **Native Chromium fingerprint** — every upstream request is issued by
   Chromium's network stack (Cronet): the browser's own TLS, HTTP/2 and QUIC
-  implementation, header order and padding, with no emulation layer.
+  implementation, header order and padding.
 - **Flexible topology** — works through CDNs, web proxies and middleboxes.
 - **Traffic obfuscation** — configurable padding and inter-frame jitter.
 - **Mandatory authentication and encryption** — tunnel tokens authorise tunnel
@@ -43,6 +43,8 @@ against the NDK, macOS and Windows. CI builds every target in
 sh scripts/build-libcronet.sh x86_64-unknown-linux-gnu
 CRONET_LIB_DIR=cronet/x86_64-unknown-linux-gnu cargo build --release
 ```
+
+### Configuration
 
 Both binaries read a `config.toml`; every key is documented in
 **[CONFIGURATION.md](CONFIGURATION.md)**.
