@@ -994,6 +994,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-root-certs",
  "x25519-dalek",
  "zeroize",
 ]
@@ -2692,6 +2693,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-root-certs"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "293198dcebfb821155b5092ab94b5a82ff180eddd7241df3bd6e66a4ffd1a585"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

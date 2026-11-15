@@ -2,6 +2,8 @@ mod runtime;
 mod sys;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use http::StatusCode;
@@ -11,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tracing::warn;
 
 use runtime::{Event, Executor, Spec, next_key};
 use sys::Ptr;
@@ -98,6 +101,9 @@ impl Engine {
         if let Some(options) = options {
             api.engine_params_experimental(params, options.as_ptr());
         }
+        if let Err(error) = install_root_store(api, engine) {
+            warn!(%error, "cronet: falling back to Chromium's root store");
+        }
         let result = api.engine_start(engine, params);
         api.engine_params_destroy(params);
         if result != sys::RESULT_SUCCESS {
@@ -112,6 +118,32 @@ impl Engine {
             let _ = sys::api().engine_shutdown(self.0);
         }
     }
+}
+
+fn install_root_store(api: &sys::Api, engine: Ptr) -> Result<()> {
+    let pem = CString::new(root_store_pem())
+        .map_err(|_| anyhow!("cronet: root store holds a nul byte"))?;
+    let verifier = api.cert_verifier_create(pem.as_ptr());
+    if verifier.is_null() {
+        bail!("cronet: the loaded library rejected the Mozilla root store");
+    }
+    api.engine_cert_verifier(engine, verifier);
+    Ok(())
+}
+
+fn root_store_pem() -> Vec<u8> {
+    const WIDTH: usize = 64;
+    let mut out = Vec::with_capacity(512 * 1024);
+    for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        out.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
+        let encoded = BASE64.encode(cert.as_ref());
+        for line in encoded.as_bytes().chunks(WIDTH) {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b"-----END CERTIFICATE-----\n");
+    }
+    out
 }
 
 fn experimental_options(address: &str) -> Result<CString> {
@@ -399,5 +431,13 @@ mod tests {
             0,
             "cronet runtime outlived the client"
         );
+    }
+
+    #[test]
+    fn root_store_pem_holds_every_mozilla_root() {
+        let pem = String::from_utf8(root_store_pem()).unwrap();
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS.len();
+        assert_eq!(pem.matches("-----BEGIN CERTIFICATE-----").count(), roots);
+        assert_eq!(pem.matches("-----END CERTIFICATE-----").count(), roots);
     }
 }
