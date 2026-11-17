@@ -13,9 +13,9 @@ base64.workspace = true
 bytes.workspace = true
 domain.workspace = true
 http.workspace = true
-httproxy-client = {path = "../httproxy-client"}
-httproxy-core = {path = "../httproxy-core", features = ["test-support"]}
-httproxy-server = {path = "../httproxy-server"}
+httproxy-client = {path = "../client"}
+httproxy-core = {path = "../core", features = ["test-support"]}
+httproxy-server = {path = "../server"}
 quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

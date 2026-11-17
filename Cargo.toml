@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/httproxy-client",
-  "crates/httproxy-core",
-  "crates/httproxy-server",
-  "crates/httproxy-tests",
+  "crates/client",
+  "crates/core",
+  "crates/server",
+  "crates/tests",
 ]
 
 [workspace.package]

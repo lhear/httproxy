@@ -20,7 +20,7 @@ clap.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 http.workspace = true
-httproxy-core = {path = "../httproxy-core"}
+httproxy-core = {path = "../core"}
 memchr.workspace = true
 moka.workspace = true
 pin-project-lite.workspace = true
@@ -38,5 +38,5 @@ x25519-dalek.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-httproxy-core = {path = "../httproxy-core", features = ["test-support"]}
+httproxy-core = {path = "../core", features = ["test-support"]}
 tokio = {workspace = true, features = ["full"]}
