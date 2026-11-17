@@ -2,7 +2,7 @@ use std::time::Duration;
 
 pub const CONNECT_RESPONSE: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 pub const PROXY_AUTH_REQUIRED_RESPONSE: &[u8] =
-    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"httproxy\"\r\nProxy-Connection: close\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 pub const AUTH_REJECT_DRAIN_WINDOW: Duration = Duration::from_millis(250);
 pub const EARLY_READ_WINDOW: Duration = Duration::from_millis(2);
 
