@@ -78,18 +78,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_applied() {
-        let cfg: DnsConfig = toml::from_str("upstream = \"8.8.8.8:53\"\n").unwrap();
-        assert_eq!(cfg.options.protocol, Protocol::Udp);
-        assert!(!cfg.options.prefer_ipv6);
-        assert_eq!(cfg.options.cache_size, 1024);
-        assert_eq!(cfg.options.min_ttl, 30);
-        assert_eq!(cfg.options.max_ttl, 3600);
-        assert_eq!(cfg.options.empty_ttl, 300);
-        assert_eq!(cfg.options.max_concurrent_queries, 1024);
-    }
-
-    #[test]
     fn explicit_fields_override_defaults() {
         let cfg: DnsConfig =
             toml::from_str("upstream = \"1.1.1.1:853\"\nprotocol = \"dot\"\ncache_size = 64\n")

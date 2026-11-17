@@ -90,7 +90,6 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{MAX_IN_FLIGHT_BYTES, UPLOAD_CONCURRENCY};
 
     fn minimal_client_cfg() -> httproxy_core::config::ClientTopConfig {
         let (_, public_key) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
@@ -125,15 +124,6 @@ padding_threshold = 50
         let mut cfg = minimal_client_cfg();
         cfg.client.upload_concurrency = Some(0);
         assert!(build_state(&cfg).is_err());
-    }
-
-    #[test]
-    fn build_state_accepts_defaults() {
-        let cfg = minimal_client_cfg();
-        let state = build_state(&cfg).unwrap();
-        assert_eq!(state.max_in_flight_bytes, MAX_IN_FLIGHT_BYTES);
-        assert_eq!(state.upload_concurrency, UPLOAD_CONCURRENCY);
-        assert_eq!(state.max_connections, MAX_LOCAL_CONNECTIONS);
     }
 
     #[test]

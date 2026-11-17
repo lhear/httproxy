@@ -262,28 +262,3 @@ pub async fn perform_pq_handshake(
 
     Ok(PqSessionTicket { master, session_id })
 }
-
-pub async fn full_handshake(
-    http_client: &Arc<Client>,
-    state: &Arc<SharedState>,
-    server_pk: &crypto::EncapsulationKey,
-    target_host: &str,
-    initial_payload: Bytes,
-    read_half: tokio::net::tcp::OwnedReadHalf,
-    write_half: tokio::net::tcp::OwnedWriteHalf,
-) -> Result<()> {
-    let ticket = perform_pq_handshake(http_client, state, server_pk).await?;
-
-    let mut rh = Some(read_half);
-    let mut wh = Some(write_half);
-    try_pq_connect(
-        http_client,
-        state,
-        &ticket,
-        target_host,
-        initial_payload,
-        &mut rh,
-        &mut wh,
-    )
-    .await
-}

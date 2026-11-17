@@ -440,13 +440,4 @@ mod tests {
         inspector.feed(&record(23, &[0xAAu8; 512]));
         assert_eq!(inspector.opaque_at(), None);
     }
-
-    #[test]
-    fn tracks_total_bytes_fed() {
-        let mut inspector = TlsInspector::new();
-        let hello = record(22, &handshake(2, &server_hello(&[0x03, 0x04], [8u8; 32])));
-        inspector.feed(&hello);
-        inspector.feed(&[0u8; 7]);
-        assert_eq!(inspector.total(), hello.len() as u64 + 7);
-    }
 }

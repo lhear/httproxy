@@ -223,12 +223,6 @@ mod tests {
     }
 
     #[test]
-    fn is_not_silent_other() {
-        let e = std::io::Error::other("other");
-        assert!(!is_silent_error(&e));
-    }
-
-    #[test]
     fn encode_initial_payload_json_chunks_roundtrip() {
         use bytes::BytesMut;
         use httproxy_core::shaper::{

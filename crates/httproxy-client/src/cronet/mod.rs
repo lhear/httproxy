@@ -56,10 +56,6 @@ impl Client {
         self.request("POST", url)
     }
 
-    pub fn patch(&self, url: &str) -> RequestBuilder {
-        self.request("PATCH", url)
-    }
-
     fn request(&self, method: &'static str, url: &str) -> RequestBuilder {
         RequestBuilder {
             exec: Arc::clone(&self.exec),

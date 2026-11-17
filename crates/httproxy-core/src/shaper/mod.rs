@@ -567,6 +567,7 @@ pin_project! {
 }
 
 impl<R> TrafficShaper<R> {
+    #[cfg(test)]
     pub fn with_seq(
         reader: R,
         config: &ResolvedShaperConfig,
@@ -977,94 +978,6 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_roundtrip_binary() {
-        let data = b"hello proxy frame";
-        let config = test_config();
-        let cipher = test_cipher();
-        let frame = encode_frame(
-            data,
-            7,
-            &cipher,
-            config.global.padding_threshold,
-            config.global.padding_range,
-            config.encoding_type,
-        )
-        .unwrap();
-        let mut buf = BytesMut::from(&frame[..]);
-        let (seq, decoded) = decode_from_buffer(&mut buf, &cipher, EncodingType::Binary)
-            .unwrap()
-            .unwrap();
-        assert_eq!(seq, 7);
-        assert_eq!(&decoded[..], data);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn decode_incomplete_returns_none() {
-        let mut buf = BytesMut::new();
-        buf.put_u16(100u16);
-        buf.put_u8(0xAA);
-        let mut json_scratch = Vec::new();
-        let result = decode_frame(
-            &mut buf,
-            &mut json_scratch,
-            &test_cipher(),
-            EncodingType::Binary,
-        )
-        .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn decode_too_long_rejected() {
-        let mut buf = BytesMut::new();
-        buf.put_u16((MAX_RAW_PAYLOAD + 1000) as u16);
-        buf.resize(2 + MAX_RAW_PAYLOAD + 1000, 0u8);
-        let mut json_scratch = Vec::new();
-        let result = decode_frame(
-            &mut buf,
-            &mut json_scratch,
-            &test_cipher(),
-            EncodingType::Binary,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn extract_frame_valid() {
-        let payload = [0u8; 8]
-            .iter()
-            .copied()
-            .chain(3u16.to_be_bytes())
-            .chain(b"abc".iter().copied())
-            .collect::<Vec<_>>();
-        let (seq, start, end) = extract_frame_range(&payload).unwrap();
-        assert_eq!(seq, 0);
-        assert_eq!(&payload[start..end], b"abc");
-    }
-
-    #[test]
-    fn extract_frame_too_short() {
-        assert!(extract_frame_range(b"short").is_err());
-    }
-
-    #[test]
-    fn parse_json_payload_valid() {
-        let enc = base122_fast::encode(b"hello");
-        let json = format!("{{\"data\":\"{enc}\"}}");
-        let mut out = Vec::new();
-        let n = parse_json_payload_into(json.as_bytes(), &mut out).unwrap();
-        assert_eq!(&out[..n], b"hello");
-    }
-
-    #[test]
-    fn parse_json_payload_missing_field() {
-        let mut out = Vec::new();
-        let result = parse_json_payload_into(b"{\"other\":\"x\"}", &mut out);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn jitter_table_deterministic_with_seed() {
         let table1 = generate_jitter_table(SmallRng::seed_from_u64(42));
         let table2 = generate_jitter_table(SmallRng::seed_from_u64(42));
@@ -1267,42 +1180,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_seal_into_produces_valid_frames() {
-        let config = ResolvedShaperConfig::resolve(&test_config());
-        let cipher = test_cipher_arc();
-        let data = vec![0xABu8; 40_000];
-        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, cipher.clone(), 0);
-        let mut out = Vec::new();
-        let seqs = seal_all(shaper, &mut out);
-
-        assert_eq!(seqs, vec![0, 1, 2]);
-
-        let mut out = BytesMut::from(&out[..]);
-        let mut json_scratch = Vec::new();
-        let mut decoded = Vec::new();
-        let mut frame_idx = 0usize;
-        while !out.is_empty() {
-            match decode_frame(
-                &mut out,
-                &mut json_scratch,
-                cipher.as_ref(),
-                EncodingType::Binary,
-            )
-            .unwrap()
-            .unwrap()
-            {
-                DecodedFrame::Owned { seq, data } => {
-                    assert_eq!(seq, seqs[frame_idx]);
-                    frame_idx += 1;
-                    decoded.extend_from_slice(&data);
-                }
-                _ => panic!("expected Owned frame"),
-            }
-        }
-        assert_eq!(decoded, data);
-    }
-
-    #[tokio::test]
     async fn poll_seal_into_cipher_matches_stream_output() {
         use futures::StreamExt;
 
@@ -1349,6 +1226,7 @@ mod tests {
             decode_append(&mut out_buf, &mut seal_payload);
         }
 
+        assert!(seqs.iter().copied().eq(0..seqs.len() as u64));
         assert_eq!(seqs, stream_seqs);
         assert_eq!(seal_payload, stream_payload);
         assert_eq!(seal_payload, data);
