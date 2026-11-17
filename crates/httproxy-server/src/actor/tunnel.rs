@@ -6,7 +6,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard};
 use std::task::{Context, Poll};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{Instrument, info, warn};
 use uuid::Uuid;
@@ -25,7 +25,6 @@ pub enum TunnelCmd {
     Continue {
         reply: oneshot::Sender<Option<SegmentStream>>,
     },
-    Shutdown,
 }
 
 enum Phase {
@@ -33,7 +32,6 @@ enum Phase {
     Active,
     Rotating,
     Draining,
-    Closed,
 }
 
 type ShaperStream = Pin<Box<TrafficShaper<UpstreamRead>>>;
@@ -175,7 +173,6 @@ pub struct TunnelActor {
     cancelled: Arc<Cancellation>,
     stream_id: Uuid,
     stream_registry: Arc<StreamRegistry>,
-    shutdown_signal: Arc<Notify>,
     max_download_bytes: Option<u64>,
     pending_write_half: Option<UpstreamWrite>,
     pending_initial_seq: u64,
@@ -204,16 +201,11 @@ impl TunnelActor {
             cancelled: Arc::new(Cancellation::default()),
             stream_id,
             stream_registry,
-            shutdown_signal: Arc::new(Notify::new()),
             max_download_bytes,
             pending_write_half: None,
             pending_initial_seq: 0,
             last_activity,
         }
-    }
-
-    pub fn shutdown_handle(&self) -> Arc<Notify> {
-        Arc::clone(&self.shutdown_signal)
     }
 
     pub fn set_upload_channel(
@@ -306,15 +298,12 @@ impl TunnelActor {
                 cmd = self.rx.recv() => {
                     self.last_activity.store(now_secs(), Ordering::Relaxed);
                     match cmd {
-                        Some(TunnelCmd::Shutdown) | None => break,
                         Some(cmd) => self.dispatch_cmd(cmd),
+                        None => break,
                     }
                 }
                 _ = &mut rotation_timeout, if matches!(self.phase, Phase::Rotating) => {
                     warn!(stream_id = %self.stream_id, "rotation staleness timeout");
-                    break;
-                }
-                _ = self.shutdown_signal.notified() => {
                     break;
                 }
                 _ = &mut idle_sleep => {
@@ -334,7 +323,7 @@ impl TunnelActor {
                 }
             }
 
-            if matches!(self.phase, Phase::Closed | Phase::Draining) {
+            if matches!(self.phase, Phase::Draining) {
                 break;
             }
         }
@@ -402,12 +391,10 @@ impl TunnelActor {
                     let _ = reply.send(None);
                 }
             },
-            TunnelCmd::Shutdown => {}
         }
     }
 
     async fn cleanup(&mut self) {
-        self.phase = Phase::Closed;
         self.consume_stream();
         self.cancelled.cancel();
         if let Some(slot) = self.shaper_slot.take() {
@@ -801,7 +788,7 @@ mod timeout_tests {
         tokio::task::yield_now().await;
         tokio::time::resume();
 
-        let _ = cmd_tx.send(TunnelCmd::Shutdown).await;
+        drop(cmd_tx);
         tokio::time::timeout(std::time::Duration::from_secs(5), handle)
             .await
             .expect("tunnel must close after rotation staleness")
