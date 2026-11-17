@@ -115,7 +115,6 @@ async fn setup_tunnel_response(
     let encoding = state.traffic_config.encoding_type;
 
     let max_download_bytes = state.traffic_config.max_download_bytes;
-    let direct = max_download_bytes.is_none();
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(httproxy_core::now_secs()));
 
     let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
@@ -175,39 +174,20 @@ async fn setup_tunnel_response(
     );
     actor.set_upload_channel(upload_tx_for_actor, upload_handle);
 
-    let body_stream = if direct {
-        let shaper = httproxy_core::shaper::TrafficShaper::with_inspector(
-            upstream_read,
-            &state.resolved_traffic,
-            download_cipher,
-            0,
-            Some(TlsInspector::new()),
-        );
-        let activity = Arc::clone(&last_activity);
-        Body::from_stream(shaper.map(move |r| {
-            if r.is_ok() {
-                activity.store(
-                    httproxy_core::now_secs(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-            r.map(|(_seq, data)| data)
-        }))
-    } else {
-        actor.on_upstream_connected(
-            upstream_read,
-            None,
-            &state.resolved_traffic,
-            download_cipher,
-            0,
-            Some(TlsInspector::new()),
-        );
-        Body::from_stream(
-            actor
-                .take_segment()
-                .ok_or_else(|| ServerError::internal("download segment unavailable"))?,
-        )
-    };
+    actor.on_upstream_connected(
+        upstream_read,
+        None,
+        &state.resolved_traffic,
+        download_cipher,
+        0,
+        Some(TlsInspector::new()),
+    );
+
+    let body_stream = Body::from_stream(
+        actor
+            .take_segment()
+            .ok_or_else(|| ServerError::internal("download segment unavailable"))?,
+    );
 
     let handle = SessionHandle {
         cmd_tx: actor_tx.clone(),
