@@ -20,7 +20,7 @@ axum = {version = "0.8.9", features = ["http2"]}
 base122-fast = "0.1.9"
 base64 = "0.23.1"
 bytes = "1.12.1"
-clap = {version = "4.6.7", features = ["derive"]}
+clap = {version = "4.6.8", features = ["derive"]}
 dashmap = "6.2.1"
 domain = "0.12.3"
 fst = "0.4.7"
@@ -38,7 +38,7 @@ quinn = {version = "0.11.12", default-features = false, features = [
   "runtime-tokio",
   "rustls-aws-lc-rs",
 ]}
-rand = "0.10.3"
+rand = "0.10.4"
 rand_distr = "0.6.0"
 rcgen = {version = "0.14.10", default-features = false, features = [
   "crypto",
@@ -70,7 +70,7 @@ tracing-subscriber = {version = "0.3.23", features = [
   "json",
 ]}
 url = "2.5.8"
-uuid = "1.29.2"
+uuid = "1.29.3"
 webpki-root-certs = "1.0.12"
 webpki-roots = "1.0.12"
 x25519-dalek = {version = "3.0.0", features = [
