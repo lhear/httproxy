@@ -16,7 +16,7 @@ version = "0.6.0"
 [workspace.dependencies]
 anyhow = "1.0.104"
 aws-lc-rs = "1.19.0"
-axum = {version = "0.8.9", features = ["http2", "macros"]}
+axum = {version = "0.8.9", features = ["http2"]}
 base122-fast = "0.1.9"
 base64 = "0.23.1"
 bytes = "1.12.1"
@@ -55,11 +55,10 @@ tokio = {version = "1.54.1", features = [
   "time",
   "sync",
   "fs",
-  "test-util",
 ]}
 tokio-rustls = "0.26.6"
 tokio-socks = "0.5.3"
-tokio-stream = {version = "0.1.19", features = ["net"]}
+tokio-stream = "0.1.19"
 toml = "1.2.1"
 tower = "0.5.3"
 tower-http = {version = "0.7.1", features = ["trace"]}
