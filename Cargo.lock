@@ -947,7 +947,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "httproxy-client"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "httproxy-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "httproxy-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "httproxy-tests"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "base64",
