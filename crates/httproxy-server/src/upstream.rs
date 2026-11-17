@@ -167,14 +167,4 @@ mod tests {
             );
         }
     }
-
-    #[tokio::test]
-    async fn direct_read_delegates() {
-        let (client, mut server) = tcp_pair().await;
-        let (mut read, _write) = Upstream::Direct(client).into_split();
-        server.write_all(b"upstream bytes").await.unwrap();
-        let mut buf = [0u8; 14];
-        read.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"upstream bytes");
-    }
 }

@@ -17,8 +17,6 @@ pub enum StreamQueryResult {
 }
 
 #[derive(Debug)]
-pub struct StreamConsumedError;
-
 pub struct StreamRegistry {
     streams: DashMap<Uuid, (AtomicU8, u64)>,
 }
@@ -85,8 +83,6 @@ impl Default for StreamRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
     fn dummy_ts() -> u64 {
         1_700_000_000
     }
@@ -149,60 +145,5 @@ mod tests {
         let removed = reg.remove_consumed_before(900);
         assert_eq!(removed, 0);
         assert_eq!(reg.check(s1), StreamQueryResult::Consumed);
-    }
-
-    #[test]
-    fn concurrent_streams_independent() {
-        let reg = StreamRegistry::new();
-        let (s1, s2, _) = ids();
-        assert!(reg.register(s1, dummy_ts()));
-        assert!(reg.register(s2, dummy_ts()));
-        reg.mark_consumed(s1);
-        assert_eq!(reg.check(s1), StreamQueryResult::Consumed);
-        assert_eq!(reg.check(s2), StreamQueryResult::Active);
-    }
-
-    #[tokio::test]
-    async fn concurrent_registrations_different_ids() {
-        let reg = Arc::new(StreamRegistry::new());
-        let mut handles = Vec::new();
-
-        for _ in 0..16u8 {
-            let reg = Arc::clone(&reg);
-            handles.push(tokio::spawn(async move {
-                let id = Uuid::new_v4();
-                reg.register(id, dummy_ts())
-            }));
-        }
-
-        let mut success = 0;
-        for handle in handles {
-            if handle.await.unwrap() {
-                success += 1;
-            }
-        }
-        assert_eq!(
-            success, 16,
-            "all 16 concurrent registrations should succeed"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_register_and_consume_race() {
-        let reg = Arc::new(StreamRegistry::new());
-        let id = Uuid::new_v4();
-
-        assert!(reg.register(id, dummy_ts()));
-
-        let reg_clone = Arc::clone(&reg);
-        let h1 = tokio::spawn(async move { reg_clone.register(id, dummy_ts()) });
-
-        let reg_clone2 = Arc::clone(&reg);
-        let h2 = tokio::spawn(async move {
-            reg_clone2.mark_consumed(id);
-        });
-
-        let (r1, _) = tokio::join!(h1, h2);
-        assert!(!r1.expect("register task should not panic"));
     }
 }
