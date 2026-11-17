@@ -77,6 +77,8 @@ pub struct ClientSection {
     pub max_in_flight_bytes: Option<usize>,
     #[serde(default)]
     pub upload_concurrency: Option<usize>,
+    #[serde(default)]
+    pub disable_http3: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -257,6 +259,29 @@ padding_threshold = 50
         let proxy_auth = cfg.client.proxy_auth.unwrap();
         assert_eq!(proxy_auth.username, "proxyuser");
         assert_eq!(proxy_auth.password, "proxypass");
+    }
+
+    #[test]
+    fn parse_client_disable_http3() {
+        let base = r#"
+[client]
+listen = "127.0.0.1:8080"
+remote = "https://example.com/secret"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+[auth]
+token = "mytoken"
+
+[traffic_shaping.global]
+padding_range = [0, 100]
+padding_threshold = 50
+"#;
+        let cfg: ClientTopConfig = toml::from_str(base).unwrap();
+        assert!(!cfg.client.disable_http3);
+
+        let disabled = base.replace("[client]\n", "[client]\ndisable_http3 = true\n");
+        let cfg: ClientTopConfig = toml::from_str(&disabled).unwrap();
+        assert!(cfg.client.disable_http3);
     }
 
     #[test]

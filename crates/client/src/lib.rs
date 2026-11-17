@@ -32,8 +32,12 @@ pub fn build_http_client(
             "trusting only the supplied certificate; the built-in Mozilla roots are disabled"
         );
     }
-    Client::with_trusted_cert(cfg.client.address.as_deref(), trusted_pem.as_deref())
-        .context("failed to start cronet engine")
+    Client::with_options(
+        cfg.client.address.as_deref(),
+        trusted_pem.as_deref(),
+        cfg.client.disable_http3,
+    )
+    .context("failed to start cronet engine")
 }
 
 fn read_trusted_cert(path: &Path) -> Result<Vec<u8>> {

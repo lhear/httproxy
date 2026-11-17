@@ -59,6 +59,7 @@ public_key = "your-public-key"       # required (§1.2)
 # max_connections = 1024
 # max_in_flight_bytes = 2097152
 # upload_concurrency = 128
+# disable_http3 = false
 
 # [client.proxy_auth]                # local proxy basic auth (§2.2)
 # username = "proxyuser"
@@ -94,6 +95,7 @@ padding_threshold = 500
 | `max_connections`     | integer | no       | `1024`      | Concurrent local connections; excess are refused. |
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Upload bytes in flight per tunnel. **Must not exceed 2 MiB** (§9). |
 | `upload_concurrency`  | integer | no       | `128`       | Concurrent upload POSTs per tunnel. |
+| `disable_http3`       | boolean | no       | `false`     | Set `true` to turn HTTP/3 off; the tunnel then falls back to HTTP/2 over TCP. |
 
 ### 2.2 `[client.proxy_auth]` — Local Proxy Authentication
 

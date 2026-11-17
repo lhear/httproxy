@@ -45,15 +45,16 @@ pub struct Client {
 
 impl Client {
     pub fn new(resolve: Option<&str>) -> Result<Arc<Self>> {
-        Self::with_trusted_cert(resolve, None)
+        Self::with_options(resolve, None, false)
     }
 
-    pub fn with_trusted_cert(
+    pub fn with_options(
         resolve: Option<&str>,
         trusted_pem: Option<&[u8]>,
+        disable_http3: bool,
     ) -> Result<Arc<Self>> {
         sys::load().map_err(|error| anyhow!(error))?;
-        let engine = Arc::new(Engine::start(resolve, trusted_pem)?);
+        let engine = Arc::new(Engine::start(resolve, trusted_pem, disable_http3)?);
         let callback = Arc::new(Callback::new()?);
         let exec = Executor::new(Arc::clone(&engine), Arc::clone(&callback))?;
         Ok(Arc::new(Self { exec }))
@@ -79,7 +80,7 @@ impl Client {
 pub(crate) struct Engine(Ptr, AtomicBool);
 
 impl Engine {
-    fn start(resolve: Option<&str>, trusted: Option<&[u8]>) -> Result<Self> {
+    fn start(resolve: Option<&str>, trusted: Option<&[u8]>, disable_http3: bool) -> Result<Self> {
         let options = resolve.map(experimental_options).transpose()?;
         let api = sys::api();
         let engine = api.engine_create();
@@ -96,7 +97,7 @@ impl Engine {
             api.engine_destroy(engine);
             bail!("cronet: engine params create failed");
         }
-        api.engine_params_quic(params, true);
+        api.engine_params_quic(params, !disable_http3);
         api.engine_params_http2(params, true);
         api.engine_params_brotli(params, true);
         api.engine_params_cache_mode(params, sys::HTTP_CACHE_DISABLED);
@@ -471,13 +472,13 @@ mod tests {
         let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
-        let client = Client::with_trusted_cert(None, Some(cert.pem().as_bytes()));
+        let client = Client::with_options(None, Some(cert.pem().as_bytes()), false);
         assert!(client.is_ok(), "{:?}", client.err().map(|e| e.to_string()));
     }
 
     #[test]
     fn an_invalid_custom_root_is_rejected() {
-        let error = Client::with_trusted_cert(None, Some(b"not a certificate"))
+        let error = Client::with_options(None, Some(b"not a certificate"), false)
             .err()
             .expect("an unparsable root store must be rejected");
         assert!(
