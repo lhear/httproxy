@@ -17,6 +17,7 @@ use crate::constants::{
     TOKEN_CACHE_TTL, TUNNEL_CMD_CHANNEL_CAPACITY, UPLOAD_CMD_CHANNEL_CAPACITY,
 };
 use crate::error::ServerError;
+use crate::janitor;
 use crate::stream::FrameDecoder;
 use crate::stream_registry::StreamQueryResult;
 use crate::{SessionHandle, utils};
@@ -579,10 +580,11 @@ async fn handle_fresh_handshake(
     };
 
     let session_id = Uuid::new_v4().to_string();
-    state.master_store.insert(
-        session_id.clone(),
-        (user, master, httproxy_core::now_secs()),
-    );
+    let now = httproxy_core::now_secs();
+    janitor::ensure_session_capacity(&state.master_store, now, state.max_sessions);
+    state
+        .master_store
+        .insert(session_id.clone(), (user, master, now));
 
     info!(session_id = %session_id, "handshake: master key derived");
 
@@ -667,6 +669,7 @@ mod tests {
                 path: "/secret".to_string(),
                 private_key: httproxy_core::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
                 max_tunnels: None,
+                max_sessions: None,
             },
             auth: httproxy_core::config::AuthSection {
                 secret: "test-secret".to_string(),

@@ -38,7 +38,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::actor::tunnel::TunnelCmd;
 use crate::actor::upload::UploadCmd;
-use crate::constants::{MAX_TUNNELS, TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
+use crate::constants::{MAX_SESSIONS, MAX_TUNNELS, TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
 
 pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
 
@@ -67,6 +67,7 @@ pub struct AppState {
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub private_key: Arc<httproxy_core::crypto::DecapsulationKey>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
+    pub max_sessions: usize,
     pub stream_registry: Arc<StreamRegistry>,
     pub actors: Arc<DashMap<Uuid, SessionHandle>>,
     pub tunnel_semaphore: Arc<Semaphore>,
@@ -114,6 +115,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
     config.auth.secret.zeroize();
 
     let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
+    let max_sessions = config.server.max_sessions.unwrap_or(MAX_SESSIONS);
 
     Ok(Arc::new(AppState {
         token_key: Arc::new(token_key),
@@ -129,6 +131,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&config.traffic_shaping)),
         private_key: Arc::new(private_key),
         master_store: Arc::new(DashMap::new()),
+        max_sessions,
         stream_registry: Arc::new(StreamRegistry::new()),
         actors: Arc::new(DashMap::new()),
         tunnel_semaphore: Arc::new(Semaphore::new(max_tunnels)),
@@ -211,6 +214,7 @@ mod tests {
                 path: "/t".into(),
                 private_key: httproxy_core::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
                 max_tunnels: None,
+                max_sessions: None,
             },
             auth: AuthSection {
                 secret: "test-key".into(),

@@ -147,6 +147,7 @@ listen = "/dev/shm/httproxy.sock"    # or "0.0.0.0:443"
 path = "/YOUR_SECRET_PATH"
 private_key = "your-private-key"     # required, from `gen-key`
 # max_tunnels = 1024
+# max_sessions = 65536
 
 [auth]
 secret = "my_secret_key"
@@ -177,6 +178,7 @@ padding_threshold = 500
 | `path`        | string  | yes      | —       | Hidden service path; must match the path in the client's `remote`. |
 | `private_key` | string  | yes      | —       | ML-KEM-768 decapsulation key (from `gen-key`), paired with the client's `public_key`. |
 | `max_tunnels` | integer | no       | `1024`  | Concurrent tunnels; excess requests get HTTP 503. |
+| `max_sessions` | integer | no      | `65536` | Handshake sessions kept in memory. When full, expired entries are dropped first, then the oldest ~12.5% are evicted; affected clients simply re-handshake. |
 
 ### 3.2 `[auth]` — Token Signing Secret
 
@@ -387,6 +389,7 @@ terminal).
 | Setting                | Default   | Effect |
 | ---------------------- | --------- | ------ |
 | `[server] max_tunnels` | `1024`    | Concurrent tunnels; excess → HTTP 503. |
+| `[server] max_sessions` | `65536`  | Handshake sessions held in memory (~200 B each); oldest evicted when full. |
 | `[client] max_connections` | `1024` | Concurrent local connections; excess are refused. |
 | `[client] upload_concurrency` | `128` | Concurrent upload POSTs per tunnel. |
 | `[client] max_in_flight_bytes` | `2097152` (2 MiB) | Upload bytes in flight per tunnel; the throughput/memory knob. |
@@ -397,7 +400,8 @@ errors under HTTP/2 frame reordering. The default sits at this ceiling.
 
 Other notes:
 
-- `max_connections` / `max_tunnels` are the main bounds on total memory.
+- `max_connections` / `max_tunnels` are the main bounds on total memory;
+  `max_sessions` bounds the session table left behind by handshakes.
 - `encoding_type = "json"` trades ~14% wire overhead for a JSON-shaped profile.
 - Leave `max_download_bytes` unset for maximum download throughput.
 

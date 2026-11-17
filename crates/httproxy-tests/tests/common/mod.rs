@@ -76,6 +76,7 @@ pub fn server_config(
             path: PATH.to_string(),
             private_key: keys.private_key.clone(),
             max_tunnels,
+            max_sessions: None,
         },
         auth: AuthSection {
             secret: SECRET.to_string(),
