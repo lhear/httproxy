@@ -165,7 +165,7 @@ pub async fn spawn_client_with_redirects(
     let state = httproxy_client::build_state(&cfg).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = listener.local_addr().unwrap();
-    let http_client = httproxy_client::build_http_client(&cfg).unwrap();
+    let http_client = httproxy_client::build_http_client(&cfg, None).unwrap();
     let sem = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
 
     let mut redirect_addrs = Vec::new();

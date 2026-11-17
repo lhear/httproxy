@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,6 +17,13 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 struct Cli {
     #[arg(short = 'c', long, default_value = "config.toml")]
     config: String,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Trust the given PEM certificate or CA bundle instead of the built-in Mozilla roots"
+    )]
+    trusted_cert: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -31,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = config.client.listen.parse()?;
     let listener = TcpListener::bind(addr).await?;
 
-    let http_client = httproxy_client::build_http_client(&config)?;
+    let http_client = httproxy_client::build_http_client(&config, cli.trusted_cert.as_deref())?;
 
     info!(listen = %addr, "proxy listening");
 
@@ -102,5 +110,25 @@ async fn main() -> anyhow::Result<()> {
                 target = tracing::field::Empty,
             )),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_cert_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["client", "--trusted-cert", "cert.pem"]).unwrap();
+        assert_eq!(
+            cli.trusted_cert.as_deref(),
+            Some(std::path::Path::new("cert.pem"))
+        );
+    }
+
+    #[test]
+    fn trusted_cert_flag_is_optional() {
+        let cli = Cli::try_parse_from(["client"]).unwrap();
+        assert!(cli.trusted_cert.is_none());
     }
 }

@@ -34,7 +34,7 @@ x25519-dalek.workspace = true
 [dev-dependencies]
 axum.workspace = true
 httproxy-core = {path = "../core", features = ["test-support"]}
-rcgen.workspace = true
+rcgen = {workspace = true, features = ["pem"]}
 rustls.workspace = true
 tokio = {workspace = true, features = ["test-util"]}
 tracing-subscriber.workspace = true

@@ -14,13 +14,34 @@ use httproxy_core::config::ClientTopConfig;
 use httproxy_core::crypto;
 use httproxy_core::shaper::ResolvedShaperConfig;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::warn;
 
-pub fn build_http_client(cfg: &ClientTopConfig) -> Result<Arc<Client>> {
-    Client::new(cfg.client.address.as_deref()).context("failed to start cronet engine")
+pub fn build_http_client(
+    cfg: &ClientTopConfig,
+    trusted_cert: Option<&Path>,
+) -> Result<Arc<Client>> {
+    let trusted_pem = trusted_cert.map(read_trusted_cert).transpose()?;
+    if let Some(path) = trusted_cert {
+        warn!(
+            path = %path.display(),
+            "trusting only the supplied certificate; the built-in Mozilla roots are disabled"
+        );
+    }
+    Client::with_trusted_cert(cfg.client.address.as_deref(), trusted_pem.as_deref())
+        .context("failed to start cronet engine")
+}
+
+fn read_trusted_cert(path: &Path) -> Result<Vec<u8>> {
+    let pem = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if pem.is_empty() {
+        bail!("{} is empty", path.display());
+    }
+    Ok(pem)
 }
 
 pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
@@ -134,5 +155,17 @@ padding_threshold = 50
         let state = build_state(&cfg).unwrap();
         assert_eq!(state.max_in_flight_bytes, 256 * 1024);
         assert_eq!(state.upload_concurrency, 4);
+    }
+
+    #[test]
+    fn build_http_client_reports_a_missing_certificate() {
+        let cfg = minimal_client_cfg();
+        let error = build_http_client(&cfg, Some(Path::new("no-such-certificate.pem")))
+            .err()
+            .expect("a missing certificate file must be reported");
+        assert!(
+            format!("{error:#}").contains("no-such-certificate.pem"),
+            "{error:#}"
+        );
     }
 }
