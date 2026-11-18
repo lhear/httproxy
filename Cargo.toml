@@ -11,7 +11,7 @@ members = [
 edition = "2024"
 license = "MPL-2.0"
 rust-version = "1.99"
-version = "0.6.2"
+version = "0.6.3"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
