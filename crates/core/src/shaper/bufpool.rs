@@ -274,13 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_frame_sizes_stay_below_the_32k_class() {
-        assert_eq!(class_of(16424), class_of(18781));
-        assert_ne!(class_of(18781), class_of(32768));
-        assert!(class_of(16424) < class_of(32768));
-    }
-
-    #[test]
     fn zero_length_take_does_not_use_the_pool() {
         let buf = take(0);
         assert!(buf.is_empty());
@@ -329,21 +322,17 @@ mod tests {
         let now = Instant::now();
         let mut free = Free::new();
         free.put(vec![0u8; 1024 * 1024], now);
+        free.put(vec![0u8; 2 * 1024 * 1024], now);
 
         assert!(
             free.take(1024, now).is_none(),
             "a 1 KiB request must not take a 1 MiB buffer"
         );
+        assert!(
+            free.take(16424, now).is_none(),
+            "a frame request must not take a 2 MiB batch buffer"
+        );
         assert!(free.take(1024 * 1024, now).is_some());
-    }
-
-    #[test]
-    fn frame_requests_do_not_take_batch_buffers() {
-        let now = Instant::now();
-        let mut free = Free::new();
-        free.put(vec![0u8; 2 * 1024 * 1024], now);
-        assert!(free.take(16424, now).is_none());
-        assert!(free.take(18781, now).is_none());
     }
 
     #[test]

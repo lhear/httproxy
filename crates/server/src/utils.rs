@@ -66,12 +66,7 @@ mod tests {
         assert_eq!(extract_cookie_value(&headers, "session"), Some("abc123"));
         assert_eq!(extract_cookie_value(&headers, "other"), Some("val"));
         assert_eq!(extract_cookie_value(&headers, "missing"), None);
-    }
-
-    #[test]
-    fn extract_cookie_no_cookie_header() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_cookie_value(&headers, "session"), None);
+        assert_eq!(extract_cookie_value(&HeaderMap::new(), "session"), None);
     }
 
     #[test]

@@ -1,8 +1,11 @@
 mod common;
 
 use common::*;
+use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+const LOOPBACK_BYPASS: &str = r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#;
 
 fn write_bypass_file(rules: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -13,18 +16,27 @@ fn write_bypass_file(rules: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-#[tokio::test]
-async fn bypass_direct_connect_skips_tunnel() {
+async fn start_bypassed(rules: &str) -> (SocketAddr, SocketAddr) {
     let keys = test_keys();
-    common::init_logging();
     let upstream = spawn_upstream().await;
     let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
-    let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
     let client = spawn_client(
-        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
+        client_config(
+            traffic(true, None),
+            &keys,
+            None,
+            vec![write_bypass_file(rules)],
+        ),
         server,
     )
     .await;
+    (upstream, client)
+}
+
+#[tokio::test]
+async fn bypass_direct_connect_skips_tunnel() {
+    common::init_logging();
+    let (upstream, client) = start_bypassed(LOOPBACK_BYPASS).await;
 
     let url = format!("http://{upstream}/hello");
     let (status, body) = raw_exchange(
@@ -38,16 +50,8 @@ async fn bypass_direct_connect_skips_tunnel() {
 
 #[tokio::test]
 async fn bypass_large_body_direct() {
-    let keys = test_keys();
     common::init_logging();
-    let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
-    let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
-    let client = spawn_client(
-        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
-        server,
-    )
-    .await;
+    let (upstream, client) = start_bypassed(LOOPBACK_BYPASS).await;
 
     let url = format!("http://{upstream}/large");
     let (status, body) = raw_exchange(
@@ -62,16 +66,8 @@ async fn bypass_large_body_direct() {
 
 #[tokio::test]
 async fn bypass_connect_direct() {
-    let keys = test_keys();
     common::init_logging();
-    let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
-    let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
-    let client = spawn_client(
-        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
-        server,
-    )
-    .await;
+    let (upstream, client) = start_bypassed(LOOPBACK_BYPASS).await;
 
     let mut stream = proxy_connect(client, upstream).await;
     stream
@@ -85,16 +81,9 @@ async fn bypass_connect_direct() {
 
 #[tokio::test]
 async fn non_matching_domain_still_tunneled() {
-    let keys = test_keys();
     common::init_logging();
-    let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
-    let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["10.0.0.0/8"]}"#);
-    let client = spawn_client(
-        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
-        server,
-    )
-    .await;
+    let (upstream, client) =
+        start_bypassed(r#"{"domain_suffix": [], "ip_cidr": ["10.0.0.0/8"]}"#).await;
 
     let url = format!("http://{upstream}/hello");
     let (status, body) = raw_exchange(
@@ -108,15 +97,8 @@ async fn non_matching_domain_still_tunneled() {
 
 #[tokio::test]
 async fn bypass_unreachable_target_fails_fast() {
-    let keys = test_keys();
     common::init_logging();
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
-    let bypass_file = write_bypass_file(r#"{"domain_suffix": [], "ip_cidr": ["127.0.0.1/32"]}"#);
-    let client = spawn_client(
-        client_config(traffic(true, None), &keys, None, vec![bypass_file]),
-        server,
-    )
-    .await;
+    let (_, client) = start_bypassed(LOOPBACK_BYPASS).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = listener.local_addr().unwrap();
