@@ -121,7 +121,9 @@ impl DnsClient {
             .acquire_owned()
             .await
             .map_err(|error| anyhow!(error))?;
-        let (mut response, upstream_id) = self.transport.send(query.to_vec()).await?;
+        let payload = super::ecs::rewrite(query, self.config.options.client_subnet)
+            .unwrap_or_else(|| query.to_vec());
+        let (mut response, upstream_id) = self.transport.send(payload).await?;
         anyhow::ensure!(response.len() >= 12, "invalid DNS response length");
         anyhow::ensure!(
             u16::from_be_bytes([response[0], response[1]]) == upstream_id,
@@ -619,6 +621,73 @@ mod tests {
         let response = client.query(&query).await.unwrap();
         assert_eq!(&response[..2], &0x1234u16.to_be_bytes());
         assert_ne!(response[2] & 0x80, 0);
+    }
+
+    async fn capturing_upstream() -> (SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok((len, peer)) = upstream.recv_from(&mut buf).await else {
+                    return;
+                };
+                *recorder.lock().unwrap() = buf[..len].to_vec();
+                buf[2] |= 0x80;
+                let _ = upstream.send_to(&buf[..len], peer).await;
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn hijacked_queries_carry_the_configured_client_subnet() {
+        let (upstream, seen) = capturing_upstream().await;
+        let config = DnsConfig {
+            upstream,
+            tls_domain: None,
+            options: DnsOptions {
+                client_subnet: Some("1.2.3.4".parse().unwrap()),
+                ..DnsOptions::default()
+            },
+        };
+        let client = DnsClient::new(&config).await.unwrap();
+        let query = client
+            .build_query("ecs.test", Rtype::A, None, 0x1111)
+            .unwrap();
+        client.query(&query).await.unwrap();
+
+        let received = seen.lock().unwrap().clone();
+        assert!(
+            received.ends_with(&[0, 8, 0, 7, 0, 1, 24, 0, 1, 2, 3]),
+            "{received:02x?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hijacked_queries_drop_ecs_without_configuration() {
+        let (upstream, seen) = capturing_upstream().await;
+        let config = DnsConfig {
+            upstream,
+            tls_domain: None,
+            options: DnsOptions::default(),
+        };
+        let client = DnsClient::new(&config).await.unwrap();
+        let with_ecs = client
+            .build_query(
+                "ecs.test",
+                Rtype::A,
+                Some("8.8.8.8".parse().unwrap()),
+                0x2222,
+            )
+            .unwrap();
+        client.query(&with_ecs).await.unwrap();
+
+        let plain = client.build_query("ecs.test", Rtype::A, None, 0).unwrap();
+        let received = seen.lock().unwrap().clone();
+        assert_eq!(&received[2..], &plain[2..]);
     }
 
     #[tokio::test]
