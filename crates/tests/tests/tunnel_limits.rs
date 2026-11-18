@@ -136,13 +136,17 @@ async fn tunnel_admission_limit_rejects_excess() {
     )
     .await;
 
-    let big_url = format!("http://{upstream}/big");
-    let small_url = format!("http://{upstream}/hello");
-    let big_req = format!("GET {big_url} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-    let small_req = format!("GET {small_url} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    let mut occupied = proxy_connect(client, upstream).await;
+    occupied
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let (status, body) = read_response(&mut occupied).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"hello upstream");
 
-    let big = tokio::spawn(async move { raw_exchange(client, big_req.as_bytes()).await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let small_req =
+        format!("GET http://{upstream}/hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
     let mut stream = TcpStream::connect(client).await.unwrap();
     stream.write_all(small_req.as_bytes()).await.unwrap();
     let mut buf = [0u8; 1024];
@@ -152,9 +156,13 @@ async fn tunnel_admission_limit_rejects_excess() {
         "excess tunnel should be rejected (503 -> connection closed)"
     );
 
-    let (status, body) = big.await.unwrap();
+    occupied
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let (status, body) = read_response(&mut occupied).await;
     assert_eq!(status, 200);
-    assert_eq!(body.len(), 32 * 1024 * 1024);
+    assert_eq!(body, b"hello upstream");
 }
 
 #[tokio::test]
