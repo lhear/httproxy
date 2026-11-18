@@ -40,6 +40,7 @@ pub struct DnsOptions {
     pub empty_ttl: u64,
     pub happy_eyeballs_delay_ms: u64,
     pub max_concurrent_queries: usize,
+    pub hijack: bool,
 }
 
 impl Default for DnsOptions {
@@ -55,6 +56,7 @@ impl Default for DnsOptions {
             empty_ttl: 300,
             happy_eyeballs_delay_ms: 250,
             max_concurrent_queries: 1024,
+            hijack: true,
         }
     }
 }
@@ -84,6 +86,16 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg.options.protocol, Protocol::Dot);
         assert_eq!(cfg.options.cache_size, 64);
+    }
+
+    #[test]
+    fn dns_hijacking_is_enabled_by_default_and_configurable() {
+        let enabled: DnsConfig = toml::from_str("upstream = \"8.8.8.8:53\"\n").unwrap();
+        assert!(enabled.options.hijack);
+
+        let disabled: DnsConfig =
+            toml::from_str("upstream = \"8.8.8.8:53\"\nhijack = false\n").unwrap();
+        assert!(!disabled.options.hijack);
     }
 
     #[test]

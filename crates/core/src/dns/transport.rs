@@ -26,7 +26,7 @@ use crate::warp::WarpClient;
 
 static ROOT_CERT_STORE: OnceLock<Arc<RootCertStore>> = OnceLock::new();
 
-const UDP_RECV_BUF: usize = 2048;
+const UDP_RECV_BUF: usize = u16::MAX as usize;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -95,7 +95,7 @@ impl UdpTransport {
         let id: u16 = rand::random();
         data[0..2].copy_from_slice(&id.to_be_bytes());
         socket.send(data).await?;
-        let mut buf = [0u8; UDP_RECV_BUF];
+        let mut buf = vec![0u8; UDP_RECV_BUF];
         let len = timeout(Duration::from_secs(2), socket.recv(&mut buf))
             .await
             .context("UDP upstream timeout")??;

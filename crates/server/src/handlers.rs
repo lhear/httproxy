@@ -5,6 +5,7 @@ use bytes::BytesMut;
 use futures::StreamExt;
 use std::io;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -119,20 +120,32 @@ async fn setup_tunnel_response(
 
     let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
 
-    let upstream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        connect_upstream(
-            state.warp.as_ref(),
-            state.dns_client.as_ref(),
-            state.client_subnet,
-            state.socks5_proxy.as_ref(),
-            host,
-            port,
-        ),
-    )
-    .await
-    .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
-    .map_err(|e| ServerError::bad_gateway(e.to_string()))?;
+    let upstream = match state
+        .dns_client
+        .as_ref()
+        .filter(|dns| port == 53 && dns.hijack_enabled())
+    {
+        Some(dns) => {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let dns = Arc::clone(dns);
+            tokio::spawn(async move { serve_dns_tcp(server, dns).await });
+            crate::upstream::Upstream::Dns(client)
+        }
+        None => tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_upstream(
+                state.warp.as_ref(),
+                state.dns_client.as_ref(),
+                state.client_subnet,
+                state.socks5_proxy.as_ref(),
+                host,
+                port,
+            ),
+        )
+        .await
+        .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
+        .map_err(|e| ServerError::bad_gateway(e.to_string()))?,
+    };
 
     let (upstream_read, upstream_write) = upstream.into_split();
 
@@ -222,6 +235,38 @@ async fn setup_tunnel_response(
 
     tunnel_guard.disarm();
     Ok(response)
+}
+
+async fn serve_dns_tcp(
+    mut stream: tokio::io::DuplexStream,
+    dns: Arc<httproxy_core::dns::DnsClient>,
+) {
+    loop {
+        let mut length = [0; 2];
+        if stream.read_exact(&mut length).await.is_err() {
+            return;
+        }
+        let query_len = u16::from_be_bytes(length) as usize;
+        if !(12..=u16::MAX as usize).contains(&query_len) {
+            return;
+        }
+        let mut query = vec![0; query_len];
+        if stream.read_exact(&mut query).await.is_err() {
+            return;
+        }
+        let Ok(response) = dns.query(&query).await else {
+            return;
+        };
+        let Ok(response_len) = u16::try_from(response.len()) else {
+            return;
+        };
+        if stream.write_all(&response_len.to_be_bytes()).await.is_err()
+            || stream.write_all(&response).await.is_err()
+            || stream.flush().await.is_err()
+        {
+            return;
+        }
+    }
 }
 
 async fn spawn_encrypted_tunnel(

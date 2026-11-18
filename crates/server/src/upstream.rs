@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -13,6 +13,7 @@ use httproxy_core::warp::masque::{KeepAlive, MasqueRecv, MasqueSend, MasqueStrea
 pub(crate) enum Upstream {
     Direct(TcpStream),
     Warp(MasqueStream),
+    Dns(DuplexStream),
 }
 
 impl Upstream {
@@ -35,6 +36,10 @@ impl Upstream {
                     },
                 )
             }
+            Upstream::Dns(stream) => {
+                let (read, write) = tokio::io::split(stream);
+                (UpstreamRead::Dns(read), UpstreamWrite::Dns(write))
+            }
         }
     }
 }
@@ -42,6 +47,7 @@ impl Upstream {
 pub(crate) enum UpstreamRead {
     Direct(OwnedReadHalf),
     Warp { read: MasqueRecv, _guard: KeepAlive },
+    Dns(ReadHalf<DuplexStream>),
 }
 
 impl AsyncRead for UpstreamRead {
@@ -53,6 +59,7 @@ impl AsyncRead for UpstreamRead {
         match self.get_mut() {
             UpstreamRead::Direct(read) => Pin::new(read).poll_read(cx, buf),
             UpstreamRead::Warp { read, .. } => Pin::new(read).poll_read(cx, buf),
+            UpstreamRead::Dns(read) => Pin::new(read).poll_read(cx, buf),
         }
     }
 }
@@ -69,6 +76,7 @@ pub(crate) enum UpstreamWrite {
         write: MasqueSend,
         _guard: KeepAlive,
     },
+    Dns(WriteHalf<DuplexStream>),
 }
 
 impl UpstreamWrite {
@@ -76,6 +84,12 @@ impl UpstreamWrite {
         match self {
             UpstreamWrite::Direct(write) => write_tcp_frames(write, frames).await,
             UpstreamWrite::Warp { write, .. } => write.write_frames(frames).await,
+            UpstreamWrite::Dns(write) => {
+                for frame in frames {
+                    write.write_all(frame).await?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -83,6 +97,7 @@ impl UpstreamWrite {
         match self {
             UpstreamWrite::Direct(write) => write.shutdown().await,
             UpstreamWrite::Warp { write, .. } => write.shutdown().await,
+            UpstreamWrite::Dns(write) => write.shutdown().await,
         }
     }
 }

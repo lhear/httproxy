@@ -103,6 +103,34 @@ impl DnsClient {
         }
     }
 
+    pub fn hijack_enabled(&self) -> bool {
+        self.config.options.hijack
+    }
+
+    pub async fn query(&self, query: &[u8]) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            (12..=u16::MAX as usize).contains(&query.len()),
+            "invalid DNS query length"
+        );
+        anyhow::ensure!(query[2] & 0x80 == 0, "DNS message is not a query");
+        anyhow::ensure!(query[4..6] != [0, 0], "DNS query has no questions");
+        let original_id = u16::from_be_bytes([query[0], query[1]]);
+        let _permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| anyhow!(error))?;
+        let (mut response, upstream_id) = self.transport.send(query.to_vec()).await?;
+        anyhow::ensure!(response.len() >= 12, "invalid DNS response length");
+        anyhow::ensure!(
+            u16::from_be_bytes([response[0], response[1]]) == upstream_id,
+            "DNS response ID mismatch"
+        );
+        response[..2].copy_from_slice(&original_id.to_be_bytes());
+        Ok(response)
+    }
+
     pub async fn lookup(
         self: &Arc<Self>,
         domain: &str,
@@ -566,6 +594,31 @@ mod tests {
             options: DnsOptions::default(),
         };
         DnsClient::new(&cfg).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn raw_query_restores_the_original_id() {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut query = [0; 512];
+            let (len, peer) = upstream.recv_from(&mut query).await.unwrap();
+            query[2] |= 0x80;
+            upstream.send_to(&query[..len], peer).await.unwrap();
+        });
+        let config = DnsConfig {
+            upstream: upstream_addr,
+            tls_domain: None,
+            options: DnsOptions::default(),
+        };
+        let client = DnsClient::new(&config).await.unwrap();
+        let mut query = vec![0; 12];
+        query[..2].copy_from_slice(&0x1234u16.to_be_bytes());
+        query[2] = 1;
+        query[5] = 1;
+        let response = client.query(&query).await.unwrap();
+        assert_eq!(&response[..2], &0x1234u16.to_be_bytes());
+        assert_ne!(response[2] & 0x80, 0);
     }
 
     #[tokio::test]

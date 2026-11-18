@@ -160,6 +160,7 @@ secret = "my_secret_key"
 # [dns]                              # §7
 # upstream = "8.8.8.8:853"
 # protocol = "dot"
+# hijack = true
 
 # [warp]                             # §3.4
 # enabled = true
@@ -365,6 +366,7 @@ Optional server-side resolver. Without it the system resolver is used; with
 | `empty_ttl`               | integer | no       | `300`      | TTL for empty (NODATA) responses. |
 | `happy_eyeballs_delay_ms` | integer | no       | `250`      | Happy-Eyeballs fallback delay. |
 | `max_concurrent_queries`  | integer | no       | `1024`     | In-flight queries to the upstream. |
+| `hijack`                  | boolean | no       | `true`     | Route tunneled TCP connections to port 53 through this DNS module. Set `false` to connect to the requested destination instead. |
 
 With `[warp]`, public upstreams are queried through the tunnel
 (DNS-over-TCP on 53, or DoT on 853) while private or loopback upstreams are
