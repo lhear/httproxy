@@ -205,7 +205,8 @@ fn root_store_pem() -> Vec<u8> {
 }
 
 fn experimental_options(address: &str) -> Result<CString> {
-    let address = if address.contains(':') && !address.starts_with('[') {
+    let bare_ipv6 = address.matches(':').count() > 1 && !address.starts_with('[');
+    let address = if bare_ipv6 {
         format!("[{address}]")
     } else {
         address.to_owned()
@@ -439,6 +440,22 @@ mod tests {
             format!("{error:#}").contains("invalid HTTP/3 hint host"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn resolver_rules_keep_host_ports_unbracketed() {
+        let rules = |address: &str| {
+            experimental_options(address)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(rules("1.2.3.4:443").contains(r#""MAP * 1.2.3.4:443""#));
+        assert!(rules("1.2.3.4").contains(r#""MAP * 1.2.3.4""#));
+        assert!(rules("example.com:8443").contains(r#""MAP * example.com:8443""#));
+        assert!(rules("::1").contains(r#""MAP * [::1]""#));
+        assert!(rules("2001:db8::1").contains(r#""MAP * [2001:db8::1]""#));
+        assert!(rules("[::1]:8443").contains(r#""MAP * [::1]:8443""#));
     }
 
     #[tokio::test]
