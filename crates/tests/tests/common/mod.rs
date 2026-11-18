@@ -295,6 +295,7 @@ pub fn dns_answer(query: &[u8], records: &HashMap<String, IpAddr>) -> Vec<u8> {
 
     let mut builder = MessageBuilder::new_vec();
     builder.header_mut().set_id(id);
+    builder.header_mut().set_qr(true);
     builder
         .header_mut()
         .set_rcode(if records.contains_key(&qname) {

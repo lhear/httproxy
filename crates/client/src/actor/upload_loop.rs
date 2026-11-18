@@ -268,6 +268,7 @@ mod tests {
             max_connections: 8,
             max_in_flight_bytes: max_in_flight,
             upload_concurrency: 4,
+            dns_cache: Default::default(),
         })
     }
 

@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::constants::MASTER_RESUME_WINDOW_SECS;
 use crate::cronet::Client;
+use crate::dns_cache::DnsCache;
 use crate::handshake::{self, PqSessionTicket};
 use httproxy_core::bypass::BypassRules;
 use httproxy_core::shaper::{ResolvedShaperConfig, TrafficConfig};
@@ -20,13 +21,20 @@ pub struct SharedState {
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub bypass: Option<Arc<BypassRules>>,
     pub server_public_key: Arc<httproxy_core::crypto::EncapsulationKey>,
-    pub proxy_auth: Option<(String, String)>,
+    pub proxy_auth: Option<ProxyAuth>,
     pub initial_master: Mutex<Option<InitialMasterEntry>>,
     pub handshake_lock: Mutex<()>,
     pub max_download_bytes: Option<u64>,
     pub max_connections: usize,
     pub max_in_flight_bytes: usize,
     pub upload_concurrency: usize,
+    pub dns_cache: DnsCache,
+}
+
+pub struct ProxyAuth {
+    pub http_header: String,
+    pub username: String,
+    pub password: String,
 }
 
 pub struct Resuming {
@@ -232,6 +240,7 @@ mod tests {
             max_connections: 10,
             max_in_flight_bytes: 1024 * 1024,
             upload_concurrency: 4,
+            dns_cache: Default::default(),
         })
     }
 

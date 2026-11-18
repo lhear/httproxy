@@ -2,9 +2,11 @@ pub mod actor;
 pub mod connection;
 pub mod constants;
 pub mod cronet;
+pub mod dns_cache;
 pub mod handshake;
 pub mod proxy;
 pub mod redirect;
+pub mod socks5;
 pub mod state;
 pub mod utils;
 
@@ -76,6 +78,15 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         .validate()
         .context("invalid traffic_shaping config")?;
 
+    if let Some(auth) = &cfg.client.proxy_auth {
+        if auth.username.is_empty() || auth.username.len() > u8::MAX as usize {
+            bail!("client.proxy_auth.username must be 1 to 255 bytes");
+        }
+        if auth.password.is_empty() || auth.password.len() > u8::MAX as usize {
+            bail!("client.proxy_auth.password must be 1 to 255 bytes");
+        }
+    }
+
     let max_in_flight_bytes = cfg
         .client
         .max_in_flight_bytes
@@ -115,7 +126,11 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
             base64::engine::general_purpose::STANDARD
                 .encode(format!("{}:{}", a.username, a.password))
         );
-        (expected, a.username.clone())
+        state::ProxyAuth {
+            http_header: expected,
+            username: a.username.clone(),
+            password: a.password.clone(),
+        }
     });
 
     Ok(Arc::new(state::SharedState {
@@ -132,6 +147,7 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         max_connections: cfg.client.max_connections.unwrap_or(MAX_LOCAL_CONNECTIONS),
         max_in_flight_bytes,
         upload_concurrency,
+        dns_cache: crate::dns_cache::DnsCache::default(),
     }))
 }
 

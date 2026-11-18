@@ -21,6 +21,7 @@ http.workspace = true
 httparse.workspace = true
 httproxy-core = {path = "../core"}
 memchr.workspace = true
+moka.workspace = true
 rand.workspace = true
 tokio.workspace = true
 toml.workspace = true
