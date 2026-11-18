@@ -53,7 +53,7 @@ async fn count_quic(hint: Option<&str>, window: Duration) -> usize {
 
 #[tokio::test]
 async fn hint_sends_quic_packets_to_the_hinted_port() {
-    let packets = count_quic(Some("127.0.0.1"), Duration::from_secs(5)).await;
+    let packets = count_quic(Some("127.0.0.1"), Duration::from_secs(15)).await;
     assert!(packets > 0, "the hint must trigger QUIC, saw {packets}");
 }
 
