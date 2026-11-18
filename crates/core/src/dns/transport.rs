@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use bytes::BytesMut;
 use std::{
     collections::{HashMap, hash_map::Entry},
     future::Future,
@@ -81,25 +82,105 @@ fn assign_id_and_register(
 }
 
 pub(super) struct UdpTransport {
-    upstream: SocketAddr,
+    tx: mpsc::Sender<(Vec<u8>, u16)>,
+    pending: PendingMap,
+    _task: AbortOnDrop,
 }
 
 impl UdpTransport {
     pub(super) fn new(upstream: SocketAddr) -> Self {
-        Self { upstream }
+        let pending: PendingMap = Default::default();
+        let actor_pending = Arc::clone(&pending);
+        let (tx, rx) = mpsc::channel::<(Vec<u8>, u16)>(32);
+        let task = tokio::spawn(async move { Self::run(upstream, rx, actor_pending).await });
+        Self {
+            tx,
+            pending,
+            _task: AbortOnDrop(task),
+        }
     }
 
-    pub(super) async fn send(&self, data: &mut [u8]) -> Result<(Vec<u8>, u16)> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(self.upstream).await?;
-        let id: u16 = rand::random();
-        data[0..2].copy_from_slice(&id.to_be_bytes());
-        socket.send(data).await?;
-        let mut buf = vec![0u8; UDP_RECV_BUF];
-        let len = timeout(Duration::from_secs(2), socket.recv(&mut buf))
-            .await
-            .context("UDP upstream timeout")??;
-        Ok((buf[..len].to_vec(), id))
+    async fn run(
+        upstream: SocketAddr,
+        mut rx: mpsc::Receiver<(Vec<u8>, u16)>,
+        pending: PendingMap,
+    ) {
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => socket,
+            Err(error) => {
+                fail_pending(&pending, &format!("DNS upstream bind failed: {error}"));
+                return;
+            }
+        };
+        let mut buf = BytesMut::with_capacity(UDP_RECV_BUF);
+        loop {
+            buf.clear();
+            tokio::select! {
+                request = rx.recv() => {
+                    let Some((data, id)) = request else { break; };
+                    if let Err(error) = socket.send_to(&data, upstream).await
+                        && let Some(tx) = take_pending(&pending, id)
+                    {
+                        let _ = tx.send(Err(anyhow!("DNS upstream send failed: {error}")));
+                    }
+                }
+                received = socket.recv_buf_from(&mut buf) => {
+                    match received {
+                        Ok((len, from)) if from == upstream && len >= 2 => {
+                            let id = u16::from_be_bytes([buf[0], buf[1]]);
+                            if let Some(tx) = take_pending(&pending, id) {
+                                let _ = tx.send(Ok(buf[..len].to_vec()));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(%error, "DNS upstream receive failed");
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) async fn send(&self, mut data: Vec<u8>) -> Result<(Vec<u8>, u16)> {
+        let (tx, rx) = oneshot::channel();
+        let id = assign_id_and_register(&self.pending, &mut data, tx)?;
+        let _pending_guard = PendingGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
+
+        let response = timeout(Duration::from_secs(2), async {
+            self.tx
+                .send((data, id))
+                .await
+                .map_err(|_| anyhow!("DNS transport actor closed"))?;
+            rx.await
+                .map_err(|_| anyhow!("DNS response channel closed"))?
+        })
+        .await
+        .context("UDP upstream timeout")??;
+        Ok((response, id))
+    }
+}
+
+fn take_pending(pending: &PendingMap, id: u16) -> Option<oneshot::Sender<Result<Vec<u8>>>> {
+    pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_mut(&id)
+        .and_then(Option::take)
+}
+
+fn fail_pending(pending: &PendingMap, reason: &str) {
+    for tx in pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values_mut()
+        .filter_map(Option::take)
+    {
+        let _ = tx.send(Err(anyhow!("{reason}")));
     }
 }
 
@@ -300,9 +381,9 @@ pub(super) enum Transport {
 }
 
 impl Transport {
-    pub(super) async fn send(&self, mut data: Vec<u8>) -> Result<(Vec<u8>, u16)> {
+    pub(super) async fn send(&self, data: Vec<u8>) -> Result<(Vec<u8>, u16)> {
         match self {
-            Transport::Udp(t) => t.send(&mut data).await,
+            Transport::Udp(t) => t.send(data).await,
             Transport::Stream(t) => t.send(data).await,
         }
     }
@@ -438,11 +519,30 @@ mod tests {
     async fn udp_transport_roundtrip() {
         let server_addr = spawn_udp_echo_server().await;
         let t = UdpTransport::new(server_addr);
-        let mut query = [0u8; 12];
-        query[12 - 12] = 0;
-        let (resp, id) = t.send(&mut query).await.unwrap();
-        assert_eq!(resp[0..2], query[0..2]);
-        assert_eq!(id, u16::from_be_bytes([query[0], query[1]]));
+        let (resp, id) = t.send(vec![0u8; 12]).await.unwrap();
+        assert_eq!(resp[0..2], id.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn udp_transport_matches_concurrent_responses_by_id() {
+        let server_addr = spawn_udp_echo_server().await;
+        let transport = Arc::new(UdpTransport::new(server_addr));
+        let mut tasks = tokio::task::JoinSet::new();
+        for marker in 0..32u8 {
+            let transport = Arc::clone(&transport);
+            tasks.spawn(async move {
+                let mut query = vec![0u8; 14];
+                query[12] = marker;
+                query[13] = marker;
+                let (response, id) = transport.send(query).await.unwrap();
+                (marker, id, response)
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            let (marker, id, response) = done.unwrap();
+            assert_eq!(response[0..2], id.to_be_bytes());
+            assert_eq!(response[12..14], [marker, marker]);
+        }
     }
 
     #[tokio::test]
@@ -450,11 +550,22 @@ mod tests {
         let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let t = UdpTransport::new(addr);
-        let mut query = [0u8; 12];
         let start = std::time::Instant::now();
-        let r = t.send(&mut query).await;
+        let r = t.send(vec![0u8; 12]).await;
         assert!(r.is_err());
         assert!(start.elapsed() >= Duration::from_secs(2));
+        assert!(t.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_queries_release_their_pending_entry() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = UdpTransport::new(addr);
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), t.send(vec![0u8; 12])).await;
+        assert!(cancelled.is_err());
+        assert!(t.pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
