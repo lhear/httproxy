@@ -60,6 +60,7 @@ public_key = "your-public-key"       # required (§1.2)
 # max_in_flight_bytes = 2097152
 # upload_concurrency = 128
 # disable_http3 = false
+# http3_hint = false
 
 # [client.proxy_auth]                # local proxy basic auth (§2.2)
 # username = "proxyuser"
@@ -96,6 +97,7 @@ padding_threshold = 500
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Upload bytes in flight per tunnel. **Must not exceed 2 MiB** (§9). |
 | `upload_concurrency`  | integer | no       | `128`       | Concurrent upload POSTs per tunnel. |
 | `disable_http3`       | boolean | no       | `false`     | Set `true` to turn HTTP/3 off; the tunnel then falls back to HTTP/2 over TCP. |
+| `http3_hint`         | boolean | no       | `false`     | Pre-seed an HTTP/3 alternative service for the `remote` origin through Cronet's QUIC hint, so HTTP/3 is attempted without waiting for an `alt-svc` header. Requires `remote` to use HTTPS and conflicts with `disable_http3`. This is a hint, not a guarantee: Cronet still falls back to HTTP/2 over TCP when QUIC cannot be established. |
 
 ### 2.2 `[client.proxy_auth]` — Local Proxy Authentication
 

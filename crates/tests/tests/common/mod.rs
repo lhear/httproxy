@@ -106,6 +106,7 @@ pub fn client_config(
             max_in_flight_bytes: None,
             upload_concurrency: None,
             disable_http3: false,
+            http3_hint: false,
         },
         auth: ClientAuthSection {
             token: token.unwrap_or_else(valid_token),

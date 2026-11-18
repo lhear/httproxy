@@ -53,8 +53,22 @@ impl Client {
         trusted_pem: Option<&[u8]>,
         disable_http3: bool,
     ) -> Result<Arc<Self>> {
+        Self::with_http3_options(resolve, trusted_pem, disable_http3, None)
+    }
+
+    pub fn with_http3_options(
+        resolve: Option<&str>,
+        trusted_pem: Option<&[u8]>,
+        disable_http3: bool,
+        http3_hint: Option<(&str, u16)>,
+    ) -> Result<Arc<Self>> {
         sys::load().map_err(|error| anyhow!(error))?;
-        let engine = Arc::new(Engine::start(resolve, trusted_pem, disable_http3)?);
+        let engine = Arc::new(Engine::start(
+            resolve,
+            trusted_pem,
+            disable_http3,
+            http3_hint,
+        )?);
         let callback = Arc::new(Callback::new()?);
         let exec = Executor::new(Arc::clone(&engine), Arc::clone(&callback))?;
         Ok(Arc::new(Self { exec }))
@@ -80,7 +94,19 @@ impl Client {
 pub(crate) struct Engine(Ptr, AtomicBool);
 
 impl Engine {
-    fn start(resolve: Option<&str>, trusted: Option<&[u8]>, disable_http3: bool) -> Result<Self> {
+    fn start(
+        resolve: Option<&str>,
+        trusted: Option<&[u8]>,
+        disable_http3: bool,
+        http3_hint: Option<(&str, u16)>,
+    ) -> Result<Self> {
+        if disable_http3 && http3_hint.is_some() {
+            bail!("cronet: an HTTP/3 hint cannot be used while HTTP/3 is disabled");
+        }
+        let http3_hint_host = http3_hint
+            .map(|(host, port)| CString::new(host).map(|host| (host, port)))
+            .transpose()
+            .context("cronet: invalid HTTP/3 hint host")?;
         let options = resolve.map(experimental_options).transpose()?;
         let api = sys::api();
         let engine = api.engine_create();
@@ -102,6 +128,19 @@ impl Engine {
         api.engine_params_brotli(params, true);
         api.engine_params_cache_mode(params, sys::HTTP_CACHE_DISABLED);
         api.engine_params_user_agent(params, user_agent.as_ptr());
+        if let Some((host, port)) = http3_hint_host {
+            let hint = api.quic_hint_create();
+            if hint.is_null() {
+                api.engine_params_destroy(params);
+                api.engine_destroy(engine);
+                bail!("cronet: QUIC hint create failed");
+            }
+            api.quic_hint_host(hint, host.as_ptr());
+            api.quic_hint_port(hint, i32::from(port));
+            api.quic_hint_alternate_port(hint, i32::from(port));
+            api.engine_params_quic_hint(params, hint);
+            api.quic_hint_destroy(hint);
+        }
         if let Some(options) = options {
             api.engine_params_experimental(params, options.as_ptr());
         }
@@ -387,6 +426,19 @@ mod tests {
         );
         assert!(build_user_agent("").is_none());
         assert!(build_user_agent("Cronet").is_none());
+    }
+
+    #[test]
+    fn http3_hint_starts_an_engine_and_rejects_a_bad_host() {
+        drop(Client::with_http3_options(None, None, false, Some(("example.com", 443))).unwrap());
+
+        let error = Client::with_http3_options(None, None, false, Some(("exa\0mple.com", 443)))
+            .err()
+            .expect("a host with an interior nul byte must be rejected");
+        assert!(
+            format!("{error:#}").contains("invalid HTTP/3 hint host"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

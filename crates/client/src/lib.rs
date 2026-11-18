@@ -32,10 +32,33 @@ pub fn build_http_client(
             "trusting only the supplied certificate; the built-in Mozilla roots are disabled"
         );
     }
-    Client::with_options(
+    if cfg.client.disable_http3 && cfg.client.http3_hint {
+        bail!("client.disable_http3 and client.http3_hint cannot both be enabled");
+    }
+    let http3_hint = if cfg.client.http3_hint {
+        let remote: url::Url = cfg.client.remote.parse().context("invalid client.remote")?;
+        if remote.scheme() != "https" {
+            bail!("client.http3_hint requires an https client.remote");
+        }
+        Some((
+            remote
+                .host_str()
+                .context("client.remote has no host")?
+                .to_owned(),
+            remote
+                .port_or_known_default()
+                .context("client.remote has no port")?,
+        ))
+    } else {
+        None
+    };
+    Client::with_http3_options(
         cfg.client.address.as_deref(),
         trusted_pem.as_deref(),
         cfg.client.disable_http3,
+        http3_hint
+            .as_ref()
+            .map(|(host, port)| (host.as_str(), *port)),
     )
     .context("failed to start cronet engine")
 }
@@ -171,5 +194,17 @@ padding_threshold = 50
             format!("{error:#}").contains("no-such-certificate.pem"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn http3_hint_requires_https_and_conflicts_with_disable_http3() {
+        let mut cfg = minimal_client_cfg();
+        cfg.client.remote = "http://example.com/secret".to_owned();
+        cfg.client.http3_hint = true;
+        assert!(build_http_client(&cfg, None).is_err());
+
+        cfg.client.remote = "https://example.com/secret".to_owned();
+        cfg.client.disable_http3 = true;
+        assert!(build_http_client(&cfg, None).is_err());
     }
 }

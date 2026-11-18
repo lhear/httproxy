@@ -95,6 +95,7 @@ api! {
     cert_verifier_create: Cronet_CreateCertVerifierWithRootCerts(pem: CronetString) -> Ptr;
     engine_params_user_agent: Cronet_EngineParams_user_agent_set(params: Ptr, agent: CronetString);
     engine_params_quic: Cronet_EngineParams_enable_quic_set(params: Ptr, enable: bool);
+    engine_params_quic_hint: Cronet_EngineParams_quic_hints_add(params: Ptr, hint: Ptr);
     engine_params_http2: Cronet_EngineParams_enable_http2_set(params: Ptr, enable: bool);
     engine_params_brotli: Cronet_EngineParams_enable_brotli_set(params: Ptr, enable: bool);
     engine_params_cache_mode: Cronet_EngineParams_http_cache_mode_set(params: Ptr, mode: i32);
@@ -102,6 +103,11 @@ api! {
         params: Ptr,
         options: CronetString,
     );
+    quic_hint_create: Cronet_QuicHint_Create() -> Ptr;
+    quic_hint_destroy: Cronet_QuicHint_Destroy(hint: Ptr);
+    quic_hint_host: Cronet_QuicHint_host_set(hint: Ptr, host: CronetString);
+    quic_hint_port: Cronet_QuicHint_port_set(hint: Ptr, port: i32);
+    quic_hint_alternate_port: Cronet_QuicHint_alternate_port_set(hint: Ptr, port: i32);
     request_create: Cronet_UrlRequest_Create() -> Ptr;
     request_destroy: Cronet_UrlRequest_Destroy(request: Ptr);
     request_set_context: Cronet_UrlRequest_SetClientContext(request: Ptr, context: *mut c_void);
