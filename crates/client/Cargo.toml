@@ -30,7 +30,6 @@ url.workspace = true
 webpki-root-certs.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
-x25519-dalek.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
