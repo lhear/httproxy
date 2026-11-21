@@ -41,7 +41,7 @@ appears in the clear, and verification is a single AEAD pass with no parsing.
 ./server gen-key
 ```
 
-Prints an ML-KEM-768 keypair. Put the **private key** in `[server] private_key` and
+Prints an X25519 keypair. Put the **private key** in `[server] private_key` and
 the **public key** in `[client] public_key`. Both are required: the tunnel is
 always sealed, and the server rejects requests that are not part of an encrypted
 session.
@@ -79,7 +79,7 @@ target = "172.16.0.207:22"
 # [log]                              # §8
 # file_path = "client.log"
 
-[traffic_shaping.global]             # staged example in §5.4
+[traffic_shaping.global]             # staged example in §5.5
 padding_range = [0, 1000]
 padding_threshold = 500
 ```
@@ -91,7 +91,7 @@ padding_threshold = 500
 | `listen`              | string  | yes      | —           | Local listen address, e.g. `"127.0.0.1:8080"`. |
 | `remote`              | string  | yes      | —           | Server URL including the hidden path. |
 | `address`             | string  | no       | system DNS  | Connection address override. TLS SNI and `Host` still use the `remote` domain. |
-| `public_key`          | string  | yes      | —           | Server's ML-KEM-768 encapsulation key; required for the tunnel handshake. |
+| `public_key`          | string  | yes      | —           | Server's X25519 public key; required for the tunnel handshake. |
 | `proxy_auth`          | table   | no       | —           | Local proxy authentication (§2.2). |
 | `max_connections`     | integer | no       | `1024`      | Concurrent local connections; excess are refused. |
 | `max_in_flight_bytes` | integer | no       | `2097152`   | Upload bytes in flight per tunnel. **Must not exceed 2 MiB** (§9). |
@@ -170,7 +170,7 @@ secret = "my_secret_key"
 # [log]                              # §8
 # file_path = "server.log"
 
-[traffic_shaping.global]             # staged example in §5.4
+[traffic_shaping.global]             # staged example in §5.5
 padding_range = [0, 1000]
 padding_threshold = 500
 ```
@@ -181,7 +181,7 @@ padding_threshold = 500
 | ------------- | ------- | -------- | ------- | ----------- |
 | `listen`      | string  | yes      | —       | TCP address (`"0.0.0.0:443"`) or Unix socket path. |
 | `path`        | string  | yes      | —       | Hidden service path; must match the path in the client's `remote`. |
-| `private_key` | string  | yes      | —       | ML-KEM-768 decapsulation key (from `gen-key`), paired with the client's `public_key`. |
+| `private_key` | string  | yes      | —       | X25519 private key (from `gen-key`), paired with the client's `public_key`. |
 | `max_tunnels` | integer | no       | `1024`  | Concurrent tunnels; excess requests get HTTP 503. |
 | `max_sessions` | integer | no      | `65536` | Handshake sessions kept in memory. When full, expired entries are dropped first, then the oldest ~12.5% are evicted; affected clients simply re-handshake. |
 
@@ -236,14 +236,14 @@ Behaviour:
 ### 3.5 `[traffic_shaping]`
 
 See [§5](#5-traffic-shaping). Both sides must agree on `encoding_type` and
-`max_download_bytes`.
+`max_download_bytes`. Padding values are per side and may differ.
 
 ---
 
 ## 4. Authentication Model
 
 1. **Tunnel authorisation:** opening a tunnel requires the client's tunnel token, verified against `[auth] secret`. Later upload and download requests are bound to the tunnel by the stream cookie.
-2. **End-to-end encryption (mandatory):** every tunnel is sealed by an ML-KEM-768 handshake and a hybrid X25519 + ML-KEM exchange above transport TLS. `public_key` and `private_key` are required, and requests that are not part of an encrypted session are rejected.
+2. **End-to-end encryption (mandatory):** every tunnel is sealed by an authenticated X25519 handshake above transport TLS. `public_key` and `private_key` are required. Requests outside an encrypted session are rejected.
 3. **Local proxy auth (optional):** `[client.proxy_auth]` gates the local proxy endpoint.
 
 ---
@@ -255,15 +255,17 @@ Two mechanisms obfuscate packet patterns:
 - **Padding** — random bytes appended to each frame before sending.
 - **Jitter** — a log-normal random delay between emitted frames, applied automatically.
 
-Padding is configured by `[traffic_shaping]`, shared verbatim by both sides
-(the client pads, the server strips).
+Padding is configured by `[traffic_shaping]`. Each side pads what it sends and
+trims on receipt, so the two ends may differ. Handshake frames use `handshake`,
+not `global`.
 
 ### 5.1 `[traffic_shaping]` Reference
 
 | Field               | Type    | Required | Default     | Description |
 | ------------------- | ------- | -------- | ----------- | ----------- |
 | `global`            | table   | yes      | —           | Default padding (§5.2). |
-| `stages`            | array   | no       | `[]`        | Per-packet overrides (§5.3). |
+| `handshake`         | table   | no       | `[0, 0]`    | Handshake padding (§5.3). |
+| `stages`            | array   | no       | `[]`        | Per-packet overrides (§5.4). |
 | `encoding_type`     | string  | no       | `"binary"`  | `"binary"` or `"json"`. JSON wraps frames as `{"data":"<base122>"}` lines (~14% larger, looks like ordinary JSON). |
 | `max_download_bytes` | integer | no       | — (stream)  | Download rotation threshold. Unset streams continuously with lower overhead. |
 
@@ -274,7 +276,21 @@ Padding is configured by `[traffic_shaping]`, shared verbatim by both sides
 | `padding_threshold` | usize  | yes      | Pad frames whose data length is below this value. |
 | `padding_range`     | [usize; 2] | yes | Random padding length, uniform in this inclusive range. |
 
-### 5.3 `stages` — Per-packet Overrides
+### 5.3 `handshake` — Handshake Padding
+
+Every handshake frame is padded, whatever its size. The section defaults to
+`[0, 0]`, which adds nothing.
+
+| Field           | Type       | Required | Description |
+| --------------- | ---------- | -------- | ----------- |
+| `padding_range` | [usize; 2] | yes      | Random padding length per handshake frame, uniform in this inclusive range. |
+
+```toml
+[traffic_shaping.handshake]
+padding_range = [0, 400]
+```
+
+### 5.4 `stages` — Per-packet Overrides
 
 Each stage overrides the global padding for a contiguous, 1-indexed range of
 packets.
@@ -288,18 +304,22 @@ packets.
 
 Constraints:
 
-- `padding_range[0]` must be ≤ `padding_range[1]`, otherwise startup fails.
+- `padding_range[0]` must be ≤ `padding_range[1]` for `global`, `handshake` and
+  every stage, otherwise startup fails.
 - Padding is capped at the frame sealing threshold minus the data length
   (~16 KiB of payload); larger values are truncated silently.
 - Stages are matched in packet order, so a gap must be covered by earlier
   stages or the global defaults.
 
-### 5.4 Example
+### 5.5 Example
 
 ```toml
 [traffic_shaping.global]
 padding_range = [0, 3000]
 padding_threshold = 1500
+
+[traffic_shaping.handshake]
+padding_range = [0, 400]
 
 [[traffic_shaping.stages]]
 count = 1
@@ -318,6 +338,7 @@ padding_threshold = 3000
 ```
 
 - **Default:** frames under 1500 B get 0–3000 B of padding.
+- **Handshake:** every handshake frame gets 0–400 B added.
 - **Packet 1:** exactly 5000 B.
 - **Packet 2:** 1000–5000 B when under 3000 B.
 - **Packets 3–8:** 1500–3000 B when under 3000 B.
