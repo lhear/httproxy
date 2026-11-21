@@ -519,90 +519,37 @@ async fn handle_fresh_handshake(
     .map_err(|_| ServerError::request_timeout("request body read timed out"))?
     .map_err(|e| ServerError::payload_too_large(format!("request body error: {e}")))?;
 
+    let encoding = state.traffic_config.encoding_type;
     let mut buf = BytesMut::from(&body_bytes[..]);
-    let Some((_seq, static_ct)) = shaper::decode_from_buffer(
-        &mut buf,
-        &crypto::PlainFrameCipher,
-        state.traffic_config.encoding_type,
-    )?
+
+    let Some((_seq, payload)) =
+        shaper::decode_from_buffer(&mut buf, &crypto::PlainFrameCipher, encoding)?
     else {
-        return Err(ServerError::bad_request("invalid ML-KEM ciphertext frame"));
+        return Err(ServerError::bad_request("invalid client handshake frame"));
     };
+    let (eph_pk, sealed) = payload
+        .split_at_checked(crypto::KEY_LEN)
+        .ok_or_else(|| ServerError::bad_request("client handshake frame too short"))?;
+    let eph_pk = crypto::public_key_from_slice(eph_pk)
+        .map_err(|e| ServerError::bad_request(e.to_string()))?;
 
-    let static_ss = crypto::mlkem_decapsulate(&state.private_key, &static_ct)
-        .map_err(|e| ServerError::bad_request(format!("invalid ML-KEM ciphertext: {e}")))?;
-    let handshake_key = crypto::derive_handshake_key(&static_ss);
-    let handshake_cipher = AesFrameCipher::new(&handshake_key);
+    let handshake_ss = crypto::diffie_hellman(&state.private_key, &eph_pk)
+        .map_err(|e| ServerError::bad_request(e.to_string()))?;
+    let handshake_key = crypto::derive_handshake_key(&handshake_ss);
 
-    let Some((_seq, client_hello_data)) = shaper::decode_from_buffer(
-        &mut buf,
-        &handshake_cipher,
-        state.traffic_config.encoding_type,
-    )?
-    else {
-        return Err(ServerError::bad_request("invalid ClientHello frame"));
-    };
-
-    if client_hello_data.len() < 2 {
-        return Err(ServerError::bad_request("ClientHello too short"));
-    }
-
-    let token_len = u16::from_be_bytes([client_hello_data[0], client_hello_data[1]]) as usize;
-    let token_end = 2 + token_len;
-    if client_hello_data.len() < token_end {
-        return Err(ServerError::bad_request(
-            "ClientHello truncated (token part)",
-        ));
-    }
-    let token = std::str::from_utf8(&client_hello_data[2..token_end])
-        .map_err(|_| ServerError::unauthorized("invalid token"))?;
+    let token = Zeroizing::new(
+        crypto::decrypt_bytes(&handshake_key, sealed)
+            .map_err(|_| ServerError::bad_request("invalid handshake payload"))?,
+    );
+    let token =
+        std::str::from_utf8(&token).map_err(|_| ServerError::unauthorized("invalid token"))?;
     let user = validate_token_if_needed(token, &state.token_key, &state.token_cache).await?;
     span.record("user", &*user);
 
-    if client_hello_data.len() < token_end + 2 {
-        return Err(ServerError::bad_request(
-            "ClientHello truncated (no KEM part)",
-        ));
-    }
-    let len_kem = u16::from_be_bytes([
-        client_hello_data[token_end],
-        client_hello_data[token_end + 1],
-    ]) as usize;
-    let kem_end = token_end + 2 + len_kem;
-    if client_hello_data.len() < kem_end {
-        return Err(ServerError::bad_request("ClientHello truncated (KEM part)"));
-    }
-    let kem_pk_bytes = &client_hello_data[token_end + 2..kem_end];
-    let kem_pk = crypto::bytes_to_encapsulation_key(kem_pk_bytes)
-        .map_err(|e| ServerError::bad_request(format!("invalid mlkem public key: {e}")))?;
-
-    if client_hello_data.len() < kem_end + 2 {
-        return Err(ServerError::bad_request(
-            "ClientHello truncated (no X25519 part)",
-        ));
-    }
-    let len_x25519 =
-        u16::from_be_bytes([client_hello_data[kem_end], client_hello_data[kem_end + 1]]) as usize;
-    let x25519_end = kem_end + 2 + len_x25519;
-    if client_hello_data.len() < x25519_end {
-        return Err(ServerError::bad_request(
-            "ClientHello truncated (X25519 part)",
-        ));
-    }
-    let eph_pk_b_bytes = &client_hello_data[kem_end + 2..x25519_end];
-    let eph_pk_b: [u8; 32] = eph_pk_b_bytes
-        .try_into()
-        .map_err(|_| ServerError::bad_request("invalid client x25519 pk length"))?;
-    let client_eph_pk_b = x25519_dalek::PublicKey::from(eph_pk_b);
-
-    let (ct, ss_mlkem) = crypto::mlkem_encapsulate(&kem_pk)
-        .map_err(|e| ServerError::internal(format!("ML-KEM encapsulation failed: {e}")))?;
     let (server_eph_sk, server_eph_pk) = crypto::generate_keypair();
-
-    let master = {
-        let ss_x25519 = crypto::diffie_hellman(&server_eph_sk, &client_eph_pk_b);
-        crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
-    };
+    let master_ss = crypto::diffie_hellman(&server_eph_sk, &eph_pk)
+        .map_err(|e| ServerError::bad_request(e.to_string()))?;
+    let master = crypto::derive_initial_master(&master_ss);
 
     let session_id = Uuid::new_v4().to_string();
     let now = httproxy_core::now_secs();
@@ -614,19 +561,17 @@ async fn handle_fresh_handshake(
     info!(session_id = %session_id, "handshake: master key derived");
 
     let sid_bytes = session_id.as_bytes();
-    let mut server_hello = Vec::with_capacity(2 + sid_bytes.len() + ct.as_ref().len() + 32);
+    let mut server_hello = Vec::with_capacity(2 + sid_bytes.len() + crypto::KEY_LEN);
     server_hello.extend_from_slice(&(sid_bytes.len() as u16).to_be_bytes());
     server_hello.extend_from_slice(sid_bytes);
-    server_hello.extend_from_slice(ct.as_ref());
     server_hello.extend_from_slice(server_eph_pk.as_bytes());
 
-    let server_hello_frame = shaper::encode_frame(
+    let server_hello_frame = shaper::encode_frame_padded(
         &server_hello,
         0,
-        &handshake_cipher,
-        state.traffic_config.global.padding_threshold,
-        state.traffic_config.global.padding_range,
-        state.traffic_config.encoding_type,
+        &AesFrameCipher::new(&handshake_key),
+        state.traffic_config.handshake_padding_range(),
+        encoding,
     )
     .map_err(|e| ServerError::internal(format!("encode ServerHello: {e}")))?;
 
@@ -634,14 +579,12 @@ async fn handle_fresh_handshake(
 
     info!(session_id = %session_id, "handshake: ServerHello sent");
 
-    let padding = utils::random_padding();
-    let resp = Response::builder()
+    let cookie_padding = utils::random_padding();
+    Response::builder()
         .header("Cache-Control", "no-store")
-        .header("Set-Cookie", padding)
+        .header("Set-Cookie", cookie_padding)
         .body(Body::from(server_hello_frame))
-        .map_err(|e| ServerError::internal(e.to_string()))?;
-
-    Ok(resp)
+        .map_err(|e| ServerError::internal(e.to_string()))
 }
 
 pub async fn validate_token_if_needed(
@@ -682,17 +625,18 @@ mod tests {
     use axum::http::StatusCode;
 
     async fn test_state() -> Arc<AppState> {
-        test_state_with_public_key().await.0
+        test_state_with_public_key(None).await.0
     }
 
-    async fn test_state_with_public_key() -> (Arc<AppState>, httproxy_core::crypto::EncapsulationKey)
-    {
-        let (private_key, public_key) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+    async fn test_state_with_public_key(
+        handshake_padding: Option<[usize; 2]>,
+    ) -> (Arc<AppState>, crypto::PublicKey) {
+        let (private_key, public_key) = crypto::generate_keypair();
         let mut cfg = httproxy_core::config::ServerTopConfig {
             server: httproxy_core::config::ServerSection {
                 listen: "127.0.0.1:0".to_string(),
                 path: "/secret".to_string(),
-                private_key: httproxy_core::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
+                private_key: crypto::private_key_to_b64(&private_key),
                 max_tunnels: None,
                 max_sessions: None,
             },
@@ -708,6 +652,8 @@ mod tests {
                     padding_threshold: 0,
                     padding_range: [0, 0],
                 },
+                handshake: handshake_padding
+                    .map(|padding_range| httproxy_core::shaper::HandshakePadding { padding_range }),
                 stages: vec![],
                 encoding_type: httproxy_core::shaper::EncodingType::Binary,
                 max_download_bytes: None,
@@ -821,48 +767,51 @@ mod tests {
 
     fn encrypted_client_hello(
         state: &Arc<AppState>,
-        server_pk: &httproxy_core::crypto::EncapsulationKey,
+        server_pk: &crypto::PublicKey,
         token: &str,
     ) -> Body {
-        let (static_ct, static_ss) = httproxy_core::crypto::mlkem_encapsulate(server_pk).unwrap();
-        let handshake_key = httproxy_core::crypto::derive_handshake_key(&static_ss);
-        let cipher = AesFrameCipher::new(&handshake_key);
+        let (eph_sk, eph_pk) = crypto::generate_keypair();
+        let handshake_ss = crypto::diffie_hellman(&eph_sk, server_pk).unwrap();
+        let handshake_key = crypto::derive_handshake_key(&handshake_ss);
+        let sealed = crypto::encrypt_bytes(&handshake_key, token.as_bytes()).unwrap();
 
-        let mut hello = Vec::with_capacity(2 + token.len());
-        hello.extend_from_slice(&(token.len() as u16).to_be_bytes());
-        hello.extend_from_slice(token.as_bytes());
-        let client_hello_frame = shaper::encode_frame(
-            &hello,
-            0,
-            &cipher,
-            state.traffic_config.global.padding_threshold,
-            state.traffic_config.global.padding_range,
-            state.traffic_config.encoding_type,
-        )
-        .unwrap();
-        let static_ct_frame = shaper::encode_frame(
-            static_ct.as_ref(),
-            0,
-            &httproxy_core::crypto::PlainFrameCipher,
-            state.traffic_config.global.padding_threshold,
-            state.traffic_config.global.padding_range,
-            state.traffic_config.encoding_type,
-        )
-        .unwrap();
+        let mut payload = Vec::with_capacity(crypto::KEY_LEN + sealed.len());
+        payload.extend_from_slice(eph_pk.as_bytes());
+        payload.extend_from_slice(&sealed);
 
-        let mut body = static_ct_frame;
-        body.extend_from_slice(&client_hello_frame);
-        Body::from(body)
+        Body::from(
+            shaper::encode_frame_padded(
+                &payload,
+                0,
+                &crypto::PlainFrameCipher,
+                state.traffic_config.handshake_padding_range(),
+                state.traffic_config.encoding_type,
+            )
+            .unwrap(),
+        )
     }
 
     #[tokio::test]
     async fn dispatch_rejects_bad_token_in_client_hello() {
-        let (state, public_key) = test_state_with_public_key().await;
+        let (state, public_key) = test_state_with_public_key(None).await;
         let body = encrypted_client_hello(&state, &public_key, "invalid-token");
         let err = dispatch(State(state), HeaderMap::new(), body)
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn handshake_response_uses_handshake_padding() {
+        let (state, public_key) = test_state_with_public_key(Some([1024, 1024])).await;
+        let body = encrypted_client_hello(&state, &public_key, &valid_token());
+        let response = dispatch(State(state), HeaderMap::new(), body)
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.len() > 1024, "ServerHello was not padded");
     }
 
     #[tokio::test]
@@ -889,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_rejects_expired_token_on_handshake_path() {
-        let (state, public_key) = test_state_with_public_key().await;
+        let (state, public_key) = test_state_with_public_key(None).await;
         let body = encrypted_client_hello(&state, &public_key, &token_with_exp(1));
         let err = dispatch(State(state), HeaderMap::new(), body)
             .await

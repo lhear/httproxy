@@ -7,7 +7,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::info;
 
 use crate::cronet::Client;
-use crate::state::ClientPqFsm;
+use crate::state::ClientFsm;
 use crate::{constants::WRITE_STALL_TIMEOUT, state::SharedState};
 
 pub(crate) async fn open_tunnel(
@@ -26,7 +26,7 @@ pub(crate) async fn open_tunnel(
     }
 
     info!(mode = "proxy", "connecting");
-    let fsm = ClientPqFsm::new(
+    let fsm = ClientFsm::new(
         target_host.to_owned(),
         payload,
         read_half,

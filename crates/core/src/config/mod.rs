@@ -171,6 +171,19 @@ enable = true
         let cfg: ClientTopConfig = toml::from_str(CLIENT_BASE).unwrap();
         assert_eq!(cfg.client.listen, "127.0.0.1:8080");
         assert_eq!(cfg.auth.token, "mytoken");
+        assert_eq!(cfg.traffic_shaping.handshake_padding_range(), [0, 0]);
+    }
+
+    #[test]
+    fn parse_handshake_padding_section() {
+        let toml_str = format!(
+            r#"{CLIENT_BASE}
+[traffic_shaping.handshake]
+padding_range = [64, 256]
+"#
+        );
+        let cfg: ClientTopConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.traffic_shaping.handshake_padding_range(), [64, 256]);
     }
 
     #[test]

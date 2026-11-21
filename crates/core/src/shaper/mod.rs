@@ -74,6 +74,12 @@ pub struct PaddingConfig {
     pub padding_range: [usize; 2],
 }
 
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct HandshakePadding {
+    pub padding_range: [usize; 2],
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StageConfig {
@@ -102,6 +108,8 @@ impl Default for EncodingType {
 pub struct TrafficConfig {
     pub global: PaddingConfig,
     #[serde(default)]
+    pub handshake: Option<HandshakePadding>,
+    #[serde(default)]
     pub stages: Vec<StageConfig>,
     #[serde(default)]
     pub encoding_type: EncodingType,
@@ -110,6 +118,11 @@ pub struct TrafficConfig {
 }
 
 impl TrafficConfig {
+    #[inline]
+    pub fn handshake_padding_range(&self) -> [usize; 2] {
+        self.handshake.map_or([0, 0], |h| h.padding_range)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         use anyhow::anyhow;
         if self.global.padding_range[0] > self.global.padding_range[1] {
@@ -117,6 +130,15 @@ impl TrafficConfig {
                 "traffic_shaping.global.padding_range low ({}) > high ({})",
                 self.global.padding_range[0],
                 self.global.padding_range[1]
+            ));
+        }
+        if let Some(handshake) = &self.handshake
+            && handshake.padding_range[0] > handshake.padding_range[1]
+        {
+            return Err(anyhow!(
+                "traffic_shaping.handshake.padding_range low ({}) > high ({})",
+                handshake.padding_range[0],
+                handshake.padding_range[1]
             ));
         }
         for (i, stage) in self.stages.iter().enumerate() {
@@ -402,6 +424,16 @@ pub fn encode_frame(
         &mut frame,
     )?;
     Ok(frame)
+}
+
+pub fn encode_frame_padded(
+    data: &[u8],
+    seq: u64,
+    cipher: &dyn FrameCipher,
+    padding_range: [usize; 2],
+    encoding: EncodingType,
+) -> std::io::Result<Vec<u8>> {
+    encode_frame(data, seq, cipher, usize::MAX, padding_range, encoding)
 }
 
 #[derive(Debug)]
@@ -972,9 +1004,39 @@ mod tests {
                 padding_threshold: 16384,
                 padding_range: [0, 16],
             },
+            handshake: None,
             stages: vec![],
             max_download_bytes: None,
         }
+    }
+
+    #[test]
+    fn validate_rejects_inverted_handshake_range() {
+        let cfg = TrafficConfig {
+            handshake: Some(HandshakePadding {
+                padding_range: [4096, 1024],
+            }),
+            ..test_config()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn padded_frame_pads_regardless_of_payload_size() {
+        let cipher = test_cipher();
+        let data = [0xABu8; 4096];
+        let frame = encode_frame_padded(&data, 0, &cipher, [16, 16], EncodingType::Binary).unwrap();
+        assert_eq!(
+            frame.len(),
+            2 + NONCE_LEN + HEADER_LEN + data.len() + 16 + TAG_LEN
+        );
+
+        let mut src = BytesMut::from(&frame[..]);
+        let (seq, decoded) = decode_from_buffer(&mut src, &cipher, EncodingType::Binary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, 0);
+        assert_eq!(&decoded[..], &data[..]);
     }
 
     #[test]
@@ -1371,6 +1433,7 @@ mod tests {
                 padding_threshold: 10_000,
                 padding_range: [0, 0],
             },
+            handshake: None,
             stages: vec![
                 StageConfig {
                     count: Some(1),

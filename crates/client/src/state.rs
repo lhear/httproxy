@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 use crate::constants::MASTER_RESUME_WINDOW_SECS;
 use crate::cronet::Client;
 use crate::dns_cache::DnsCache;
-use crate::handshake::{self, PqSessionTicket};
+use crate::handshake::{self, SessionTicket};
 use httproxy_core::bypass::BypassRules;
 use httproxy_core::shaper::{ResolvedShaperConfig, TrafficConfig};
 
@@ -20,7 +20,7 @@ pub struct SharedState {
     pub traffic_config: TrafficConfig,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub bypass: Option<Arc<BypassRules>>,
-    pub server_public_key: Arc<httproxy_core::crypto::EncapsulationKey>,
+    pub server_public_key: Arc<httproxy_core::crypto::PublicKey>,
     pub proxy_auth: Option<ProxyAuth>,
     pub initial_master: Mutex<Option<InitialMasterEntry>>,
     pub handshake_lock: Mutex<()>,
@@ -38,7 +38,7 @@ pub struct ProxyAuth {
 }
 
 pub struct Resuming {
-    pub ticket: PqSessionTicket,
+    pub ticket: SessionTicket,
     pub target_host: String,
     pub payload: Bytes,
     pub read_half: Option<OwnedReadHalf>,
@@ -50,32 +50,32 @@ pub struct Handshaking {
     pub payload: Bytes,
     pub read_half: OwnedReadHalf,
     pub write_half: OwnedWriteHalf,
-    pub server_pk: Arc<httproxy_core::crypto::EncapsulationKey>,
+    pub server_pk: Arc<httproxy_core::crypto::PublicKey>,
 }
 
-pub enum ClientPqFsm {
+pub enum ClientFsm {
     Resuming(Resuming),
     Handshaking(Handshaking),
 }
 
-impl ClientPqFsm {
+impl ClientFsm {
     pub async fn new(
         target_host: String,
         payload: Bytes,
         read_half: OwnedReadHalf,
         write_half: OwnedWriteHalf,
-        server_pk: Arc<httproxy_core::crypto::EncapsulationKey>,
+        server_pk: Arc<httproxy_core::crypto::PublicKey>,
         state: &Arc<SharedState>,
     ) -> Self {
         match load_and_validate_ticket(state).await {
-            Some(ticket) => ClientPqFsm::Resuming(Resuming {
+            Some(ticket) => ClientFsm::Resuming(Resuming {
                 ticket,
                 target_host,
                 payload,
                 read_half: Some(read_half),
                 write_half: Some(write_half),
             }),
-            None => ClientPqFsm::Handshaking(Handshaking {
+            None => ClientFsm::Handshaking(Handshaking {
                 target_host,
                 payload,
                 read_half,
@@ -92,7 +92,7 @@ impl ClientPqFsm {
     ) -> anyhow::Result<()> {
         loop {
             self = match self {
-                ClientPqFsm::Resuming(r) => match Self::try_resume(r, &http_client, &state).await {
+                ClientFsm::Resuming(r) => match Self::try_resume(r, &http_client, &state).await {
                     Ok(()) => return Ok(()),
                     Err((resuming, e))
                         if e.downcast_ref::<handshake::RehandshakeRequired>().is_some() =>
@@ -105,7 +105,7 @@ impl ClientPqFsm {
                         let wh = resuming
                             .write_half
                             .ok_or_else(|| anyhow::anyhow!("write half consumed"))?;
-                        ClientPqFsm::Handshaking(Handshaking {
+                        ClientFsm::Handshaking(Handshaking {
                             target_host: resuming.target_host,
                             payload: resuming.payload,
                             read_half: rh,
@@ -118,24 +118,20 @@ impl ClientPqFsm {
                         return Err(e);
                     }
                 },
-                ClientPqFsm::Handshaking(h) => {
+                ClientFsm::Handshaking(h) => {
                     let ticket = {
                         let _guard = state.handshake_lock.lock().await;
                         if let Some(ticket) = load_and_validate_ticket(&state).await {
                             ticket
                         } else {
-                            handshake::perform_pq_handshake(
-                                &http_client,
-                                state.as_ref(),
-                                &h.server_pk,
-                            )
-                            .await?
+                            handshake::perform_handshake(&http_client, state.as_ref(), &h.server_pk)
+                                .await?
                         }
                     };
 
                     let mut rh = Some(h.read_half);
                     let mut wh = Some(h.write_half);
-                    handshake::try_pq_connect(
+                    handshake::try_connect(
                         &http_client,
                         &state,
                         &ticket,
@@ -159,7 +155,7 @@ impl ClientPqFsm {
     ) -> std::result::Result<(), (Resuming, anyhow::Error)> {
         let mut read_half = resuming.read_half;
         let mut write_half = resuming.write_half;
-        match handshake::try_pq_connect(
+        match handshake::try_connect(
             http_client,
             state,
             &resuming.ticket,
@@ -187,14 +183,14 @@ fn ticket_is_valid(created: u64, now: u64) -> bool {
     now.saturating_sub(created) < MASTER_RESUME_WINDOW_SECS
 }
 
-async fn load_and_validate_ticket(state: &Arc<SharedState>) -> Option<PqSessionTicket> {
+async fn load_and_validate_ticket(state: &Arc<SharedState>) -> Option<SessionTicket> {
     let mut guard = state.initial_master.lock().await;
     let (session_id, master, created) = guard.as_ref()?;
     if !ticket_is_valid(*created, httproxy_core::now_secs()) {
         *guard = None;
         return None;
     }
-    Some(PqSessionTicket {
+    Some(SessionTicket {
         master: Zeroizing::new(**master),
         session_id: session_id.clone(),
     })
@@ -216,12 +212,13 @@ mod tests {
     use httproxy_core::shaper::{EncodingType, PaddingConfig, TrafficConfig};
 
     fn shared_state() -> Arc<SharedState> {
-        let (_, server_pk) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+        let (_, server_pk) = httproxy_core::crypto::generate_keypair();
         let traffic = TrafficConfig {
             global: PaddingConfig {
                 padding_threshold: 0,
                 padding_range: [0, 0],
             },
+            handshake: None,
             stages: vec![],
             encoding_type: EncodingType::Binary,
             max_download_bytes: None,

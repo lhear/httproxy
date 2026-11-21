@@ -65,7 +65,7 @@ pub struct AppState {
     pub client_subnet: Option<IpAddr>,
     pub traffic_config: Arc<TrafficConfig>,
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
-    pub private_key: Arc<httproxy_core::crypto::DecapsulationKey>,
+    pub private_key: Arc<crypto::StaticSecret>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
     pub max_sessions: usize,
     pub stream_registry: Arc<StreamRegistry>,
@@ -107,7 +107,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         None => (None, None),
     };
 
-    let private_key = crypto::b64_to_mlkem_private_key(&config.server.private_key);
+    let private_key = crypto::b64_to_private_key(&config.server.private_key);
     config.server.private_key.zeroize();
     let private_key = private_key.context("invalid server.private_key")?;
 
@@ -207,12 +207,12 @@ mod tests {
 
     #[test]
     fn build_state_with_minimal_config() {
-        let (private_key, public_key) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+        let (private_key, public_key) = crypto::generate_keypair();
         let mut cfg = ServerTopConfig {
             server: ServerSection {
                 listen: "0.0.0.0:0".into(),
                 path: "/t".into(),
-                private_key: httproxy_core::crypto::mlkem_private_key_to_b64(&private_key).unwrap(),
+                private_key: crypto::private_key_to_b64(&private_key),
                 max_tunnels: None,
                 max_sessions: None,
             },
@@ -228,6 +228,7 @@ mod tests {
                     padding_threshold: 100,
                     padding_range: [0, 50],
                 },
+                handshake: None,
                 stages: vec![],
                 encoding_type: Default::default(),
                 max_download_bytes: None,
@@ -236,9 +237,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let state = rt.block_on(build_state(&mut cfg)).unwrap();
         assert!(state.dns_client.is_none());
-        let (ct, shared) = httproxy_core::crypto::mlkem_encapsulate(&public_key).unwrap();
-        let decapsulated =
-            httproxy_core::crypto::mlkem_decapsulate(&state.private_key, ct.as_ref()).unwrap();
-        assert_eq!(*shared, *decapsulated);
+        let (client_sk, client_pk) = crypto::generate_keypair();
+        assert_eq!(
+            *crypto::diffie_hellman(&client_sk, &public_key).unwrap(),
+            *crypto::diffie_hellman(&state.private_key, &client_pk).unwrap()
+        );
     }
 }

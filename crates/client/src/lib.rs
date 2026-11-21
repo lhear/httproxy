@@ -114,8 +114,8 @@ pub fn build_state(cfg: &ClientTopConfig) -> Result<Arc<state::SharedState>> {
         }
     };
 
-    let server_public_key = crypto::b64_to_mlkem_public_key(&cfg.client.public_key)
-        .context("invalid client.public_key")?;
+    let server_public_key =
+        crypto::b64_to_public_key(&cfg.client.public_key).context("invalid client.public_key")?;
 
     let remote: url::Url = cfg.client.remote.parse().context("invalid server URL")?;
     let remote_str = remote.as_str().to_owned();
@@ -156,8 +156,8 @@ mod tests {
     use super::*;
 
     fn minimal_client_cfg() -> httproxy_core::config::ClientTopConfig {
-        let (_, public_key) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
-        let public_key = httproxy_core::crypto::mlkem_public_key_to_b64(&public_key).unwrap();
+        let (_, public_key) = crypto::generate_keypair();
+        let public_key = crypto::public_key_to_b64(&public_key);
         toml::from_str(&format!(
             r#"
 [client]

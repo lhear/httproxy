@@ -28,6 +28,7 @@ pub fn traffic(binary: bool, max_download_bytes: Option<u64>) -> TrafficConfig {
             padding_threshold: 0,
             padding_range: [0, 0],
         },
+        handshake: None,
         stages: vec![],
         encoding_type: if binary {
             EncodingType::Binary
@@ -58,10 +59,10 @@ pub struct TestKeys {
 }
 
 pub fn test_keys() -> TestKeys {
-    let (sk, pk) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+    let (sk, pk) = httproxy_core::crypto::generate_keypair();
     TestKeys {
-        private_key: httproxy_core::crypto::mlkem_private_key_to_b64(&sk).unwrap(),
-        public_key: httproxy_core::crypto::mlkem_public_key_to_b64(&pk).unwrap(),
+        private_key: httproxy_core::crypto::private_key_to_b64(&sk),
+        public_key: httproxy_core::crypto::public_key_to_b64(&pk),
     }
 }
 

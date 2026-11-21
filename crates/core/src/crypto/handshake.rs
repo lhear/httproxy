@@ -21,18 +21,15 @@ pub fn expand_key(salt: Option<&[u8]>, ikm: &[u8], info: &[&[u8]], out: &mut [u8
         .expect("valid HKDF output length");
 }
 
-pub fn derive_handshake_key(shared: &[u8]) -> Zeroizing<[u8; 32]> {
+pub fn derive_handshake_key(shared: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let mut key = Zeroizing::new([0u8; 32]);
-    expand_key(None, shared, &[b"mlkem_handshake_key"], &mut *key);
+    expand_key(None, shared, &[b"handshake_key"], &mut *key);
     key
 }
 
-pub fn derive_initial_master(mlkem_ss: &[u8], x25519_ss: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-    let mut ikm = Zeroizing::new(Vec::with_capacity(mlkem_ss.len() + x25519_ss.len()));
-    ikm.extend_from_slice(mlkem_ss);
-    ikm.extend_from_slice(x25519_ss);
+pub fn derive_initial_master(shared: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let mut master = Zeroizing::new([0u8; 32]);
-    expand_key(Some(b"initial_master_salt"), &ikm, &[], &mut *master);
+    expand_key(Some(b"initial_master_salt"), shared, &[], &mut *master);
     master
 }
 
@@ -68,11 +65,22 @@ mod tests {
     fn derive_handshake_key_matches_known_vector() {
         let shared = [0xAAu8; 32];
         let expected = [
-            0x83, 0xA2, 0x42, 0xB0, 0xA3, 0x80, 0x09, 0x71, 0x5C, 0x8F, 0x1D, 0x63, 0xF5, 0x2A,
-            0xBF, 0xAB, 0x2B, 0x8B, 0x45, 0xA0, 0x4C, 0xDB, 0x75, 0x6A, 0x09, 0x73, 0x82, 0x2A,
-            0xCB, 0xD9, 0x3F, 0xC1,
+            0x30, 0x51, 0x37, 0x74, 0x88, 0x65, 0xEF, 0x5B, 0xEE, 0x02, 0x2C, 0x64, 0x53, 0x92,
+            0xCE, 0xC0, 0x13, 0x81, 0xB3, 0x3D, 0x2A, 0x55, 0x6E, 0x10, 0x88, 0x24, 0xC5, 0xEB,
+            0x0A, 0x97, 0x1C, 0x5A,
         ];
         assert_eq!(*derive_handshake_key(&shared), expected);
+    }
+
+    #[test]
+    fn derive_initial_master_matches_known_vector() {
+        let shared = [0xAAu8; 32];
+        let expected = [
+            0x29, 0xB4, 0x6D, 0x35, 0x53, 0x11, 0x73, 0x10, 0x48, 0x78, 0xE2, 0xEB, 0x78, 0x9D,
+            0x8A, 0x5D, 0x25, 0xF5, 0x53, 0x2C, 0x7D, 0x3A, 0x0D, 0x05, 0x02, 0x9D, 0x6C, 0xBD,
+            0x14, 0x40, 0x85, 0x5D,
+        ];
+        assert_eq!(*derive_initial_master(&shared), expected);
     }
 
     #[test]

@@ -84,8 +84,9 @@ async fn handshake_survives_max_padding() {
     let keys = test_keys();
     let upstream = spawn_upstream().await;
     let mut traffic = traffic(false, None);
-    traffic.global.padding_threshold = 20_000;
-    traffic.global.padding_range = [14_000, 14_000];
+    traffic.handshake = Some(httproxy_core::shaper::HandshakePadding {
+        padding_range: [14_000, 14_000],
+    });
     let server = spawn_server(server_config(traffic.clone(), &keys, None)).await;
     let client = spawn_client(client_config(traffic, &keys, None, vec![]), server).await;
 

@@ -244,12 +244,13 @@ mod tests {
     use tokio::sync::Mutex;
 
     fn test_state(remote: &str, max_in_flight: usize) -> Arc<SharedState> {
-        let (_, server_pk) = httproxy_core::crypto::generate_mlkem_keypair().unwrap();
+        let (_, server_pk) = httproxy_core::crypto::generate_keypair();
         let traffic = TrafficConfig {
             global: PaddingConfig {
                 padding_threshold: 0,
                 padding_range: [0, 0],
             },
+            handshake: None,
             stages: vec![],
             encoding_type: EncodingType::Binary,
             max_download_bytes: None,

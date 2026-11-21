@@ -17,7 +17,7 @@ use httproxy_core::shaper::{self, MAX_RAW_PAYLOAD, ShaperStream};
 use super::state::SharedState;
 use crate::constants::{DECODE_BUF_CAPACITY, DOWNLOAD_CONNECT_TIMEOUT};
 
-pub struct PqSessionTicket {
+pub struct SessionTicket {
     pub master: Zeroizing<[u8; 32]>,
     pub session_id: String,
 }
@@ -33,10 +33,10 @@ impl std::fmt::Display for RehandshakeRequired {
 
 impl std::error::Error for RehandshakeRequired {}
 
-pub async fn try_pq_connect(
+pub async fn try_connect(
     http_client: &Arc<Client>,
     state: &Arc<SharedState>,
-    ticket: &PqSessionTicket,
+    ticket: &SessionTicket,
     target_host: &str,
     initial_payload: Bytes,
     read_half: &mut Option<tokio::net::tcp::OwnedReadHalf>,
@@ -141,54 +141,31 @@ pub async fn try_pq_connect(
     utils::race_upload_download(upload_task, download_actor.run(), Some("download failed")).await
 }
 
-pub async fn perform_pq_handshake(
+pub async fn perform_handshake(
     http_client: &Client,
     state: &SharedState,
-    server_pk: &crypto::EncapsulationKey,
-) -> Result<PqSessionTicket> {
-    info!("PQ handshake initiated");
+    server_pk: &crypto::PublicKey,
+) -> Result<SessionTicket> {
+    info!("handshake initiated");
 
-    let (static_ct, static_ss) = crypto::mlkem_encapsulate(server_pk)?;
-    let handshake_key = crypto::derive_handshake_key(&static_ss);
-    let handshake_cipher = AesFrameCipher::new(&handshake_key);
+    let (eph_sk, eph_pk) = crypto::generate_keypair();
+    let handshake_ss = crypto::diffie_hellman(&eph_sk, server_pk)?;
+    let handshake_key = crypto::derive_handshake_key(&handshake_ss);
 
-    let (kem_sk, kem_pk) = crypto::generate_mlkem_keypair()?;
-    let kem_pk_bytes = crypto::mlkem_public_key_bytes(&kem_pk)?;
+    let sealed = crypto::encrypt_bytes(&handshake_key, state.auth_token.as_bytes())?;
+    let mut payload = Vec::with_capacity(crypto::KEY_LEN + sealed.len());
+    payload.extend_from_slice(eph_pk.as_bytes());
+    payload.extend_from_slice(&sealed);
 
-    let (eph_sk_b, eph_pk_b) = crypto::generate_keypair();
-    let eph_pk_b_bytes = eph_pk_b.to_bytes().to_vec();
+    let encoding = state.traffic_config.encoding_type;
 
-    let token = state.auth_token.as_bytes();
-    let token_len = u16::try_from(token.len()).context("auth token too long")?;
-    let mut client_hello =
-        Vec::with_capacity(2 + token.len() + 2 + kem_pk_bytes.len() + 2 + eph_pk_b_bytes.len());
-    client_hello.extend_from_slice(&token_len.to_be_bytes());
-    client_hello.extend_from_slice(token);
-    client_hello.extend_from_slice(&(kem_pk_bytes.len() as u16).to_be_bytes());
-    client_hello.extend_from_slice(&kem_pk_bytes);
-    client_hello.extend_from_slice(&(eph_pk_b_bytes.len() as u16).to_be_bytes());
-    client_hello.extend_from_slice(&eph_pk_b_bytes);
-    let client_hello_frame = shaper::encode_frame(
-        &client_hello,
-        0,
-        &handshake_cipher,
-        state.traffic_config.global.padding_threshold,
-        state.traffic_config.global.padding_range,
-        state.traffic_config.encoding_type,
-    )?;
-
-    let static_ct_frame = shaper::encode_frame(
-        static_ct.as_ref(),
+    let body = shaper::encode_frame_padded(
+        &payload,
         0,
         &crypto::PlainFrameCipher,
-        state.traffic_config.global.padding_threshold,
-        state.traffic_config.global.padding_range,
-        state.traffic_config.encoding_type,
+        state.traffic_config.handshake_padding_range(),
+        encoding,
     )?;
-
-    let mut handshake_body = Vec::with_capacity(static_ct_frame.len() + client_hello_frame.len());
-    handshake_body.extend_from_slice(&static_ct_frame);
-    handshake_body.extend_from_slice(&client_hello_frame);
 
     info!("ClientHello ready, sending to server");
 
@@ -196,7 +173,7 @@ pub async fn perform_pq_handshake(
         DOWNLOAD_CONNECT_TIMEOUT,
         http_client
             .post(state.remote_str.as_str())
-            .body(Bytes::from(handshake_body))
+            .body(Bytes::from(body))
             .send(),
     )
     .await
@@ -205,17 +182,16 @@ pub async fn perform_pq_handshake(
 
     let response = utils::check_response_status(response, "server rejected handshake")?;
 
+    let handshake_cipher = AesFrameCipher::new(&handshake_key);
     let mut body_buf = BytesMut::with_capacity(DECODE_BUF_CAPACITY);
     let mut stream = response.into_body();
-    let server_hello_data = loop {
+    let server_hello = loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
                 body_buf.extend_from_slice(&chunk);
-                if let Some((_, data)) = shaper::decode_from_buffer(
-                    &mut body_buf,
-                    &handshake_cipher,
-                    state.traffic_config.encoding_type,
-                )? {
+                if let Some((_, data)) =
+                    shaper::decode_from_buffer(&mut body_buf, &handshake_cipher, encoding)?
+                {
                     break data;
                 }
             }
@@ -224,32 +200,22 @@ pub async fn perform_pq_handshake(
         }
     };
 
-    if server_hello_data.len() < 2 {
-        return Err(anyhow!("ServerHello too short"));
-    }
-
-    info!("ServerHello received, deriving master key");
-
-    let sid_len = u16::from_be_bytes([server_hello_data[0], server_hello_data[1]]) as usize;
-    let ct_start = 2 + sid_len;
-    let ct_end = ct_start + 1088;
-    if server_hello_data.len() < ct_end + 32 {
-        return Err(anyhow!("ServerHello truncated"));
-    }
-    let session_id = std::str::from_utf8(&server_hello_data[2..2 + sid_len])
+    let (sid_len, rest) = server_hello
+        .split_at_checked(2)
+        .ok_or_else(|| anyhow!("ServerHello too short"))?;
+    let sid_len = u16::from_be_bytes([sid_len[0], sid_len[1]]) as usize;
+    let (session_id, server_eph_pk) = rest
+        .split_at_checked(sid_len)
+        .ok_or_else(|| anyhow!("ServerHello truncated"))?;
+    let session_id = std::str::from_utf8(session_id)
         .context("invalid session_id")?
         .to_owned();
-    let ct_bytes = &server_hello_data[ct_start..ct_end];
-    let server_eph_pk_bytes: [u8; 32] = server_hello_data[ct_end..ct_end + 32].try_into().unwrap();
-    let server_eph_pk = x25519_dalek::PublicKey::from(server_eph_pk_bytes);
+    let server_eph_pk = crypto::public_key_from_slice(server_eph_pk)?;
 
-    let master = {
-        let ss_mlkem = crypto::mlkem_decapsulate(&kem_sk, ct_bytes)?;
-        let ss_x25519 = crypto::diffie_hellman(&eph_sk_b, &server_eph_pk);
-        crypto::derive_initial_master(&ss_mlkem, &ss_x25519)
-    };
+    info!(session_id = %session_id, "ServerHello received, deriving master key");
 
-    info!(session_id = %session_id, "handshake complete, master key derived");
+    let master_ss = crypto::diffie_hellman(&eph_sk, &server_eph_pk)?;
+    let master = crypto::derive_initial_master(&master_ss);
 
     {
         let mut lock = state.initial_master.lock().await;
@@ -260,5 +226,5 @@ pub async fn perform_pq_handshake(
         ));
     }
 
-    Ok(PqSessionTicket { master, session_id })
+    Ok(SessionTicket { master, session_id })
 }
