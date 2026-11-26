@@ -18,7 +18,7 @@ use crate::constants::{
 };
 use crate::stream_registry::StreamRegistry;
 use crate::upstream::{UpstreamRead, UpstreamWrite};
-use httproxy_core::now_secs;
+use httproxy_core::monotonic_secs;
 use httproxy_core::shaper::{FrameCipher, ResolvedShaperConfig, TrafficShaper};
 
 pub enum TunnelCmd {
@@ -131,7 +131,7 @@ impl Stream for Segment {
         match shaper.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok((_seq, data)))) => {
                 this.sent += data.len() as u64;
-                this.activity.store(now_secs(), Ordering::Relaxed);
+                this.activity.store(monotonic_secs(), Ordering::Relaxed);
                 if this.max_bytes.is_some_and(|m| this.sent >= m) {
                     this.pause_on_drop = true;
                     this.ended = true;
@@ -296,7 +296,7 @@ impl TunnelActor {
                     self.serve_pending_continue(alive);
                 }
                 cmd = self.rx.recv() => {
-                    self.last_activity.store(now_secs(), Ordering::Relaxed);
+                    self.last_activity.store(monotonic_secs(), Ordering::Relaxed);
                     match cmd {
                         Some(cmd) => self.dispatch_cmd(cmd),
                         None => break,
@@ -307,7 +307,7 @@ impl TunnelActor {
                     break;
                 }
                 _ = &mut idle_sleep => {
-                    let idle_secs = now_secs()
+                    let idle_secs = monotonic_secs()
                         .saturating_sub(self.last_activity.load(Ordering::Relaxed));
                     if idle_secs >= STREAM_IDLE_TIMEOUT_SECS {
                         warn!(
@@ -436,7 +436,7 @@ mod tests {
 
     use super::*;
     use futures::StreamExt;
-    use httproxy_core::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+    use httproxy_core::shaper::EncodingType;
     use httproxy_core::test_support::{connected_pair, test_cipher_dyn as test_cipher};
     use tokio::io::AsyncWriteExt;
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -449,16 +449,9 @@ mod tests {
     }
 
     fn resolved_config() -> Arc<ResolvedShaperConfig> {
-        let cfg = TrafficConfig {
-            global: PaddingConfig {
-                padding_threshold: 0,
-                padding_range: [0, 0],
-            },
-            handshake: None,
-            stages: vec![],
-            encoding_type: EncodingType::Binary,
-            max_download_bytes: None,
-        };
+        use httproxy_core::test_support::plain_traffic;
+
+        let cfg = plain_traffic(EncodingType::Binary);
         Arc::new(ResolvedShaperConfig::resolve(&cfg))
     }
 
@@ -468,7 +461,7 @@ mod tests {
             Uuid::new_v4(),
             Arc::new(StreamRegistry::new()),
             Some(max_download_bytes),
-            Arc::new(AtomicU64::new(httproxy_core::now_secs())),
+            Arc::new(AtomicU64::new(httproxy_core::monotonic_secs())),
         )
     }
 
@@ -573,7 +566,7 @@ mod tests {
             Uuid::new_v4(),
             Arc::new(StreamRegistry::new()),
             None,
-            Arc::new(AtomicU64::new(httproxy_core::now_secs())),
+            Arc::new(AtomicU64::new(httproxy_core::monotonic_secs())),
         );
         actor.on_upstream_connected(
             read_half.into(),
@@ -731,7 +724,7 @@ mod timeout_tests {
     use super::*;
     use crate::constants::ROTATION_STALENESS;
     use futures::StreamExt;
-    use httproxy_core::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+    use httproxy_core::shaper::EncodingType;
     use httproxy_core::test_support::connected_pair;
     use tokio::io::AsyncWriteExt;
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -747,22 +740,13 @@ mod timeout_tests {
     async fn rotation_staleness_timeout_closes_tunnel() {
         let (read_half, client_write, mut upstream_write) = tcp_pair().await;
         let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCmd>(16);
-        let cfg = TrafficConfig {
-            global: PaddingConfig {
-                padding_threshold: 0,
-                padding_range: [0, 0],
-            },
-            handshake: None,
-            stages: vec![],
-            encoding_type: EncodingType::Binary,
-            max_download_bytes: None,
-        };
+        let cfg = httproxy_core::test_support::plain_traffic(EncodingType::Binary);
         let mut actor = TunnelActor::new(
             cmd_rx,
             Uuid::new_v4(),
             Arc::new(StreamRegistry::new()),
             Some(1000),
-            Arc::new(AtomicU64::new(httproxy_core::now_secs())),
+            Arc::new(AtomicU64::new(httproxy_core::monotonic_secs())),
         );
         actor.on_upstream_connected(
             read_half.into(),

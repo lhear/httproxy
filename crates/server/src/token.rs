@@ -75,7 +75,7 @@ pub fn open(key: &LessSafeKey, token: &str) -> Result<Claims, &'static str> {
     }
 
     let sub = std::str::from_utf8(&body[BODY_LEN..]).map_err(|_| "bad subject")?;
-    if exp <= httproxy_core::unix_now_secs() {
+    if exp <= httproxy_core::unix_secs() {
         return Err("expired");
     }
 
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let exp = httproxy_core::unix_now_secs() + 3600;
+        let exp = httproxy_core::unix_secs() + 3600;
         let token = issue(&key(), &claims("alice", exp));
         let parsed = open(&key(), &token).unwrap();
         assert_eq!(parsed.sub, "alice");
@@ -111,10 +111,7 @@ mod tests {
 
     #[test]
     fn subject_is_not_visible_in_the_token() {
-        let token = issue(
-            &key(),
-            &claims("alice", httproxy_core::unix_now_secs() + 60),
-        );
+        let token = issue(&key(), &claims("alice", httproxy_core::unix_secs() + 60));
         let raw = URL_SAFE_NO_PAD.decode(&token).unwrap();
         assert!(!raw.windows(5).any(|w| w == b"alice"));
         assert!(!token.contains("alice"));
@@ -122,23 +119,20 @@ mod tests {
 
     #[test]
     fn wrong_key_rejected() {
-        let token = issue(
-            &key(),
-            &claims("alice", httproxy_core::unix_now_secs() + 60),
-        );
+        let token = issue(&key(), &claims("alice", httproxy_core::unix_secs() + 60));
         let other = key_from_secret(b"other-secret");
         assert_eq!(open(&other, &token).unwrap_err(), "bad tag");
     }
 
     #[test]
     fn expired_rejected() {
-        let token = issue(&key(), &claims("alice", httproxy_core::unix_now_secs()));
+        let token = issue(&key(), &claims("alice", httproxy_core::unix_secs()));
         assert_eq!(open(&key(), &token).unwrap_err(), "expired");
     }
 
     #[test]
     fn tampered_rejected() {
-        let exp = httproxy_core::unix_now_secs() + 3600;
+        let exp = httproxy_core::unix_secs() + 3600;
         for byte in [NONCE_LEN, NONCE_LEN + 1, NONCE_LEN + BODY_LEN] {
             let token = issue(&key(), &claims("alice", exp));
             let mut raw = URL_SAFE_NO_PAD.decode(&token).unwrap();

@@ -332,44 +332,20 @@ async fn read_early_data(read_half: &mut OwnedReadHalf, buf: &mut BytesMut) {
 mod tests {
     use super::*;
     use httproxy_core::bypass::{BypassRules, BypassRulesBuilder};
-    use httproxy_core::shaper::{EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig};
     use httproxy_core::test_support::connected_pair as tcp_pair;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
-    use tokio::sync::Mutex;
 
     fn test_state(
         proxy_auth: Option<crate::state::ProxyAuth>,
         bypass: Option<Arc<BypassRules>>,
     ) -> Arc<SharedState> {
-        let traffic = TrafficConfig {
-            global: PaddingConfig {
-                padding_threshold: 0,
-                padding_range: [0, 0],
-            },
-            handshake: None,
-            stages: vec![],
-            encoding_type: EncodingType::Binary,
-            max_download_bytes: None,
-        };
-        Arc::new(SharedState {
-            remote_str: "http://127.0.0.1:1/".to_string(),
-            auth_token: "test".to_string(),
-            traffic_config: traffic.clone(),
-            resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
-            bypass,
-            server_public_key: Arc::new(httproxy_core::crypto::generate_keypair().1),
-            proxy_auth,
-            initial_master: Mutex::new(None),
-            handshake_lock: Mutex::new(()),
-            max_download_bytes: None,
-            max_connections: 8,
-            max_in_flight_bytes: 1024 * 1024,
-            upload_concurrency: 4,
-            dns_cache: Default::default(),
-        })
+        let mut state = SharedState::for_test("http://127.0.0.1:1/");
+        state.proxy_auth = proxy_auth;
+        state.bypass = bypass;
+        Arc::new(state)
     }
 
     fn bypass_loopback() -> Arc<BypassRules> {

@@ -142,7 +142,7 @@ impl DnsClient {
         let key = (domain.to_string(), rtype.to_int(), ecs);
 
         if let Some(entry) = self.cache.get(&key).await {
-            let elapsed = crate::now_secs().saturating_sub(entry.created_at);
+            let elapsed = crate::monotonic_secs().saturating_sub(entry.created_at);
 
             if elapsed < entry.ttl.as_secs() {
                 debug!("cache hit: {} {:?}, ips: {:?}", domain, rtype, entry.ips);
@@ -155,15 +155,10 @@ impl DnsClient {
                     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
                 {
-                    let (sc, kc, dc, flag) = (
-                        self.clone(),
-                        key.clone(),
-                        domain.to_string(),
-                        entry.is_refreshing.clone(),
-                    );
+                    let (sc, kc, flag) = (self.clone(), key.clone(), entry.is_refreshing.clone());
                     tokio::spawn(async move {
-                        debug!("background refresh triggered: {} {:?}", dc, rtype);
-                        let _ = sc.lookup_uncached(dc, rtype, ecs, kc).await;
+                        debug!("background refresh triggered: {} {:?}", kc.0, rtype);
+                        let _ = sc.lookup_uncached(kc, rtype, ecs).await;
                         flag.store(false, Ordering::Release);
                     });
                 }
@@ -172,7 +167,7 @@ impl DnsClient {
             }
         }
 
-        self.lookup_uncached(domain.to_owned(), rtype, ecs, key)
+        self.lookup_uncached(key, rtype, ecs)
             .await
             .map(|(ips, _)| ips)
             .map_err(|e| anyhow!("DNS resolution error: {}", e))
@@ -180,10 +175,9 @@ impl DnsClient {
 
     async fn lookup_uncached(
         self: &Arc<Self>,
-        domain: String,
+        key: CacheKey,
         rtype: Rtype,
         ecs: Option<IpAddr>,
-        key: CacheKey,
     ) -> SharedDnsResult {
         let existing = self
             .in_flight
@@ -221,6 +215,7 @@ impl DnsClient {
             let client = Arc::clone(self);
             let cleanup = Arc::downgrade(self);
             let cleanup_key = key.clone();
+            let domain = key.0.clone();
             tokio::spawn(async move {
                 let _cleanup = InFlightGuard {
                     client: cleanup,
@@ -250,7 +245,7 @@ impl DnsClient {
             .map_err(Arc::new)?;
         let entry = CacheEntry {
             ips: ips.clone(),
-            created_at: crate::now_secs(),
+            created_at: crate::monotonic_secs(),
             ttl,
             is_refreshing: Arc::new(false.into()),
         };

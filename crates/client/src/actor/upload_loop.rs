@@ -232,45 +232,17 @@ async fn send_upload_post(
 mod tests {
     use super::*;
     use bytes::BytesMut;
-    use httproxy_core::shaper::{
-        DecodedFrame, EncodingType, PaddingConfig, ResolvedShaperConfig, TrafficConfig,
-        decode_frame,
-    };
+    use httproxy_core::shaper::{DecodedFrame, EncodingType, decode_frame};
     use httproxy_core::test_support::{connected_pair, test_cipher_arc as test_cipher};
     use std::net::SocketAddr;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::Mutex;
 
     fn test_state(remote: &str, max_in_flight: usize) -> Arc<SharedState> {
-        let (_, server_pk) = httproxy_core::crypto::generate_keypair();
-        let traffic = TrafficConfig {
-            global: PaddingConfig {
-                padding_threshold: 0,
-                padding_range: [0, 0],
-            },
-            handshake: None,
-            stages: vec![],
-            encoding_type: EncodingType::Binary,
-            max_download_bytes: None,
-        };
-        Arc::new(SharedState {
-            remote_str: remote.to_string(),
-            auth_token: "test-token".to_string(),
-            traffic_config: traffic.clone(),
-            resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
-            bypass: None,
-            server_public_key: Arc::new(server_pk),
-            proxy_auth: None,
-            initial_master: Mutex::new(None),
-            handshake_lock: Mutex::new(()),
-            max_download_bytes: None,
-            max_connections: 8,
-            max_in_flight_bytes: max_in_flight,
-            upload_concurrency: 4,
-            dns_cache: Default::default(),
-        })
+        let mut state = SharedState::for_test(remote);
+        state.max_in_flight_bytes = max_in_flight;
+        Arc::new(state)
     }
 
     async fn spawn_collector() -> (

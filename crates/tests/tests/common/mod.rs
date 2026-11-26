@@ -4,7 +4,7 @@ use httproxy_core::config::{
     AuthSection, BypassConfig, ClientAuthSection, ClientSection, ClientTopConfig, ServerSection,
     ServerTopConfig,
 };
-use httproxy_core::shaper::{EncodingType, PaddingConfig, TrafficConfig};
+use httproxy_core::shaper::{EncodingType, TrafficConfig};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -23,20 +23,14 @@ pub fn init_logging() {
 }
 
 pub fn traffic(binary: bool, max_download_bytes: Option<u64>) -> TrafficConfig {
-    TrafficConfig {
-        global: PaddingConfig {
-            padding_threshold: 0,
-            padding_range: [0, 0],
-        },
-        handshake: None,
-        stages: vec![],
-        encoding_type: if binary {
-            EncodingType::Binary
-        } else {
-            EncodingType::Json
-        },
-        max_download_bytes,
-    }
+    let encoding = if binary {
+        EncodingType::Binary
+    } else {
+        EncodingType::Json
+    };
+    let mut config = httproxy_core::test_support::plain_traffic(encoding);
+    config.max_download_bytes = max_download_bytes;
+    config
 }
 
 pub fn make_token(user: &str, exp: u64) -> String {

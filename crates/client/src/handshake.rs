@@ -222,7 +222,7 @@ pub async fn perform_handshake(
         *lock = Some((
             session_id.clone(),
             Zeroizing::new(*master),
-            httproxy_core::now_secs(),
+            httproxy_core::monotonic_secs(),
         ));
     }
 

@@ -1,10 +1,23 @@
 use crate::crypto::AesFrameCipher;
-use crate::shaper::FrameCipher;
+use crate::shaper::{EncodingType, FrameCipher, PaddingConfig, TrafficConfig};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;
 
 pub const TEST_KEY_SEED: u8 = 7;
+
+pub fn plain_traffic(encoding: EncodingType) -> TrafficConfig {
+    TrafficConfig {
+        global: PaddingConfig {
+            padding_threshold: 0,
+            padding_range: [0, 0],
+        },
+        handshake: None,
+        stages: vec![],
+        encoding_type: encoding,
+        max_download_bytes: None,
+    }
+}
 
 pub fn test_cipher() -> AesFrameCipher {
     cipher_with_key(TEST_KEY_SEED)

@@ -188,19 +188,9 @@ mod tests {
     #[test]
     fn encode_initial_payload_json_chunks_roundtrip() {
         use bytes::BytesMut;
-        use httproxy_core::shaper::{
-            DecodedFrame, EncodingType, PaddingConfig, TrafficConfig, decode_frame,
-        };
-        let cfg = TrafficConfig {
-            global: PaddingConfig {
-                padding_threshold: 0,
-                padding_range: [0, 0],
-            },
-            handshake: None,
-            stages: vec![],
-            encoding_type: EncodingType::Json,
-            max_download_bytes: None,
-        };
+        use httproxy_core::shaper::{DecodedFrame, EncodingType, decode_frame};
+        use httproxy_core::test_support::plain_traffic;
+        let cfg = plain_traffic(EncodingType::Json);
         let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
         let cipher = test_cipher();
         let (body, remaining, seq) =

@@ -21,6 +21,7 @@ use crate::error::ServerError;
 use crate::janitor;
 use crate::stream::FrameDecoder;
 use crate::stream_registry::StreamQueryResult;
+use crate::upstream::{Upstream, UpstreamWrite};
 use crate::{SessionHandle, utils};
 use httproxy_core::crypto::{self, AesFrameCipher, StreamCipher, TlsInspector};
 use httproxy_core::shaper::{self, FrameCipher};
@@ -97,7 +98,6 @@ impl TunnelGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn setup_tunnel_response(
     state: &Arc<AppState>,
     body: Body,
@@ -116,65 +116,18 @@ async fn setup_tunnel_response(
     let encoding = state.traffic_config.encoding_type;
 
     let max_download_bytes = state.traffic_config.max_download_bytes;
-    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(httproxy_core::now_secs()));
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(
+        httproxy_core::monotonic_secs(),
+    ));
 
     let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
 
-    let upstream = match state
-        .dns_client
-        .as_ref()
-        .filter(|dns| port == 53 && dns.hijack_enabled())
-    {
-        Some(dns) => {
-            let (client, server) = tokio::io::duplex(64 * 1024);
-            let dns = Arc::clone(dns);
-            tokio::spawn(async move { serve_dns_tcp(server, dns).await });
-            crate::upstream::Upstream::Dns(client)
-        }
-        None => tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            connect_upstream(
-                state.warp.as_ref(),
-                state.dns_client.as_ref(),
-                state.client_subnet,
-                state.socks5_proxy.as_ref(),
-                host,
-                port,
-            ),
-        )
-        .await
-        .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
-        .map_err(|e| ServerError::bad_gateway(e.to_string()))?,
-    };
+    let upstream = open_upstream(state, host, port).await?;
 
     let (upstream_read, upstream_write) = upstream.into_split();
 
-    let (upload_tx, upload_rx) =
-        tokio::sync::mpsc::channel::<UploadCmd>(UPLOAD_CMD_CHANNEL_CAPACITY);
-    let upload_actor = crate::actor::upload::UploadActor::new(upload_rx, upstream_write, 0);
-    let upload_handle =
-        tokio::spawn(async move { upload_actor.run().await }.instrument(tracing::Span::current()));
-
-    let byte_stream = body.into_data_stream().map(|r| r.map_err(io::Error::other));
-    let mut decoder = FrameDecoder::new(
-        byte_stream,
-        upload_cipher.clone(),
-        encoding,
-        MAX_FRAME_BUF_SIZE,
-    );
-
-    let body_deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
-    while let Some(result) = tokio::time::timeout_at(body_deadline, decoder.next())
-        .await
-        .map_err(|_| ServerError::request_timeout("request body read timed out"))?
-    {
-        let (seq, data) =
-            result.map_err(|e| ServerError::bad_request(format!("decode error: {e}")))?;
-        upload_tx
-            .send(UploadCmd::Frame { seq, data })
-            .await
-            .map_err(|_| ServerError::bad_gateway("upload actor closed during initial stream"))?;
-    }
+    let (upload_tx, upload_handle) = spawn_upload_actor(upstream_write);
+    pump_initial_body(body, &upload_tx, upload_cipher.clone(), encoding).await?;
 
     let upload_tx_for_actor = upload_tx.clone();
 
@@ -235,6 +188,76 @@ async fn setup_tunnel_response(
 
     tunnel_guard.disarm();
     Ok(response)
+}
+
+async fn open_upstream(
+    state: &Arc<AppState>,
+    host: &str,
+    port: u16,
+) -> Result<Upstream, ServerError> {
+    if let Some(dns) = state
+        .dns_client
+        .as_ref()
+        .filter(|dns| port == 53 && dns.hijack_enabled())
+    {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let dns = Arc::clone(dns);
+        tokio::spawn(async move { serve_dns_tcp(server, dns).await });
+        return Ok(Upstream::Dns(client));
+    }
+
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_upstream(
+            state.warp.as_ref(),
+            state.dns_client.as_ref(),
+            state.client_subnet,
+            state.socks5_proxy.as_ref(),
+            host,
+            port,
+        ),
+    )
+    .await
+    .map_err(|_| ServerError::gateway_timeout("connect timeout"))?
+    .map_err(|e| ServerError::bad_gateway(e.to_string()))
+}
+
+fn spawn_upload_actor(
+    upstream_write: UpstreamWrite,
+) -> (
+    tokio::sync::mpsc::Sender<UploadCmd>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (upload_tx, upload_rx) =
+        tokio::sync::mpsc::channel::<UploadCmd>(UPLOAD_CMD_CHANNEL_CAPACITY);
+    let actor = crate::actor::upload::UploadActor::new(upload_rx, upstream_write, 0);
+    let handle =
+        tokio::spawn(async move { actor.run().await }.instrument(tracing::Span::current()));
+    (upload_tx, handle)
+}
+
+async fn pump_initial_body(
+    body: Body,
+    upload_tx: &tokio::sync::mpsc::Sender<UploadCmd>,
+    cipher: Arc<dyn FrameCipher>,
+    encoding: httproxy_core::shaper::EncodingType,
+) -> Result<(), ServerError> {
+    let byte_stream = body.into_data_stream().map(|r| r.map_err(io::Error::other));
+    let mut decoder = FrameDecoder::new(byte_stream, cipher, encoding, MAX_FRAME_BUF_SIZE);
+
+    let deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
+    while let Some(result) = tokio::time::timeout_at(deadline, decoder.next())
+        .await
+        .map_err(|_| ServerError::request_timeout("request body read timed out"))?
+    {
+        let (seq, data) =
+            result.map_err(|e| ServerError::bad_request(format!("decode error: {e}")))?;
+        upload_tx
+            .send(UploadCmd::Frame { seq, data })
+            .await
+            .map_err(|_| ServerError::bad_gateway("upload actor closed during initial stream"))?;
+    }
+    Ok(())
 }
 
 async fn serve_dns_tcp(
@@ -298,7 +321,7 @@ async fn spawn_encrypted_tunnel(
     master.copy_from_slice(&**master_z);
     let username = Arc::clone(username);
     let created = *created;
-    if httproxy_core::now_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
+    if httproxy_core::monotonic_secs().saturating_sub(created) > MASTER_EXPIRY.as_secs() {
         drop(entry);
         state.master_store.remove(session_id);
         return Err(ServerError::precondition_required("master key expired"));
@@ -319,7 +342,7 @@ async fn spawn_encrypted_tunnel(
 
     if !state
         .stream_registry
-        .register(stream_id, httproxy_core::now_secs())
+        .register(stream_id, httproxy_core::monotonic_secs())
     {
         warn!(stream_id = %stream_id, session_id = %session_id, "duplicate stream registration attempt");
         return Err(ServerError::precondition_required("stream already active"));
@@ -552,7 +575,7 @@ async fn handle_fresh_handshake(
     let master = crypto::derive_initial_master(&master_ss);
 
     let session_id = Uuid::new_v4().to_string();
-    let now = httproxy_core::now_secs();
+    let now = httproxy_core::monotonic_secs();
     janitor::ensure_session_capacity(&state.master_store, now, state.max_sessions);
     state
         .master_store
@@ -607,7 +630,7 @@ pub async fn validate_token_if_needed(
     })?;
 
     let user: Arc<str> = Arc::from(claims.sub);
-    let now = httproxy_core::unix_now_secs();
+    let now = httproxy_core::unix_secs();
     if claims.exp > now.saturating_add(TOKEN_CACHE_TTL.as_secs()) {
         cache
             .insert(token.to_owned().into_boxed_str(), Arc::clone(&user))
@@ -697,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn token_close_to_expiry_is_not_cached() {
         let state = test_state().await;
-        let token = token_with_exp(httproxy_core::unix_now_secs() + 5);
+        let token = token_with_exp(httproxy_core::unix_secs() + 5);
         assert!(
             validate_token_if_needed(&token, &state.token_key, &state.token_cache)
                 .await

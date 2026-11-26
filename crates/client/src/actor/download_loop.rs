@@ -18,7 +18,7 @@ use crate::constants::{
 };
 use crate::cronet::{Client, Response};
 use crate::utils;
-use httproxy_core::shaper::{self, DecodedFrame, EncodingType, FrameCipher};
+use httproxy_core::shaper::{self, EncodingType, FrameCipher};
 
 enum Phase {
     Streaming {
@@ -87,13 +87,7 @@ impl DecodeBuffers {
                 shaper::append_frame_chunk(input, &mut chunk, encoding);
                 continue;
             };
-            let (seq, data) = match frame {
-                DecodedFrame::Owned { seq, data } => (seq, data),
-                DecodedFrame::InJsonScratch { seq, start, end } => {
-                    let plain = shaper::pooled_frame_bytes(std::mem::take(json_scratch));
-                    (seq, plain.slice(start..end))
-                }
-            };
+            let (seq, data) = shaper::take_payload(frame, json_scratch);
             if seq != *expected_seq {
                 return Err(anyhow!(
                     "download frame seq {seq} out of order, expected {expected_seq}"

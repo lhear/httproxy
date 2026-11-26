@@ -3,7 +3,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::SessionHandle;
-use crate::constants::{JANITOR_INTERVAL, MASTER_CLEANUP_INTERVAL, MASTER_EXPIRY, now_secs};
+use crate::constants::{JANITOR_INTERVAL, MASTER_CLEANUP_INTERVAL, MASTER_EXPIRY, monotonic_secs};
 use crate::stream_registry::StreamRegistry;
 
 pub async fn master_and_stream_janitor(
@@ -16,7 +16,7 @@ pub async fn master_and_stream_janitor(
     loop {
         interval.tick().await;
 
-        let now = now_secs();
+        let now = monotonic_secs();
         let pruned = prune_expired_masters(&master_store, now);
         if pruned > 0 {
             tracing::debug!(pruned, "pruned expired master sessions");

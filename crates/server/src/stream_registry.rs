@@ -28,11 +28,11 @@ impl StreamRegistry {
         }
     }
 
-    pub fn register(&self, stream_id: Uuid, now_secs: u64) -> bool {
+    pub fn register(&self, stream_id: Uuid, monotonic_secs: u64) -> bool {
         match self.streams.entry(stream_id) {
             dashmap::Entry::Occupied(_) => false,
             dashmap::Entry::Vacant(entry) => {
-                entry.insert((AtomicU8::new(StreamState::Active as u8), now_secs));
+                entry.insert((AtomicU8::new(StreamState::Active as u8), monotonic_secs));
                 true
             }
         }

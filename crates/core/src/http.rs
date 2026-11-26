@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
+use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,12 +52,13 @@ async fn send(
         .with_context(|| format!("tls handshake with {host} failed"))?;
 
     let mut head = String::with_capacity(256);
-    head.push_str(&format!("{method} {path} HTTP/1.1\r\n"));
-    head.push_str(&format!("Host: {host}\r\n"));
-    head.push_str("Connection: close\r\n");
-    head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    let _ = write!(
+        head,
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
     for (name, value) in headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        let _ = write!(head, "{name}: {value}\r\n");
     }
     head.push_str("\r\n");
 
@@ -111,12 +113,10 @@ fn client_config() -> Arc<ClientConfig> {
 }
 
 fn parse(raw: &[u8]) -> Result<Response> {
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
+    let split = memchr::memmem::find(raw, b"\r\n\r\n")
         .ok_or_else(|| anyhow!("response holds no header terminator"))?;
     let head = &raw[..split + 2];
-    let mut body = raw[split + 4..].to_vec();
+    let body = &raw[split + 4..];
 
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut headers);
@@ -131,9 +131,11 @@ fn parse(raw: &[u8]) -> Result<Response> {
                 .to_ascii_lowercase()
                 .contains("chunked")
     });
-    if chunked {
-        body = decode_chunked(&body)?;
-    }
+    let body = if chunked {
+        decode_chunked(body)?
+    } else {
+        body.to_vec()
+    };
 
     Ok(Response { status, body })
 }
@@ -142,7 +144,8 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(body.len());
     let mut rest = body;
     loop {
-        let line_end = find(rest, b"\r\n").ok_or_else(|| anyhow!("truncated chunk size"))?;
+        let line_end =
+            memchr::memmem::find(rest, b"\r\n").ok_or_else(|| anyhow!("truncated chunk size"))?;
         let line = std::str::from_utf8(&rest[..line_end]).context("invalid chunk size")?;
         let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
             .context("invalid chunk size")?;
@@ -156,10 +159,4 @@ fn decode_chunked(body: &[u8]) -> Result<Vec<u8>> {
         out.extend_from_slice(&rest[..size]);
         rest = &rest[size + 2..];
     }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }

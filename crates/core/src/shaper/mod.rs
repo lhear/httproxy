@@ -541,6 +541,16 @@ pub fn decode_frame(
     }
 }
 
+pub fn take_payload(frame: DecodedFrame, json_scratch: &mut Vec<u8>) -> (u64, Bytes) {
+    match frame {
+        DecodedFrame::Owned { seq, data } => (seq, data),
+        DecodedFrame::InJsonScratch { seq, start, end } => {
+            let plain = pooled_frame_bytes(std::mem::take(json_scratch));
+            (seq, plain.slice(start..end))
+        }
+    }
+}
+
 pub fn decode_from_buffer(
     src: &mut BytesMut,
     cipher: &dyn FrameCipher,
@@ -548,11 +558,7 @@ pub fn decode_from_buffer(
 ) -> Result<Option<(u64, Bytes)>, Error> {
     let mut json_scratch = Vec::new();
     match decode_frame(src, &mut json_scratch, cipher, encoding)? {
-        Some(DecodedFrame::InJsonScratch { seq, start, end }) => {
-            let plain = pooled_frame_bytes(std::mem::take(&mut json_scratch));
-            Ok(Some((seq, plain.slice(start..end))))
-        }
-        Some(DecodedFrame::Owned { seq, data }) => Ok(Some((seq, data))),
+        Some(frame) => Ok(Some(take_payload(frame, &mut json_scratch))),
         None => Ok(None),
     }
 }

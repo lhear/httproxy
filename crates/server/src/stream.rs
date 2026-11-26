@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use httproxy_core::shaper::{self, DecodedFrame, EncodingType, FrameCipher};
+use httproxy_core::shaper::{self, EncodingType, FrameCipher};
 
 pin_project! {
     pub struct FrameDecoder<S> {
@@ -65,14 +65,7 @@ where
                     if this.buf.is_empty() {
                         *this.buf = BytesMut::new();
                     }
-                    let (seq, data) = match frame {
-                        DecodedFrame::InJsonScratch { seq, start, end } => {
-                            let plain =
-                                shaper::pooled_frame_bytes(std::mem::take(this.json_scratch));
-                            (seq, plain.slice(start..end))
-                        }
-                        DecodedFrame::Owned { seq, data } => (seq, data),
-                    };
+                    let (seq, data) = shaper::take_payload(frame, this.json_scratch);
                     return Poll::Ready(Some(Ok((seq, data))));
                 }
                 Ok(None) => {}

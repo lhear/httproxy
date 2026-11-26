@@ -28,7 +28,7 @@ pub const PREFETCH_ROTATE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DECODE_BUF_CAPACITY: usize = 16 * 1024 + 2396;
 
 pub const WRITE_BUF_CAPACITY: usize = 64 * 1024;
-pub const MAX_WRITE_IOV: usize = 64;
+pub use httproxy_core::MAX_WRITE_IOV;
 pub const WRITE_FLUSH_TIMEOUT: Duration = Duration::from_millis(2);
 
 pub const MASTER_RESUME_WINDOW_SECS: u64 = 1170;

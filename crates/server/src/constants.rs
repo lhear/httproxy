@@ -20,7 +20,7 @@ pub const MASTER_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-pub const MAX_WRITE_IOV: usize = 64;
+pub use httproxy_core::MAX_WRITE_IOV;
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const SEGMENT_DONE_CHANNEL_CAPACITY: usize = 2;
@@ -37,4 +37,4 @@ pub const TOKEN_CACHE_CAPACITY: u64 = 2048;
 
 pub const PADDING_POOL: &[u8] = b"padding=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 
-pub use httproxy_core::now_secs;
+pub use httproxy_core::monotonic_secs;

@@ -37,6 +37,33 @@ pub struct ProxyAuth {
     pub password: String,
 }
 
+#[cfg(test)]
+impl SharedState {
+    pub(crate) fn for_test(remote: &str) -> Self {
+        use httproxy_core::shaper::EncodingType;
+        use httproxy_core::test_support::plain_traffic;
+
+        let traffic = plain_traffic(EncodingType::Binary);
+
+        Self {
+            remote_str: remote.to_string(),
+            auth_token: "test".to_string(),
+            resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
+            traffic_config: traffic,
+            bypass: None,
+            server_public_key: Arc::new(httproxy_core::crypto::generate_keypair().1),
+            proxy_auth: None,
+            initial_master: Mutex::new(None),
+            handshake_lock: Mutex::new(()),
+            max_download_bytes: None,
+            max_connections: 8,
+            max_in_flight_bytes: 1024 * 1024,
+            upload_concurrency: 4,
+            dns_cache: Default::default(),
+        }
+    }
+}
+
 pub struct Resuming {
     pub ticket: SessionTicket,
     pub target_host: String,
@@ -186,7 +213,7 @@ fn ticket_is_valid(created: u64, now: u64) -> bool {
 async fn load_and_validate_ticket(state: &Arc<SharedState>) -> Option<SessionTicket> {
     let mut guard = state.initial_master.lock().await;
     let (session_id, master, created) = guard.as_ref()?;
-    if !ticket_is_valid(*created, httproxy_core::now_secs()) {
+    if !ticket_is_valid(*created, httproxy_core::monotonic_secs()) {
         *guard = None;
         return None;
     }
@@ -209,36 +236,9 @@ pub(super) async fn invalidate_stale_master(state: &Arc<SharedState>, rejected_s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httproxy_core::shaper::{EncodingType, PaddingConfig, TrafficConfig};
 
     fn shared_state() -> Arc<SharedState> {
-        let (_, server_pk) = httproxy_core::crypto::generate_keypair();
-        let traffic = TrafficConfig {
-            global: PaddingConfig {
-                padding_threshold: 0,
-                padding_range: [0, 0],
-            },
-            handshake: None,
-            stages: vec![],
-            encoding_type: EncodingType::Binary,
-            max_download_bytes: None,
-        };
-        Arc::new(SharedState {
-            remote_str: "http://x/".to_string(),
-            auth_token: "x".to_string(),
-            traffic_config: traffic.clone(),
-            resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&traffic)),
-            bypass: None,
-            server_public_key: Arc::new(server_pk),
-            proxy_auth: None,
-            initial_master: Mutex::new(None),
-            handshake_lock: Mutex::new(()),
-            max_download_bytes: None,
-            max_connections: 10,
-            max_in_flight_bytes: 1024 * 1024,
-            upload_concurrency: 4,
-            dns_cache: Default::default(),
-        })
+        Arc::new(SharedState::for_test("http://x/"))
     }
 
     #[tokio::test]
@@ -246,7 +246,7 @@ mod tests {
         let state = shared_state();
         let master = zeroize::Zeroizing::new([7u8; 32]);
         *state.initial_master.lock().await =
-            Some(("sid-1".to_string(), master, httproxy_core::now_secs()));
+            Some(("sid-1".to_string(), master, httproxy_core::monotonic_secs()));
         let ticket = load_and_validate_ticket(&state)
             .await
             .expect("fresh ticket");
@@ -270,7 +270,7 @@ mod tests {
         let state = shared_state();
         let master = zeroize::Zeroizing::new([7u8; 32]);
         *state.initial_master.lock().await =
-            Some(("sid-2".to_string(), master, httproxy_core::now_secs()));
+            Some(("sid-2".to_string(), master, httproxy_core::monotonic_secs()));
         invalidate_stale_master(&state, "sid-2").await;
         assert!(state.initial_master.lock().await.is_none());
     }
