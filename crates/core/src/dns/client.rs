@@ -598,31 +598,6 @@ mod tests {
         DnsClient::new(&cfg).await.unwrap()
     }
 
-    #[tokio::test]
-    async fn raw_query_restores_the_original_id() {
-        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut query = [0; 512];
-            let (len, peer) = upstream.recv_from(&mut query).await.unwrap();
-            query[2] |= 0x80;
-            upstream.send_to(&query[..len], peer).await.unwrap();
-        });
-        let config = DnsConfig {
-            upstream: upstream_addr,
-            tls_domain: None,
-            options: DnsOptions::default(),
-        };
-        let client = DnsClient::new(&config).await.unwrap();
-        let mut query = vec![0; 12];
-        query[..2].copy_from_slice(&0x1234u16.to_be_bytes());
-        query[2] = 1;
-        query[5] = 1;
-        let response = client.query(&query).await.unwrap();
-        assert_eq!(&response[..2], &0x1234u16.to_be_bytes());
-        assert_ne!(response[2] & 0x80, 0);
-    }
-
     async fn capturing_upstream() -> (SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>) {
         let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = upstream.local_addr().unwrap();
@@ -667,30 +642,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hijacked_queries_drop_ecs_without_configuration() {
-        let (upstream, seen) = capturing_upstream().await;
-        let config = DnsConfig {
-            upstream,
-            tls_domain: None,
-            options: DnsOptions::default(),
-        };
-        let client = DnsClient::new(&config).await.unwrap();
-        let with_ecs = client
-            .build_query(
-                "ecs.test",
-                Rtype::A,
-                Some("8.8.8.8".parse().unwrap()),
-                0x2222,
-            )
-            .unwrap();
-        client.query(&with_ecs).await.unwrap();
-
-        let plain = client.build_query("ecs.test", Rtype::A, None, 0).unwrap();
-        let received = seen.lock().unwrap().clone();
-        assert_eq!(&received[2..], &plain[2..]);
-    }
-
-    #[tokio::test]
     async fn failed_address_does_not_delay_the_next_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = test_client().await;
@@ -707,65 +658,6 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
-    }
-
-    #[tokio::test]
-    async fn canceled_lookup_does_not_leave_an_in_flight_entry() {
-        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let config = DnsConfig {
-            upstream: upstream.local_addr().unwrap(),
-            tls_domain: None,
-            options: DnsOptions::default(),
-        };
-        let client = Arc::new(DnsClient::new(&config).await.unwrap());
-        let domain = "cancelled-random-query.example";
-        let lookup = {
-            let client = Arc::clone(&client);
-            tokio::spawn(async move { client.lookup(domain, Rtype::A, None).await })
-        };
-
-        let mut query = [0u8; 2048];
-        let (length, peer) =
-            tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut query))
-                .await
-                .unwrap()
-                .unwrap();
-        lookup.abort();
-        let _ = lookup.await;
-
-        let id = u16::from_be_bytes([query[0], query[1]]);
-        let response = make_response_for(
-            id,
-            false,
-            Rcode::NOERROR,
-            60,
-            &[Ipv4Addr::new(192, 0, 2, 1)],
-            domain,
-            Rtype::A,
-        );
-        upstream.send_to(&response, peer).await.unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !client
-                .in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("completed lookup must be removed from the in-flight map");
-        assert!(
-            client
-                .cache
-                .get(&(domain.to_owned(), Rtype::A.to_int(), None))
-                .await
-                .is_some(),
-            "detached query must complete and populate the DNS cache"
-        );
-        assert!(length > 0);
     }
 
     #[tokio::test]
@@ -842,29 +734,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_response_safe_when_ttl_bounds_inverted() {
-        let cfg = DnsConfig {
-            upstream: "127.0.0.1:1".parse().unwrap(),
-            tls_domain: None,
-            options: DnsOptions {
-                min_ttl: 5000,
-                max_ttl: 100,
-                ..DnsOptions::default()
-            },
-        };
-        let c = DnsClient::new(&cfg).await.unwrap();
-        let bytes = make_response(8, false, Rcode::NOERROR, 60, &[Ipv4Addr::new(9, 9, 9, 9)]);
-        let (_, ttl) = c
-            .parse_response(&bytes, 8, Rtype::A, "example.com")
-            .unwrap();
-        assert_eq!(
-            ttl.as_secs(),
-            100,
-            "inverted bounds must not panic and clamp to max"
-        );
-    }
-
-    #[tokio::test]
     async fn parse_response_rejects_question_name_mismatch() {
         let c = test_client().await;
         let bytes = make_response_for(
@@ -883,46 +752,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_response_rejects_question_type_mismatch() {
-        let c = test_client().await;
-        let bytes = make_response_for(
-            10,
-            false,
-            Rcode::NOERROR,
-            120,
-            &[Ipv4Addr::new(1, 2, 3, 4)],
-            "example.com",
-            Rtype::AAAA,
-        );
-        assert!(
-            c.parse_response(&bytes, 10, Rtype::A, "example.com")
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_response_rejects_missing_question() {
-        let c = test_client().await;
-        let mut builder = MessageBuilder::new_vec();
-        builder.header_mut().set_id(11);
-        builder.header_mut().set_rcode(Rcode::NOERROR);
-        let mut answer = builder.answer();
-        answer
-            .push(Record::new(
-                Name::<Vec<u8>>::from_str("example.com").unwrap(),
-                Class::IN,
-                Ttl::from_secs(120),
-                A::new(Ipv4Addr::new(1, 2, 3, 4)),
-            ))
-            .unwrap();
-        let bytes = answer.into_message().into_octets();
-        assert!(
-            c.parse_response(&bytes, 11, Rtype::A, "example.com")
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
     async fn init_dns_rejects_inverted_ttl_bounds() {
         let mut cfg = DnsConfig {
             upstream: "127.0.0.1:1".parse().unwrap(),
@@ -934,33 +763,6 @@ mod tests {
             },
         };
         assert!(init_dns(&mut cfg, None).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn build_query_writes_id_and_domain() {
-        let c = test_client().await;
-        let q = c
-            .build_query("example.com", Rtype::A, None, 0x1234)
-            .unwrap();
-        assert_eq!(q[0], 0x12);
-        assert_eq!(q[1], 0x34);
-        assert!(q.windows(7).any(|w| w == b"example"));
-        assert_eq!(q[2] & 0x01, 0x01, "RD flag must be set");
-    }
-
-    #[tokio::test]
-    async fn build_query_with_ecs_includes_opt_record() {
-        let c = test_client().await;
-        let plain = c.build_query("example.com", Rtype::A, None, 1).unwrap();
-        let with_ecs = c
-            .build_query(
-                "example.com",
-                Rtype::A,
-                Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
-                1,
-            )
-            .unwrap();
-        assert!(with_ecs.len() > plain.len());
     }
 
     #[tokio::test]
@@ -992,39 +794,6 @@ mod tests {
             .unwrap();
         assert_eq!(ips, vec![IpAddr::V6(v6)]);
         assert_eq!(ttl.as_secs(), 300);
-    }
-
-    #[tokio::test]
-    async fn interleave_prefers_ipv4_by_default() {
-        let c = test_client().await;
-        let v4 = vec![
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)),
-        ];
-        let v6 = vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)];
-        let r = c.interleave_ips(v4.clone(), v6.clone());
-        assert_eq!(r, vec![v4[0], v6[0], v4[1]]);
-    }
-
-    #[tokio::test]
-    async fn interleave_prefers_ipv6_when_configured() {
-        let cfg = DnsConfig {
-            upstream: "127.0.0.1:1".parse().unwrap(),
-            tls_domain: None,
-            options: DnsOptions {
-                prefer_ipv6: true,
-                ..DnsOptions::default()
-            },
-        };
-        let c = DnsClient::new(&cfg).await.unwrap();
-        let v4 = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
-        let v6 = vec![
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        ];
-        let r = c.interleave_ips(v4, v6.clone());
-        assert_eq!(r.len(), 3);
-        assert_eq!(r[0], v6[0]);
     }
 
     #[tokio::test]

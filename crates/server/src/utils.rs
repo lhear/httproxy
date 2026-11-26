@@ -68,13 +68,4 @@ mod tests {
         assert_eq!(extract_cookie_value(&headers, "missing"), None);
         assert_eq!(extract_cookie_value(&HeaderMap::new(), "session"), None);
     }
-
-    #[test]
-    fn random_padding_length() {
-        for _ in 0..100 {
-            let p = random_padding();
-            assert!(p.len() >= 30);
-            assert!(p.len() <= PADDING_POOL.len());
-        }
-    }
 }

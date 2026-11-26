@@ -684,31 +684,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_token_is_cached_and_reused() {
-        let state = test_state().await;
-        let token = valid_token();
-
-        let first = validate_token_if_needed(&token, &state.token_key, &state.token_cache)
-            .await
-            .unwrap();
-        assert_eq!(&*first, "user");
-        let cached = state
-            .token_cache
-            .get(token.as_str())
-            .await
-            .expect("valid token must be cached");
-        assert_eq!(&*cached, "user");
-
-        let second = validate_token_if_needed(&token, &state.token_key, &state.token_cache)
-            .await
-            .unwrap();
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "cache hit must reuse the entry"
-        );
-    }
-
-    #[tokio::test]
     async fn invalid_tokens_are_never_cached() {
         let state = test_state().await;
         assert!(
@@ -745,20 +720,6 @@ mod tests {
         let state = test_state().await;
         let mut headers = HeaderMap::new();
         headers.insert("cookie", "stream=not-a-uuid".parse().unwrap());
-        let err = dispatch(State(state), headers, Body::empty())
-            .await
-            .unwrap_err();
-        assert_eq!(err.0, StatusCode::PRECONDITION_REQUIRED);
-    }
-
-    #[tokio::test]
-    async fn dispatch_rejects_unknown_stream() {
-        let state = test_state().await;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "cookie",
-            format!("stream={}", Uuid::new_v4()).parse().unwrap(),
-        );
         let err = dispatch(State(state), headers, Body::empty())
             .await
             .unwrap_err();

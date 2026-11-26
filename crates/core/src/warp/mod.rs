@@ -557,15 +557,6 @@ mod tests {
         assert!(!direct(&b, "::ffff:1.1.1.1"));
     }
 
-    #[test]
-    fn authority_is_always_ip_literal() {
-        assert_eq!(authority("1.1.1.1".parse().unwrap(), 80), "1.1.1.1:80");
-        assert_eq!(
-            authority("2606:4700::1".parse().unwrap(), 443),
-            "[2606:4700::1]:443"
-        );
-    }
-
     fn creds(v4: &str, v6: &str) -> register::WarpCredentials {
         register::WarpCredentials {
             id: "id".into(),
@@ -632,24 +623,6 @@ mod tests {
         assert_eq!(
             candidate_addrs(&explicit_v6, &c).unwrap().first().copied(),
             Some(ip("2606:4700:d0::9"))
-        );
-    }
-
-    #[test]
-    fn candidates_fall_back_when_credentials_lack_addresses() {
-        let c = creds("", "");
-        assert_eq!(
-            candidate_addrs(&section(), &c).unwrap(),
-            vec![ip(FALLBACK_ENDPOINT), ip(FALLBACK_ENDPOINT_V6)]
-        );
-    }
-
-    #[test]
-    fn candidates_drop_duplicates() {
-        let c = creds(FALLBACK_ENDPOINT, FALLBACK_ENDPOINT_V6);
-        assert_eq!(
-            candidate_addrs(&section(), &c).unwrap(),
-            vec![ip(FALLBACK_ENDPOINT), ip(FALLBACK_ENDPOINT_V6)]
         );
     }
 

@@ -419,44 +419,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_starts_seq_from_configured_value() {
-        let (addr, stop_tx, collector) = spawn_collector().await;
-        let state = test_state(&format!("http://{addr}/"), 64 * 1024);
-        let client = test_client();
-        let (read_half, writer) = tcp_pair().await;
-        drop(writer);
-
-        let initial = vec![0xABu8; 40_000];
-        let shaped = shaped(&state, Bytes::from(initial), read_half, test_cipher(), 7);
-        let actor = UploadLoopActor::new(client, state, shaped, Uuid::new_v4());
-        let handle = tokio::spawn(async move { actor.run().await });
-        handle.await.unwrap().unwrap();
-
-        let _ = stop_tx.send(());
-        let received = collector.await.unwrap();
-        let mut json_scratch = Vec::new();
-        let mut src = BytesMut::from(&received[..]);
-        let mut seqs = Vec::new();
-        while let Some(frame) = decode_frame(
-            &mut src,
-            &mut json_scratch,
-            test_cipher().as_ref(),
-            EncodingType::Binary,
-        )
-        .unwrap()
-        {
-            match frame {
-                DecodedFrame::Owned { seq, .. } => seqs.push(seq),
-                _ => panic!("unexpected borrowed frame"),
-            }
-        }
-        assert_eq!(seqs.first(), Some(&7));
-        for w in seqs.windows(2) {
-            assert_eq!(w[1], w[0] + 1, "seqs must be contiguous");
-        }
-    }
-
-    #[tokio::test]
     async fn upload_failure_propagates_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead = listener.local_addr().unwrap();

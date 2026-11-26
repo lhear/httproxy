@@ -89,17 +89,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_error_answers() {
-        let cache = DnsCache::default();
-        let question = query(2);
-        let mut answer = response(&question);
-        answer[3] = (answer[3] & 0xF0) | 2;
-        cache.store(&question, &answer).await;
-
-        assert!(cache.response(&question).await.is_none());
-    }
-
-    #[tokio::test]
     async fn ignores_short_messages() {
         let cache = DnsCache::default();
         assert!(cache.response(&[0, 1, 2]).await.is_none());

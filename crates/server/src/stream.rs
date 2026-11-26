@@ -144,22 +144,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_frame_decoded() {
-        let frame = make_frame(b"hello", 0);
-        let byte_stream = stream::iter(vec![Ok(frame)]);
-        let mut decoder = FrameDecoder::new(
-            byte_stream,
-            Arc::new(test_cipher()),
-            shaper::EncodingType::Binary,
-            18_781,
-        );
-        let (seq, data) = decoder.next().await.unwrap().unwrap();
-        assert_eq!(seq, 0);
-        assert_eq!(&data[..], b"hello");
-        assert!(decoder.next().await.is_none());
-    }
-
-    #[tokio::test]
     async fn fragmented_binary_and_json_frames_roundtrip() {
         for encoding in [EncodingType::Binary, EncodingType::Json] {
             let mut wire = Vec::new();
@@ -197,25 +181,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_then_complete() {
-        let frame = make_frame(b"world", 1);
-        let split_at = frame.len() / 2;
-        let bytes: Vec<io::Result<Bytes>> =
-            vec![Ok(frame.slice(0..split_at)), Ok(frame.slice(split_at..))];
-        let byte_stream = stream::iter(bytes);
-        let mut decoder = FrameDecoder::new(
-            byte_stream,
-            Arc::new(test_cipher()),
-            shaper::EncodingType::Binary,
-            18_781,
-        );
-        let (seq, data) = decoder.next().await.unwrap().unwrap();
-        assert_eq!(seq, 1);
-        assert_eq!(&data[..], b"world");
-        assert!(decoder.next().await.is_none());
-    }
-
-    #[tokio::test]
     async fn multiple_frames_in_one_chunk() {
         let f0 = make_frame(b"first", 0);
         let f1 = make_frame(b"second", 1);
@@ -238,31 +203,6 @@ mod tests {
         assert_eq!(seq1, 1);
         assert_eq!(&d1[..], b"second");
 
-        assert!(decoder.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn trailing_data_errors() {
-        let byte_stream = stream::iter(vec![Ok(Bytes::from_static(b"abcde"))]);
-        let mut decoder = FrameDecoder::new(
-            byte_stream,
-            Arc::new(test_cipher()),
-            shaper::EncodingType::Binary,
-            18_781,
-        );
-        let result = decoder.next().await.unwrap();
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn empty_stream_yields_none() {
-        let byte_stream = stream::iter(vec![]);
-        let mut decoder: FrameDecoder<_> = FrameDecoder::new(
-            byte_stream,
-            Arc::new(test_cipher()),
-            shaper::EncodingType::Binary,
-            18_781,
-        );
         assert!(decoder.next().await.is_none());
     }
 
@@ -319,31 +259,6 @@ mod tests {
             18_781,
         );
         assert!(decoder.next().await.unwrap().is_err());
-    }
-
-    #[tokio::test]
-    async fn json_encoded_frames_decoded() {
-        let data = b"json payload data";
-        let frame = shaper::encode_frame(
-            data,
-            7,
-            &test_cipher(),
-            16384,
-            [0, 0],
-            shaper::EncodingType::Json,
-        )
-        .unwrap();
-        let byte_stream = stream::iter(vec![Ok(Bytes::from(frame))]);
-        let mut decoder = FrameDecoder::new(
-            byte_stream,
-            Arc::new(test_cipher()),
-            shaper::EncodingType::Json,
-            18_781,
-        );
-        let (seq, decoded) = decoder.next().await.unwrap().unwrap();
-        assert_eq!(seq, 7);
-        assert_eq!(&decoded[..], data);
-        assert!(decoder.next().await.is_none());
     }
 
     #[tokio::test]

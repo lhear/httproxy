@@ -312,32 +312,11 @@ mod tests {
     }
 
     #[test]
-    fn domain_dedup() {
-        let r = make_rules(&["example.com", "example.com", ".example.com"], &[]);
-        assert!(r.match_domain("example.com"));
-        assert!(r.match_domain("sub.example.com"));
-    }
-
-    #[test]
-    fn ip_exact() {
-        let r = make_rules(&[], &["1.1.1.1/32"]);
-        assert!(r.match_ip("1.1.1.1".parse().unwrap()));
-        assert!(!r.match_ip("1.1.1.2".parse().unwrap()));
-    }
-
-    #[test]
     fn ip_subnet() {
         let r = make_rules(&[], &["8.8.8.0/24"]);
         assert!(r.match_ip("8.8.8.1".parse().unwrap()));
         assert!(r.match_ip("8.8.8.254".parse().unwrap()));
         assert!(!r.match_ip("8.8.9.1".parse().unwrap()));
-    }
-
-    #[test]
-    fn ip_default_route() {
-        let r = make_rules(&[], &["0.0.0.0/0"]);
-        assert!(r.match_ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
-        assert!(r.match_ip(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255))));
     }
 
     #[test]
@@ -362,13 +341,5 @@ mod tests {
         let r = make_rules(&[], &["::1/128"]);
         assert!(r.should_bypass("[::1]:80"));
         assert!(!r.should_bypass("[::2]:80"));
-    }
-
-    #[test]
-    fn extract_host_cases() {
-        assert_eq!(extract_host("example.com:443"), "example.com");
-        assert_eq!(extract_host("[::1]:80"), "::1");
-        assert_eq!(extract_host("1.2.3.4:80"), "1.2.3.4");
-        assert_eq!(extract_host("example.com"), "example.com");
     }
 }

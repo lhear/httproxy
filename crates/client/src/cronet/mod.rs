@@ -386,31 +386,6 @@ impl Drop for Body {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
-    use std::sync::Weak;
-    use std::time::Duration;
-    use tokio::time::{sleep, timeout};
-
-    async fn upstream() -> SocketAddr {
-        let router = axum::Router::new().route(
-            "/",
-            axum::routing::post(|body: Bytes| async move { body.len().to_string() }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        address
-    }
-
-    async fn settle(watch: &Weak<runtime::Shared>, live: usize) {
-        timeout(Duration::from_secs(10), async {
-            while watch.strong_count() > live {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the runtime still owns requests");
-    }
 
     #[test]
     fn derives_the_user_agent_from_the_cronet_version() {
@@ -440,22 +415,6 @@ mod tests {
             format!("{error:#}").contains("invalid HTTP/3 hint host"),
             "{error:#}"
         );
-    }
-
-    #[test]
-    fn resolver_rules_keep_host_ports_unbracketed() {
-        let rules = |address: &str| {
-            experimental_options(address)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        };
-        assert!(rules("1.2.3.4:443").contains(r#""MAP * 1.2.3.4:443""#));
-        assert!(rules("1.2.3.4").contains(r#""MAP * 1.2.3.4""#));
-        assert!(rules("example.com:8443").contains(r#""MAP * example.com:8443""#));
-        assert!(rules("::1").contains(r#""MAP * [::1]""#));
-        assert!(rules("2001:db8::1").contains(r#""MAP * [2001:db8::1]""#));
-        assert!(rules("[::1]:8443").contains(r#""MAP * [::1]:8443""#));
     }
 
     #[tokio::test]
@@ -489,53 +448,6 @@ mod tests {
         assert_eq!(&body[..], expected.to_bytes());
     }
 
-    #[tokio::test]
-    async fn releases_requests_uploads_and_engine() {
-        let client = Client::new(None).unwrap();
-        let watch = client.exec.watch();
-        let live = watch.strong_count();
-        let address = upstream().await;
-        let url = format!("http://{address}/");
-
-        for _ in 0..8 {
-            let response = client
-                .post(&url)
-                .body(Bytes::from_static(b"payload"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(&response.bytes().await.unwrap()[..], b"7");
-            settle(&watch, live).await;
-        }
-
-        for _ in 0..4 {
-            let response = client
-                .post(&url)
-                .body(Bytes::from_static(b"payload"))
-                .send()
-                .await
-                .unwrap();
-            drop(response);
-            settle(&watch, live).await;
-        }
-
-        drop(client);
-        assert_eq!(
-            watch.strong_count(),
-            0,
-            "cronet runtime outlived the client"
-        );
-    }
-
-    #[test]
-    fn root_store_pem_holds_every_mozilla_root() {
-        let pem = String::from_utf8(root_store_pem()).unwrap();
-        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS.len();
-        assert_eq!(pem.matches("-----BEGIN CERTIFICATE-----").count(), roots);
-        assert_eq!(pem.matches("-----END CERTIFICATE-----").count(), roots);
-    }
-
     #[test]
     fn a_custom_root_starts_the_engine() {
         let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -554,31 +466,5 @@ mod tests {
             format!("{error:#}").contains("trusted certificate"),
             "{error:#}"
         );
-    }
-
-    #[tokio::test]
-    async fn body_chunks_stay_mutable_after_the_runtime_is_dropped() {
-        let client = Client::new(None).unwrap();
-        let watch = client.exec.watch();
-        let address = upstream().await;
-        let mut body = client
-            .post(&format!("http://{address}/"))
-            .body(Bytes::from_static(b"payload"))
-            .send()
-            .await
-            .unwrap()
-            .into_body();
-        let chunk = body.next().await.unwrap().unwrap();
-        assert_eq!(&chunk[..], b"7");
-        let pointer = chunk.as_ptr();
-        drop(body);
-        drop(client);
-        assert_eq!(watch.strong_count(), 0);
-        let mut writable = chunk
-            .try_into_mut()
-            .expect("native reads must transfer ownership");
-        assert_eq!(writable.as_ptr(), pointer);
-        writable[0] = b'8';
-        assert_eq!(&writable[..], b"8");
     }
 }

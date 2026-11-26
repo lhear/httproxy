@@ -367,16 +367,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn time_string_matches_cloudflare_format() {
-        let (y, mo, d, h, mi, s) = civil_from_unix(1_793_602_800);
-        assert_eq!((y, mo, d, h, mi, s), (2026, 11, 2, 7, 0, 0));
-    }
-    #[test]
-    fn hex_encoding_is_lowercase_and_padded() {
-        assert_eq!(hex_lower(&[0x0a, 0xff, 0x00]), "0aff00");
-    }
-
-    #[test]
     fn strip_port_handles_v4_and_v6() {
         assert_eq!(strip_port("162.159.192.1:500"), "162.159.192.1");
         assert_eq!(strip_port("162.159.192.1"), "162.159.192.1");

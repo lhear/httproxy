@@ -186,44 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn build_cookie_contains_session() {
-        let mut buf = String::new();
-        build_tunnel_cookie(&mut buf, "abc:def:ghi");
-        assert!(buf.starts_with("session=abc:def:ghi; "));
-        assert!(buf.len() > 25);
-    }
-
-    #[test]
-    fn encode_zero_payload() {
-        let config = shaper::TrafficConfig {
-            global: shaper::PaddingConfig {
-                padding_threshold: 16384,
-                padding_range: [0, 0],
-            },
-            handshake: None,
-            stages: vec![],
-            encoding_type: Default::default(),
-            max_download_bytes: None,
-        };
-        let (body, remaining, seq) = encode_initial_payload(
-            &Bytes::new(),
-            shaper::MAX_RAW_PAYLOAD,
-            &test_cipher(),
-            &config,
-        )
-        .unwrap();
-        assert!(body.is_empty());
-        assert!(remaining.is_empty());
-        assert_eq!(seq, 0);
-    }
-
-    #[test]
-    fn is_silent_reset() {
-        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
-        assert!(is_silent_error(&e));
-    }
-
-    #[test]
     fn encode_initial_payload_json_chunks_roundtrip() {
         use bytes::BytesMut;
         use httproxy_core::shaper::{

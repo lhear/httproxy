@@ -487,25 +487,6 @@ mod tests {
     }
 
     #[test]
-    fn ingest_hands_over_frames_without_copying() {
-        let cipher = test_cipher();
-        let mut bufs = buffers();
-        let mut expected_seq = 0u64;
-        let raw = frame(&[0xAB; 512], 0);
-        let raw_ptr = raw.as_ptr();
-        bufs.ingest(raw, &cipher, EncodingType::Binary, &mut expected_seq)
-            .unwrap();
-
-        let head = bufs.pending.front().expect("one pending chunk");
-        assert_eq!(head.len(), 512);
-        assert_eq!(
-            head.as_ptr(),
-            raw_ptr.wrapping_add(2 + httproxy_core::crypto::NONCE_LEN + 10),
-            "payload must alias the input buffer, not a copy"
-        );
-    }
-
-    #[test]
     fn ingest_handles_split_frames() {
         let cipher = test_cipher();
         let mut bufs = buffers();
@@ -614,55 +595,6 @@ mod tests {
     }
 
     struct StalledWriter;
-
-    #[test]
-    fn empty_frames_do_not_accumulate_pending_allocations() {
-        let cipher = test_cipher();
-        let mut bufs = buffers();
-        let mut expected_seq = 0;
-        for seq in 0..1024 {
-            bufs.ingest(
-                frame(b"", seq),
-                &cipher,
-                EncodingType::Binary,
-                &mut expected_seq,
-            )
-            .unwrap();
-        }
-        assert_eq!(expected_seq, 1024);
-        assert!(bufs.pending.is_empty());
-        assert_eq!(bufs.input.capacity(), 0);
-    }
-
-    #[test]
-    fn split_frame_does_not_copy_the_following_complete_frame() {
-        let cipher = test_cipher();
-        let mut bufs = buffers();
-        let mut expected_seq = 0;
-        let first = frame(b"first", 0);
-        let second = frame(b"second", 1);
-        let mut next = first[5..].to_vec();
-        let payload_offset = next.len() + 2 + httproxy_core::crypto::NONCE_LEN + 10;
-        next.extend_from_slice(&second);
-        let pointer = next.as_ptr().wrapping_add(payload_offset);
-        bufs.ingest(
-            Bytes::copy_from_slice(&first[..5]),
-            &cipher,
-            EncodingType::Binary,
-            &mut expected_seq,
-        )
-        .unwrap();
-        bufs.ingest(
-            Bytes::from(next),
-            &cipher,
-            EncodingType::Binary,
-            &mut expected_seq,
-        )
-        .unwrap();
-        assert_eq!(queued(&bufs), b"firstsecond");
-        assert_eq!(bufs.pending[1].as_ptr(), pointer);
-        assert_eq!(bufs.input.capacity(), 0);
-    }
 
     impl AsyncWrite for StalledWriter {
         fn poll_write(

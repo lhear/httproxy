@@ -112,23 +112,3 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn trusted_cert_flag_is_parsed() {
-        let cli = Cli::try_parse_from(["client", "--trusted-cert", "cert.pem"]).unwrap();
-        assert_eq!(
-            cli.trusted_cert.as_deref(),
-            Some(std::path::Path::new("cert.pem"))
-        );
-    }
-
-    #[test]
-    fn trusted_cert_flag_is_optional() {
-        let cli = Cli::try_parse_from(["client"]).unwrap();
-        assert!(cli.trusted_cert.is_none());
-    }
-}

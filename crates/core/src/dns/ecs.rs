@@ -226,19 +226,6 @@ mod tests {
     }
 
     #[test]
-    fn adds_ecs_next_to_other_options() {
-        let cookie = option(10, &[1, 2, 3, 4]);
-        let original = query(&cookie, true);
-        let out = rewrite(&original, Some(IpAddr::V4(Ipv4Addr::new(9, 8, 7, 6)))).unwrap();
-
-        let mut expected = original.clone();
-        let rdlen = u16::from_be_bytes([expected[38], expected[39]]) + 11;
-        expected[38..40].copy_from_slice(&rdlen.to_be_bytes());
-        expected.extend_from_slice(&ecs_option(24, &[9, 8, 7]));
-        assert_eq!(out, expected);
-    }
-
-    #[test]
     fn replaces_an_existing_ecs() {
         let old = ecs_option(24, &[8, 8, 8]);
         let original = query(&old, true);

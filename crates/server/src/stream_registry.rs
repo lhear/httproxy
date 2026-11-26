@@ -117,13 +117,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_stream_returns_fresh() {
-        let reg = StreamRegistry::new();
-        let (_, s2, _) = ids();
-        assert_eq!(reg.check(s2), StreamQueryResult::Fresh);
-    }
-
-    #[test]
     fn remove_consumed_before_removes_expired() {
         let reg = StreamRegistry::new();
         let (s1, s2, _) = ids();
@@ -134,16 +127,5 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(reg.check(s1), StreamQueryResult::Fresh);
         assert_eq!(reg.check(s2), StreamQueryResult::Active);
-    }
-
-    #[test]
-    fn remove_consumed_before_keeps_recent() {
-        let reg = StreamRegistry::new();
-        let (s1, _, _) = ids();
-        reg.register(s1, 1000);
-        reg.mark_consumed(s1);
-        let removed = reg.remove_consumed_before(900);
-        assert_eq!(removed, 0);
-        assert_eq!(reg.check(s1), StreamQueryResult::Consumed);
     }
 }

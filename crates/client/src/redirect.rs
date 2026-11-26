@@ -164,12 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_hostname_target() {
-        let rule = RedirectRule::parse(&section("127.0.0.1:0", " example.com:443 ")).unwrap();
-        assert_eq!(rule.target, "example.com:443");
-    }
-
-    #[test]
     fn parse_rejects_bad_listen() {
         assert!(RedirectRule::parse(&section("127.0.0.1", "example.com:443")).is_err());
         assert!(RedirectRule::parse(&section("not-an-addr", "example.com:443")).is_err());

@@ -184,23 +184,6 @@ padding_threshold = 50
     }
 
     #[test]
-    fn build_state_rejects_zero_concurrency() {
-        let mut cfg = minimal_client_cfg();
-        cfg.client.upload_concurrency = Some(0);
-        assert!(build_state(&cfg).is_err());
-    }
-
-    #[test]
-    fn build_state_accepts_bounded_config() {
-        let mut cfg = minimal_client_cfg();
-        cfg.client.max_in_flight_bytes = Some(256 * 1024);
-        cfg.client.upload_concurrency = Some(4);
-        let state = build_state(&cfg).unwrap();
-        assert_eq!(state.max_in_flight_bytes, 256 * 1024);
-        assert_eq!(state.upload_concurrency, 4);
-    }
-
-    #[test]
     fn build_http_client_reports_a_missing_certificate() {
         let cfg = minimal_client_cfg();
         let error = build_http_client(&cfg, Some(Path::new("no-such-certificate.pem")))

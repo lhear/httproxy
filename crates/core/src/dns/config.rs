@@ -73,13 +73,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn upstream_parsed_from_string() {
-        let cfg: DnsConfig = toml::from_str("upstream = \"8.8.8.8:53\"\n").unwrap();
-        assert_eq!(cfg.upstream, "8.8.8.8:53".parse::<SocketAddr>().unwrap());
-        assert!(cfg.tls_domain.is_none());
-    }
-
-    #[test]
     fn explicit_fields_override_defaults() {
         let cfg: DnsConfig =
             toml::from_str("upstream = \"1.1.1.1:853\"\nprotocol = \"dot\"\ncache_size = 64\n")

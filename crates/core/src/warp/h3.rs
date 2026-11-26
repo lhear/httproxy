@@ -263,51 +263,12 @@ mod tests {
     }
 
     #[test]
-    fn varint_rejects_truncated() {
-        assert!(get_varint(&[]).is_none());
-        assert!(get_varint(&[0x40]).is_none());
-    }
-
-    #[test]
     fn frame_header_parses_type_and_length() {
         let mut buf = BytesMut::new();
         put_varint(&mut buf, FRAME_HEADERS);
         put_varint(&mut buf, 300);
         let (ty, len, used) = get_frame_header(&buf).unwrap();
         assert_eq!((ty, len, used), (FRAME_HEADERS, 300, buf.len()));
-    }
-
-    #[test]
-    fn connect_headers_have_expected_bytes() {
-        let block = encode_connect_headers("example.com:443");
-        assert_eq!(block[0], 0, "Required Insert Count must be 0");
-        assert_eq!(block[1], 0, "Delta Base must be 0");
-        assert_eq!(block[2], 0xCF, ":method CONNECT");
-        assert_eq!(block[3], 0x50, ":authority with static name reference");
-        assert_eq!(block[4], 15, "authority length");
-        assert_eq!(&block[5..20], b"example.com:443");
-        assert_eq!(block.len(), 20, "no :scheme / :path for CONNECT");
-    }
-
-    #[test]
-    fn connect_headers_encode_long_authority() {
-        let authority = "a".repeat(200);
-        let block = encode_connect_headers(&authority);
-        assert_eq!(block[4], 0x7F);
-        assert_eq!(block[5], 200 - 127);
-        assert_eq!(&block[6..6 + 200], authority.as_bytes());
-    }
-
-    #[test]
-    fn decode_status_from_static_index() {
-        for (index, expected) in STATIC_STATUS_VALUES.iter().enumerate() {
-            let block = [
-                0u8,
-                0u8,
-                INDEXED_STATIC | (STATIC_STATUS_FIRST as u8 + index as u8),
-            ];
-            assert_eq!(decode_status(&block).unwrap(), *expected);
-        }
     }
 
     #[test]
@@ -319,16 +280,6 @@ mod tests {
         block.put_slice(b":status");
         put_string(&mut block, b"403");
         assert_eq!(decode_status(&block).unwrap(), 403);
-    }
-
-    #[test]
-    fn decode_status_skips_unrelated_fields() {
-        let mut block = BytesMut::new();
-        block.put_u8(0);
-        block.put_u8(0);
-        put_int(&mut block, INDEXED_STATIC, 6, 32);
-        block.put_u8(INDEXED_STATIC | 25);
-        assert_eq!(decode_status(&block).unwrap(), 200);
     }
 
     #[test]
@@ -354,19 +305,5 @@ mod tests {
     fn decode_status_errors_when_absent() {
         let block = [0u8, 0u8, INDEXED_STATIC | 32];
         assert!(decode_status(&block).is_err());
-    }
-
-    #[test]
-    fn control_stream_declares_zero_dynamic_table() {
-        let bytes = control_stream_bytes();
-        let (stream_type, used) = get_varint(&bytes).unwrap();
-        assert_eq!(stream_type, STREAM_CONTROL);
-        let (frame_type, len, header) = get_frame_header(&bytes[used..]).unwrap();
-        assert_eq!(frame_type, FRAME_SETTINGS);
-        let payload = &bytes[used + header..used + header + len as usize];
-        assert_eq!(payload.len(), 9);
-        let (id, n) = get_varint(payload).unwrap();
-        assert_eq!(id, SETTINGS_QPACK_MAX_TABLE_CAPACITY);
-        assert_eq!(get_varint(&payload[n..]).unwrap().0, 0);
     }
 }

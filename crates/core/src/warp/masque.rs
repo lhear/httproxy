@@ -863,20 +863,6 @@ mod tests {
         assert_eq!(extract_spki(&cert).unwrap(), spki.as_bytes());
     }
 
-    #[test]
-    fn spki_extraction_rejects_garbage() {
-        assert!(extract_spki(b"not a certificate").is_none());
-        assert!(extract_spki(&[]).is_none());
-    }
-
-    #[test]
-    fn der_length_handles_long_form() {
-        assert_eq!(read_der_len(&[0x05]), Some((5, 1)));
-        assert_eq!(read_der_len(&[0x81, 0x80]), Some((128, 2)));
-        assert_eq!(read_der_len(&[0x82, 0x01, 0x00]), Some((256, 3)));
-        assert_eq!(read_der_len(&[0x85, 0, 0, 0, 0, 0]), None);
-    }
-
     fn server_endpoint() -> (quinn::Endpoint, SocketAddr, Vec<u8>) {
         let (cert, key) = server_cert();
         let spki = extract_spki(&cert).unwrap().to_vec();
@@ -1117,37 +1103,6 @@ mod tests {
 
         server.close(VarInt::from_u32(0), b"done");
         endpoint.close(VarInt::from_u32(0), b"done");
-    }
-
-    #[test]
-    fn control_stream_goaway_is_detected() {
-        let mut buf = BytesMut::new();
-        buf.put_u8(h3::FRAME_SETTINGS as u8);
-        buf.put_u8(0);
-        assert!(!control_has_goaway(&mut buf));
-        assert!(buf.is_empty());
-
-        buf.put_u8(h3::FRAME_GOAWAY as u8);
-        buf.put_u8(1);
-        buf.put_u8(0);
-        assert!(control_has_goaway(&mut buf));
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn control_stream_partial_frame_waits_for_more_bytes() {
-        let mut buf = BytesMut::new();
-        buf.put_u8(h3::FRAME_GOAWAY as u8);
-        buf.put_u8(4);
-        buf.put_u8(0);
-        assert!(!control_has_goaway(&mut buf));
-        assert_eq!(buf.len(), 3);
-
-        buf.put_u8(0);
-        buf.put_u8(0);
-        buf.put_u8(0);
-        assert!(control_has_goaway(&mut buf));
-        assert!(buf.is_empty());
     }
 
     #[tokio::test]

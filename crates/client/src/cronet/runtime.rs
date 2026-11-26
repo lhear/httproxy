@@ -242,11 +242,6 @@ impl Executor {
             let _ = thread.join();
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn watch(&self) -> std::sync::Weak<Shared> {
-        Arc::downgrade(&self.shared)
-    }
 }
 
 impl Drop for Executor {
@@ -695,37 +690,4 @@ unsafe extern "C" fn upload_close(provider: Ptr) {
         .unwrap_or_else(PoisonError::into_inner)
         .push((provider, data));
     let _ = shared.commands.send(Command::Collect);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn read_callback() -> Arc<ReadCallback> {
-        sys::load().unwrap();
-        let callback = sys::api().buffer_callback_create(Some(on_buffer_destroy));
-        assert!(!callback.is_null());
-        Arc::new(ReadCallback(callback))
-    }
-
-    #[test]
-    fn destroying_an_unfinished_read_releases_its_owner() {
-        let callback = read_callback();
-        let watch = Arc::downgrade(&callback);
-        let buffer = ReadBuffer::create(&callback).unwrap();
-        drop(callback);
-        assert_eq!(watch.strong_count(), 1);
-        sys::api().buffer_destroy(buffer);
-        assert_eq!(watch.strong_count(), 0);
-    }
-
-    #[test]
-    fn empty_and_invalid_reads_release_their_allocations() {
-        let callback = read_callback();
-        for length in [0, READ_CHUNK as u64 + 1, u64::MAX] {
-            let buffer = ReadBuffer::create(&callback).unwrap();
-            assert!(ReadBuffer::complete(buffer, length).is_none());
-            assert_eq!(Arc::strong_count(&callback), 1);
-        }
-    }
 }

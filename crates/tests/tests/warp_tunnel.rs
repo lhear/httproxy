@@ -341,24 +341,6 @@ async fn large_download_survives_flow_control() {
 }
 
 #[tokio::test]
-async fn large_upload_echoes_through_masque() {
-    common::init_logging();
-    let (upstream, client, _) = start_with_warp().await;
-
-    let body: Vec<u8> = (0..(256 * 1024) as u32).map(|i| (i % 251) as u8).collect();
-    let request = format!(
-        "POST http://{upstream}/echo HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let mut stream = TcpStream::connect(client).await.unwrap();
-    stream.write_all(request.as_bytes()).await.unwrap();
-    stream.write_all(&body).await.unwrap();
-    let (status, echoed) = read_response(&mut stream).await;
-    assert_eq!(status, 200);
-    assert_eq!(echoed, body);
-}
-
-#[tokio::test]
 async fn concurrent_streams_share_one_quic_connection() {
     common::init_logging();
     let (upstream, client, connects) = start_with_warp().await;

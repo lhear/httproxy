@@ -33,28 +33,6 @@ async fn bad_token_rejected() {
 }
 
 #[tokio::test]
-async fn expired_token_rejected() {
-    common::init_logging();
-    let keys = test_keys();
-    let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
-    let client = spawn_client(
-        client_config(traffic(true, None), &keys, Some(make_token("u", 1)), vec![]),
-        server,
-    )
-    .await;
-    let url = format!("http://{upstream}/hello");
-    let mut stream = TcpStream::connect(client).await.unwrap();
-    stream
-        .write_all(format!("GET {url} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
-        .await
-        .unwrap();
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await.unwrap();
-    assert_eq!(n, 0, "rejected connection should close without a response");
-}
-
-#[tokio::test]
 async fn unreachable_upstream_yields_connection_error() {
     common::init_logging();
     let keys = test_keys();

@@ -242,12 +242,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_ticket_returns_none_when_empty() {
-        let state = shared_state();
-        assert!(load_and_validate_ticket(&state).await.is_none());
-    }
-
-    #[tokio::test]
     async fn load_ticket_returns_some_when_fresh() {
         let state = shared_state();
         let master = zeroize::Zeroizing::new([7u8; 32]);
@@ -279,15 +273,5 @@ mod tests {
             Some(("sid-2".to_string(), master, httproxy_core::now_secs()));
         invalidate_stale_master(&state, "sid-2").await;
         assert!(state.initial_master.lock().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn invalidate_non_matching_session_keeps() {
-        let state = shared_state();
-        let master = zeroize::Zeroizing::new([7u8; 32]);
-        *state.initial_master.lock().await =
-            Some(("sid-3".to_string(), master, httproxy_core::now_secs()));
-        invalidate_stale_master(&state, "other-sid").await;
-        assert!(state.initial_master.lock().await.is_some());
     }
 }

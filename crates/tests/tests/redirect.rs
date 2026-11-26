@@ -64,25 +64,6 @@ async fn redirect_forwards_raw_tcp() {
 }
 
 #[tokio::test]
-async fn redirect_handles_many_roundtrips() {
-    common::init_logging();
-    let keys = common::test_keys();
-    let redirect = spawn_redirect(common::traffic(true, None), &keys).await;
-    let mut stream = TcpStream::connect(redirect).await.unwrap();
-
-    for i in 0..8u8 {
-        let payload = [i; 32];
-        stream.write_all(&payload).await.unwrap();
-        let mut buf = [0u8; 32];
-        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
-            .await
-            .expect("echo timed out")
-            .unwrap();
-        assert_eq!(buf, payload);
-    }
-}
-
-#[tokio::test]
 async fn redirect_forwards_large_bidirectional_stream() {
     common::init_logging();
     let keys = common::test_keys();

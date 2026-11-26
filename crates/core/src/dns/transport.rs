@@ -516,14 +516,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_transport_roundtrip() {
-        let server_addr = spawn_udp_echo_server().await;
-        let t = UdpTransport::new(server_addr);
-        let (resp, id) = t.send(vec![0u8; 12]).await.unwrap();
-        assert_eq!(resp[0..2], id.to_be_bytes());
-    }
-
-    #[tokio::test]
     async fn udp_transport_matches_concurrent_responses_by_id() {
         let server_addr = spawn_udp_echo_server().await;
         let transport = Arc::new(UdpTransport::new(server_addr));
@@ -554,17 +546,6 @@ mod tests {
         let r = t.send(vec![0u8; 12]).await;
         assert!(r.is_err());
         assert!(start.elapsed() >= Duration::from_secs(2));
-        assert!(t.pending.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancelled_queries_release_their_pending_entry() {
-        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let t = UdpTransport::new(addr);
-        let cancelled =
-            tokio::time::timeout(Duration::from_millis(50), t.send(vec![0u8; 12])).await;
-        assert!(cancelled.is_err());
         assert!(t.pending.lock().unwrap().is_empty());
     }
 

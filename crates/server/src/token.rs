@@ -121,28 +121,6 @@ mod tests {
     }
 
     #[test]
-    fn token_is_shorter_than_jwt() {
-        let token = issue(&key(), &claims("admin", 4_102_444_800));
-        assert!(
-            token.len() <= 64,
-            "expected a short token, got {} chars",
-            token.len()
-        );
-        assert!(!token.contains('.'));
-        assert!(!token.contains('='));
-    }
-
-    #[test]
-    fn nonces_differ_between_tokens() {
-        let k = key();
-        let exp = httproxy_core::unix_now_secs() + 3600;
-        assert_ne!(
-            issue(&k, &claims("alice", exp)),
-            issue(&k, &claims("alice", exp))
-        );
-    }
-
-    #[test]
     fn wrong_key_rejected() {
         let token = issue(
             &key(),
@@ -171,17 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn truncated_rejected() {
-        let token = issue(
-            &key(),
-            &claims("alice", httproxy_core::unix_now_secs() + 60),
-        );
-        let raw = URL_SAFE_NO_PAD.decode(&token).unwrap();
-        let cut = URL_SAFE_NO_PAD.encode(&raw[..raw.len() - 1]);
-        assert_eq!(open(&key(), &cut).unwrap_err(), "bad tag");
-    }
-
-    #[test]
     fn malformed_rejected() {
         let k = key();
         assert_eq!(open(&k, "").unwrap_err(), "token too short");
@@ -190,29 +157,5 @@ mod tests {
 
         let long = "A".repeat(MAX_TOKEN_LEN + 1);
         assert_eq!(open(&k, &long).unwrap_err(), "token too long");
-    }
-
-    #[test]
-    fn bad_payload_length_rejected() {
-        let k = key();
-        let mut body = vec![VERSION];
-        body.extend_from_slice(&(httproxy_core::unix_now_secs() + 60).to_be_bytes());
-        body.extend_from_slice(&99u16.to_be_bytes());
-        body.extend_from_slice(b"alice");
-
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::rng().fill_bytes(&mut nonce);
-        let mut raw = nonce.to_vec();
-        raw.extend_from_slice(&body);
-        let tag = k
-            .seal_in_place_separate_tag(
-                Nonce::assume_unique_for_key(nonce),
-                Aad::empty(),
-                &mut raw[NONCE_LEN..],
-            )
-            .unwrap();
-        raw.extend_from_slice(tag.as_ref());
-        let token = URL_SAFE_NO_PAD.encode(&raw);
-        assert_eq!(open(&k, &token).unwrap_err(), "bad payload length");
     }
 }

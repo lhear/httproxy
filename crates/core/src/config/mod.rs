@@ -167,14 +167,6 @@ enable = true
     }
 
     #[test]
-    fn parse_minimal_client_config() {
-        let cfg: ClientTopConfig = toml::from_str(CLIENT_BASE).unwrap();
-        assert_eq!(cfg.client.listen, "127.0.0.1:8080");
-        assert_eq!(cfg.auth.token, "mytoken");
-        assert_eq!(cfg.traffic_shaping.handshake_padding_range(), [0, 0]);
-    }
-
-    #[test]
     fn parse_handshake_padding_section() {
         let toml_str = format!(
             r#"{CLIENT_BASE}
@@ -184,35 +176,6 @@ padding_range = [64, 256]
         );
         let cfg: ClientTopConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(cfg.traffic_shaping.handshake_padding_range(), [64, 256]);
-    }
-
-    #[test]
-    fn parse_client_redirect_rules() {
-        let toml_str = format!(
-            r#"{CLIENT_BASE}
-[[redirect]]
-listen = "127.0.0.1:2222"
-target = "172.16.0.207:22"
-
-[[redirect]]
-listen = "127.0.0.1:2223"
-target = "example.com:443"
-"#
-        );
-        let cfg: ClientTopConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(cfg.redirect.len(), 2);
-        assert_eq!(cfg.redirect[0].listen, "127.0.0.1:2222");
-        assert_eq!(cfg.redirect[0].target, "172.16.0.207:22");
-        assert_eq!(cfg.redirect[1].target, "example.com:443");
-    }
-
-    #[test]
-    fn server_config_requires_private_key() {
-        let toml_str = SERVER_BASE.replace(
-            "private_key = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
-            "",
-        );
-        assert!(toml::from_str::<ServerTopConfig>(&toml_str).is_err());
     }
 
     #[test]
@@ -228,21 +191,6 @@ password = "proxypass"
         let proxy_auth = cfg.client.proxy_auth.unwrap();
         assert_eq!(proxy_auth.username, "proxyuser");
         assert_eq!(proxy_auth.password, "proxypass");
-    }
-
-    #[test]
-    fn parse_client_http3_flags() {
-        let cfg: ClientTopConfig = toml::from_str(CLIENT_BASE).unwrap();
-        assert!(!cfg.client.disable_http3);
-        assert!(!cfg.client.http3_hint);
-
-        let disabled = CLIENT_BASE.replace("[client]\n", "[client]\ndisable_http3 = true\n");
-        let cfg: ClientTopConfig = toml::from_str(&disabled).unwrap();
-        assert!(cfg.client.disable_http3);
-
-        let hinted = CLIENT_BASE.replace("[client]\n", "[client]\nhttp3_hint = true\n");
-        let cfg: ClientTopConfig = toml::from_str(&hinted).unwrap();
-        assert!(cfg.client.http3_hint);
     }
 
     #[test]

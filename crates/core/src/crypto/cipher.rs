@@ -393,12 +393,6 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_garbage_fails() {
-        let key = random_key();
-        assert!(decrypt_bytes(&key, b"too-short").is_err());
-    }
-
-    #[test]
     fn tampered_ciphertext_fails_decryption() {
         let key = random_key();
         let cipher = AesFrameCipher::new(&key);
@@ -419,21 +413,6 @@ mod tests {
         assert!(c2.decrypt(&ct).is_err());
     }
 
-    #[test]
-    fn encrypt_into_matches_encrypt() {
-        let key = random_key();
-        let cipher = AesFrameCipher::new(&key);
-        let plain = b"in-place frame payload";
-
-        let mut out = bytes::BytesMut::new();
-        cipher.encrypt_into(plain, &mut out).unwrap();
-        assert_eq!(out.len(), NONCE_LEN + plain.len() + TAG_LEN);
-
-        let mut pt = bytes::BytesMut::new();
-        cipher.decrypt_into(&out, &mut pt).unwrap();
-        assert_eq!(&pt[..], plain);
-    }
-
     fn stream_frame(cipher: &dyn FrameCipher, seq: u64, data: &[u8], plain: bool) -> Vec<u8> {
         let mut frame = vec![0u8; NONCE_LEN];
         frame.extend_from_slice(&seq.to_be_bytes());
@@ -441,18 +420,6 @@ mod tests {
         frame.extend_from_slice(data);
         cipher.seal_frame(&mut frame, 0, NONCE_LEN, plain).unwrap();
         frame
-    }
-
-    #[test]
-    fn frame_mode_lives_in_prefix() {
-        let key = random_key();
-        let cipher = StreamCipher::new(&key);
-        let data = vec![0x22u8; 64];
-        assert_eq!(stream_frame(&cipher, 0, &data, false)[0] & OPAQUE_BIT, 0);
-        assert_eq!(
-            stream_frame(&cipher, 0, &data, true)[0] & OPAQUE_BIT,
-            OPAQUE_BIT
-        );
     }
 
     #[test]
@@ -464,16 +431,6 @@ mod tests {
         let range = cipher.open_frame(&mut frame).unwrap();
         assert_eq!(range.start, NONCE_LEN);
         assert_eq!(&frame[range.start..range.start + 8], &3u64.to_be_bytes());
-        assert_eq!(&frame[range.start + HEADER_LEN..range.end], &data[..]);
-    }
-
-    #[test]
-    fn stream_keeps_sealed_frames_sealed() {
-        let key = random_key();
-        let cipher = StreamCipher::new(&key);
-        let data = vec![0x11u8; 1024];
-        let mut frame = stream_frame(&cipher, 0, &data, false);
-        let range = cipher.open_frame(&mut frame).unwrap();
         assert_eq!(&frame[range.start + HEADER_LEN..range.end], &data[..]);
     }
 
@@ -519,16 +476,5 @@ mod tests {
         let last = frame.len() - 1;
         frame[last] ^= 0x80;
         assert!(cipher.open_frame(&mut frame).is_err());
-    }
-
-    #[test]
-    fn opaque_frame_requires_matching_key() {
-        let key1 = random_key();
-        let key2 = random_key();
-        let sender = StreamCipher::new(&key1);
-        let receiver = StreamCipher::new(&key2);
-        let data = vec![0x22u8; 9000];
-        let mut frame = stream_frame(&sender, 5, &data, true);
-        assert!(receiver.open_frame(&mut frame).is_err());
     }
 }

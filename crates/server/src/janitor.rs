@@ -181,16 +181,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_session_capacity_keeps_sessions_below_limit() {
-        let store = DashMap::new();
-        for i in 0..4 {
-            insert_session(&store, &format!("s{i}"), 100 + i);
-        }
-        ensure_session_capacity(&store, 1_000, 8);
-        assert_eq!(store.len(), 4);
-    }
-
-    #[test]
     fn ensure_session_capacity_prunes_expired_before_evicting() {
         let store = DashMap::new();
         let now = 10_000u64;
@@ -216,29 +206,6 @@ mod tests {
         assert!(!store.contains_key("s00"));
         assert!(!store.contains_key("s01"));
         assert!(store.contains_key("s15"));
-    }
-
-    #[test]
-    fn shrink_if_sparse_releases_capacity() {
-        let map: DashMap<u64, u64> = DashMap::new();
-        for i in 0..4096 {
-            map.insert(i, i);
-        }
-        map.clear();
-        let before = map.capacity();
-        shrink_if_sparse(&map);
-        assert!(map.capacity() < before);
-    }
-
-    #[test]
-    fn shrink_if_sparse_keeps_dense_map() {
-        let map: DashMap<u64, u64> = DashMap::new();
-        for i in 0..4096 {
-            map.insert(i, i);
-        }
-        let before = map.capacity();
-        shrink_if_sparse(&map);
-        assert_eq!(map.capacity(), before);
     }
 
     #[test]

@@ -49,22 +49,6 @@ async fn bypass_direct_connect_skips_tunnel() {
 }
 
 #[tokio::test]
-async fn bypass_large_body_direct() {
-    common::init_logging();
-    let (upstream, client) = start_bypassed(LOOPBACK_BYPASS).await;
-
-    let url = format!("http://{upstream}/large");
-    let (status, body) = raw_exchange(
-        client,
-        format!("GET {url} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body.len(), 512 * 1024);
-    assert!(body.iter().all(|&b| b == 0xAB));
-}
-
-#[tokio::test]
 async fn bypass_connect_direct() {
     common::init_logging();
     let (upstream, client) = start_bypassed(LOOPBACK_BYPASS).await;

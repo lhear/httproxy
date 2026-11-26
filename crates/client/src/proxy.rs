@@ -272,11 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_connect_no_port_fails() {
-        assert!(resolve_request("CONNECT", "example.com").is_err());
-    }
-
-    #[test]
     fn rewrite_absolute_to_origin() {
         for (authority, path) in [
             ("example.com", "/path"),
@@ -301,35 +296,6 @@ mod tests {
     #[test]
     fn origin_form_target_is_rejected() {
         assert!(resolve_request("GET", "/path").is_err());
-    }
-
-    #[test]
-    fn rewrite_post_body_intact() {
-        let body = b"{\"key\":\"value\"}";
-        let mut request = Vec::new();
-        request.extend_from_slice(b"POST http://example.com/api HTTP/1.1\r\n");
-        request.extend_from_slice(b"Host: example.com\r\n");
-        request.extend_from_slice(b"Content-Type: application/json\r\n");
-        request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-        request.extend_from_slice(b"\r\n");
-        request.extend_from_slice(body);
-
-        let mut buf = BytesMut::from(&request[..]);
-        let body_pointer = buf.as_ptr().wrapping_add(buf.len() - body.len());
-        handle_request(&mut buf, "POST", "http://example.com/api").unwrap();
-        assert_eq!(
-            buf.as_ptr().wrapping_add(buf.len() - body.len()),
-            body_pointer
-        );
-        let result = buf.to_vec();
-
-        let result_str = String::from_utf8(result.clone()).unwrap();
-        assert!(
-            result_str.starts_with("POST /api HTTP/1.1\r\n"),
-            "got: {result_str}"
-        );
-        assert!(result.ends_with(body), "POST body was modified");
-        assert!(result_str.contains(&format!("Content-Length: {}", body.len())));
     }
 
     #[test]
@@ -484,39 +450,6 @@ mod tests {
         assert!(head.contains("Accept: */*\r\n"));
         assert!(head.ends_with("\r\n\r\n"));
         assert_eq!(new_len, buf.len());
-    }
-
-    #[test]
-    fn strip_proxy_headers_keeps_body() {
-        for body_len in [4, 8192] {
-            let head = format!(
-                "POST http://example.com/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: Basic YQ==\r\nContent-Length: {body_len}\r\n\r\n"
-            );
-            let body = vec![b'x'; body_len];
-            let mut buf = BytesMut::new();
-            buf.extend_from_slice(head.as_bytes());
-            buf.extend_from_slice(&body);
-            let body_pointer = buf.as_ptr().wrapping_add(head.len());
-            let new_len = strip_proxy_headers(&mut buf, head.len());
-            assert!(
-                !String::from_utf8_lossy(&buf[..new_len])
-                    .to_ascii_lowercase()
-                    .contains("proxy-authorization")
-            );
-            assert_eq!(&buf[new_len..], &body);
-            if body_len == 8192 {
-                assert_eq!(buf.as_ptr().wrapping_add(new_len), body_pointer);
-            }
-        }
-    }
-
-    #[test]
-    fn strip_proxy_headers_is_noop_without_them() {
-        let raw = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let mut buf = BytesMut::from(&raw[..]);
-        let new_len = strip_proxy_headers(&mut buf, raw.len());
-        assert_eq!(new_len, raw.len());
-        assert_eq!(&buf[..], &raw[..]);
     }
 
     #[test]

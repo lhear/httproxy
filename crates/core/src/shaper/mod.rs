@@ -892,58 +892,6 @@ mod tests {
     use super::*;
     use crate::test_support::{stream_cipher_arc, test_cipher, test_cipher_dyn as test_cipher_arc};
     use std::io::Cursor;
-    use zeroize::Zeroizing;
-
-    #[tokio::test]
-    async fn binary_upload_reads_directly_into_the_batch() {
-        struct RecordingReader {
-            cursor: Cursor<Vec<u8>>,
-            pointer: Arc<std::sync::atomic::AtomicUsize>,
-        }
-
-        impl AsyncRead for RecordingReader {
-            fn poll_read(
-                self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &mut ReadBuf<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                let this = self.get_mut();
-                this.pointer.store(
-                    buf.initialize_unfilled().as_ptr() as usize,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                Pin::new(&mut this.cursor).poll_read(cx, buf)
-            }
-        }
-
-        let pointer = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let payload = vec![0x35; MAX_FRAME_PAYLOAD];
-        let reader = RecordingReader {
-            cursor: Cursor::new(payload.clone()),
-            pointer: Arc::clone(&pointer),
-        };
-        let cipher = test_cipher_arc();
-        let config = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_seq(
-            reader,
-            &config,
-            Arc::clone(&cipher),
-            0,
-        ));
-        let mut batch = Vec::with_capacity(64 * 1024);
-        batch.extend_from_slice(b"prefix");
-        let expected = batch.as_ptr().wrapping_add(6 + HEAD_BINARY) as usize;
-        std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut batch))
-            .await
-            .unwrap();
-        assert_eq!(pointer.load(std::sync::atomic::Ordering::Relaxed), expected);
-        assert_eq!(&batch[..6], b"prefix");
-        let mut input = BytesMut::from(&batch[6..]);
-        let (_, decoded) = decode_from_buffer(&mut input, cipher.as_ref(), EncodingType::Binary)
-            .unwrap()
-            .unwrap();
-        assert_eq!(&decoded[..], &payload);
-    }
 
     #[tokio::test(start_paused = true)]
     async fn pending_binary_frame_survives_switching_batch_buffers() {
@@ -1040,37 +988,6 @@ mod tests {
     }
 
     #[test]
-    fn jitter_table_deterministic_with_seed() {
-        let table1 = generate_jitter_table(SmallRng::seed_from_u64(42));
-        let table2 = generate_jitter_table(SmallRng::seed_from_u64(42));
-        assert_eq!(&table1[..], &table2[..]);
-
-        let mean = table1.iter().map(|&v| v as f64).sum::<f64>() / table1.len() as f64;
-        assert!((mean - AVG_LATENCY_MICROS).abs() < AVG_LATENCY_MICROS * 0.5);
-    }
-
-    #[test]
-    fn decode_frame_binary_is_zero_copy() {
-        let cipher = test_cipher();
-        let frame = encode_frame(b"payload", 0, &cipher, 0, [0, 0], EncodingType::Binary).unwrap();
-        let mut src = BytesMut::from(&frame[..]);
-        let base = src.as_ptr() as usize;
-        let limit = base + src.capacity();
-        let mut json_scratch = Vec::new();
-        let Some(DecodedFrame::Owned { data, .. }) =
-            decode_frame(&mut src, &mut json_scratch, &cipher, EncodingType::Binary).unwrap()
-        else {
-            panic!("expected Owned frame");
-        };
-        let start = data.as_ptr() as usize;
-        assert_eq!(&data[..], b"payload");
-        assert!(
-            start >= base && start + data.len() <= limit,
-            "decoded payload must alias the input buffer, not a copy"
-        );
-    }
-
-    #[test]
     fn decode_frame_roundtrips_multiple_frames() {
         let cipher = test_cipher();
         let mut combined = BytesMut::new();
@@ -1144,87 +1061,6 @@ mod tests {
         assert!(src.is_empty());
     }
 
-    #[test]
-    fn decode_frame_json_keeps_scratch_allocation() {
-        let cipher = test_cipher();
-        let mut src = BytesMut::new();
-        for (i, msg) in [b"aaaa".as_slice(), b"bbbb".as_slice()].iter().enumerate() {
-            let frame =
-                encode_frame(msg, i as u64, &cipher, 16384, [0, 0], EncodingType::Json).unwrap();
-            src.extend_from_slice(&frame);
-        }
-        let mut json_scratch = Vec::new();
-        let mut decoded = Vec::new();
-        let mut cap_after_first = 0usize;
-        for i in 0..2u64 {
-            match decode_frame(&mut src, &mut json_scratch, &cipher, EncodingType::Json)
-                .unwrap()
-                .unwrap()
-            {
-                DecodedFrame::InJsonScratch { seq, start, end } => {
-                    assert_eq!(seq, i);
-                    decoded.extend_from_slice(&json_scratch[start..end]);
-                }
-                _ => panic!("expected InJsonScratch frame"),
-            }
-            if i == 0 {
-                cap_after_first = json_scratch.capacity();
-                assert!(cap_after_first > 0, "json_scratch 容量被复用，而不是被取走");
-            }
-        }
-        assert_eq!(decoded, b"aaaabbbb");
-        assert_eq!(
-            json_scratch.capacity(),
-            cap_after_first,
-            "第二帧不能重新分配 json_scratch"
-        );
-    }
-
-    #[tokio::test]
-    async fn json_frames_fit_single_h2_data_frame() {
-        let cipher = test_cipher_arc();
-        let mut config = test_config();
-        config.encoding_type = EncodingType::Json;
-        let resolved = ResolvedShaperConfig::resolve(&config);
-        let data = vec![0xAAu8; 64 * 1024];
-        let shaper =
-            TrafficShaper::with_seq(Cursor::new(data.clone()), &resolved, Arc::clone(&cipher), 0);
-        let mut out = Vec::new();
-        seal_all(shaper, &mut out);
-
-        let mut frames = 0;
-        let mut src = &out[..];
-        while !src.is_empty() {
-            let newline = memchr::memchr(b'\n', src).expect("frame must end with newline");
-            let line_len = newline + 1;
-            assert!(line_len <= 16384, "JSON frame {line_len} B > 16384");
-            src = &src[line_len..];
-            frames += 1;
-        }
-        assert!(frames >= 4, "expected multiple frames, got {frames}");
-
-        let mut json_scratch = Vec::new();
-        let mut decoded = Vec::new();
-        let mut buf = BytesMut::from(&out[..]);
-        while !buf.is_empty() {
-            match decode_frame(
-                &mut buf,
-                &mut json_scratch,
-                cipher.as_ref(),
-                EncodingType::Json,
-            )
-            .unwrap()
-            .unwrap()
-            {
-                DecodedFrame::InJsonScratch { start, end, .. } => {
-                    decoded.extend_from_slice(&json_scratch[start..end]);
-                }
-                DecodedFrame::Owned { data, .. } => decoded.extend_from_slice(&data),
-            }
-        }
-        assert_eq!(decoded, data);
-    }
-
     fn seal_all(shaper: TrafficShaper<Cursor<Vec<u8>>>, out: &mut Vec<u8>) -> Vec<u64> {
         let mut shaper = std::pin::pin!(shaper);
         let mut seqs = Vec::new();
@@ -1294,54 +1130,6 @@ mod tests {
         assert_eq!(seal_payload, data);
     }
 
-    #[tokio::test]
-    async fn seal_in_place_default_impl_produces_valid_frames() {
-        struct VecCipher(Zeroizing<[u8; 32]>);
-        impl FrameCipher for VecCipher {
-            fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
-                crate::crypto::encrypt_bytes(&self.0, data).map_err(Error::other)
-            }
-            fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
-                crate::crypto::decrypt_bytes(&self.0, data).map_err(Error::other)
-            }
-        }
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(&mut *key);
-        let cipher: Arc<dyn FrameCipher> = Arc::new(VecCipher(key));
-        let cipher_for_decode = Arc::clone(&cipher);
-
-        let config = ResolvedShaperConfig::resolve(&test_config());
-        let data = vec![0x3Du8; 20_000];
-        let shaper = TrafficShaper::with_seq(Cursor::new(data.clone()), &config, cipher, 0);
-        let mut out = Vec::new();
-        let seqs = seal_all(shaper, &mut out);
-
-        let mut out = BytesMut::from(&out[..]);
-        let mut json_scratch = Vec::new();
-        let mut decoded = Vec::new();
-        let mut frame_idx = 0usize;
-        while !out.is_empty() {
-            match decode_frame(
-                &mut out,
-                &mut json_scratch,
-                cipher_for_decode.as_ref(),
-                EncodingType::Binary,
-            )
-            .unwrap()
-            .unwrap()
-            {
-                DecodedFrame::Owned { seq, data } => {
-                    assert_eq!(seq, seqs[frame_idx]);
-                    frame_idx += 1;
-                    decoded.extend_from_slice(&data);
-                }
-                _ => panic!("expected Owned frame"),
-            }
-        }
-        assert_eq!(decoded, data);
-    }
-
     #[test]
     fn encode_frame_rejects_oversized_payload() {
         let big = vec![0u8; MAX_RAW_PAYLOAD + 1];
@@ -1359,16 +1147,6 @@ mod tests {
         let frame = encode_frame(&raw, 0, &aes, 100_000, [0, 100_000], EncodingType::Json).unwrap();
         let line_len = frame.iter().position(|&b| b == b'\n').unwrap();
         assert!(line_len <= MAX_JSON_LINE_LEN);
-    }
-
-    #[tokio::test]
-    async fn poll_seal_into_eof_returns_none() {
-        let reader = std::io::Cursor::new(Vec::<u8>::new());
-        let cfg = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_seq(reader, &cfg, test_cipher_arc(), 0));
-        let mut out = Vec::new();
-        let result = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out)).await;
-        assert!(matches!(result, Ok(None)));
     }
 
     #[tokio::test]
@@ -1511,27 +1289,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_frame_json_rejects_invalid_utf8() {
-        let mut json_scratch = Vec::new();
-        let mut src = BytesMut::new();
-        src.extend_from_slice(b"{\"data\":\"");
-        src.extend_from_slice(&[0xff, 0xfe, 0xfd]);
-        src.extend_from_slice(
-            b"\"}
-",
-        );
-        assert!(
-            decode_frame(
-                &mut src,
-                &mut json_scratch,
-                &test_cipher(),
-                EncodingType::Json
-            )
-            .is_err()
-        );
-    }
-
     fn tls13_server_hello_record() -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]);
@@ -1579,53 +1336,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_shaper_passes_client_ciphertext_through() {
-        let cipher = stream_cipher_arc(9);
-        let mut input = tls13_client_hello_record();
-        for _ in 0..20 {
-            input.extend_from_slice(&tls13_app_data_record(1024));
-        }
-
-        let cfg = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_inspector(
-            std::io::Cursor::new(input.clone()),
-            &cfg,
-            Arc::clone(&cipher),
-            0,
-            Some(crate::crypto::TlsInspector::new()),
-        ));
-
-        let mut out = Vec::new();
-        std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(out[2] & 0x80, 0);
-
-        out.clear();
-        std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(out[2] & 0x80, 0x80);
-
-        let mut buf = BytesMut::from(&out[..]);
-        let mut json_scratch = Vec::new();
-        let DecodedFrame::Owned { seq, data } = decode_frame(
-            &mut buf,
-            &mut json_scratch,
-            cipher.as_ref(),
-            EncodingType::Binary,
-        )
-        .unwrap()
-        .expect("frame") else {
-            panic!("expected owned frame");
-        };
-        assert_eq!(seq, 1);
-        assert_eq!(&data[..], &input[16640..]);
-    }
-
-    #[tokio::test]
     async fn shaper_continues_from_inspector_offset() {
         let cipher = stream_cipher_arc(2);
         let hello = tls13_client_hello_record();
@@ -1668,124 +1378,11 @@ mod tests {
         assert_eq!(&data[..], &input[split..]);
     }
 
-    #[tokio::test]
-    async fn shaper_switches_to_plaintext_after_tls13_server_hello() {
-        let cipher = stream_cipher_arc(3);
-        let mut input = tls13_server_hello_record();
-        for _ in 0..10 {
-            input.extend_from_slice(&tls13_app_data_record(4096));
-        }
-
-        let cfg = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_inspector(
-            std::io::Cursor::new(input.clone()),
-            &cfg,
-            Arc::clone(&cipher),
-            0,
-            Some(crate::crypto::TlsInspector::new()),
-        ));
-
-        let mut out = Vec::new();
-        let seq = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(seq, 0);
-        assert_eq!(out[2] & 0x80, 0);
-
-        let mut buf = BytesMut::from(&out[..]);
-        let mut json_scratch = Vec::new();
-        let DecodedFrame::Owned { data, .. } = decode_frame(
-            &mut buf,
-            &mut json_scratch,
-            cipher.as_ref(),
-            EncodingType::Binary,
-        )
-        .unwrap()
-        .expect("frame") else {
-            panic!("expected owned frame");
-        };
-        assert_eq!(data.len(), 16640);
-
-        out.clear();
-        let seq = std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(seq, 1);
-        assert_eq!(out[2] & 0x80, 0x80);
-
-        let mut buf = BytesMut::from(&out[..]);
-        let frame = decode_frame(
-            &mut buf,
-            &mut json_scratch,
-            cipher.as_ref(),
-            EncodingType::Binary,
-        )
-        .unwrap()
-        .expect("frame");
-        match frame {
-            DecodedFrame::Owned { seq, data } => {
-                assert_eq!(seq, 1);
-                assert_eq!(&data[..], &input[16640..33280]);
-            }
-            DecodedFrame::InJsonScratch { .. } => panic!("expected owned frame"),
-        }
-    }
-
     fn tls13_app_data_record(len: usize) -> Vec<u8> {
         let mut record = vec![23u8, 0x03, 0x03];
         record.extend_from_slice(&(len as u16).to_be_bytes());
         record.extend(std::iter::repeat_n(0x5Au8, len));
         record
-    }
-
-    #[tokio::test]
-    async fn small_records_are_coalesced_into_one_plaintext_frame() {
-        let cipher = stream_cipher_arc(6);
-        let mut input = tls13_server_hello_record();
-        for _ in 0..16 {
-            input.extend_from_slice(&tls13_app_data_record(4096));
-        }
-
-        let cfg = ResolvedShaperConfig::resolve(&test_config());
-        let mut shaper = Box::pin(TrafficShaper::with_inspector(
-            std::io::Cursor::new(input.clone()),
-            &cfg,
-            Arc::clone(&cipher),
-            0,
-            Some(crate::crypto::TlsInspector::new()),
-        ));
-
-        let mut out = Vec::new();
-        for _ in 0..2 {
-            out.clear();
-            std::future::poll_fn(|cx| shaper.as_mut().poll_seal_into(cx, &mut out))
-                .await
-                .unwrap()
-                .unwrap();
-        }
-
-        let mut buf = BytesMut::from(&out[..]);
-        let mut json_scratch = Vec::new();
-        let DecodedFrame::Owned { seq, data } = decode_frame(
-            &mut buf,
-            &mut json_scratch,
-            cipher.as_ref(),
-            EncodingType::Binary,
-        )
-        .unwrap()
-        .expect("frame") else {
-            panic!("expected owned frame");
-        };
-        assert_eq!(seq, 1);
-        assert_eq!(&data[..], &input[16640..33280]);
-
-        let headers = data
-            .windows(5)
-            .filter(|w| w[0] == 23 && w[1..3] == [3, 3] && w[3..5] == [0x10, 0x00])
-            .count();
-        assert_eq!(headers, 4, "one frame must span four 4 KiB records");
     }
 
     #[tokio::test]

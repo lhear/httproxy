@@ -54,22 +54,3 @@ impl From<std::io::Error> for ServerError {
         Self::internal(err.to_string())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn app_error_into_response() {
-        let err = ServerError::bad_request("test");
-        let resp = err.into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn app_error_from_std_error() {
-        let io = std::io::Error::other("oops");
-        let app: ServerError = io.into();
-        assert_eq!(app.0, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-}

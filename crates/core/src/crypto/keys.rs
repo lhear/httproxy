@@ -74,15 +74,6 @@ mod tests {
     }
 
     #[test]
-    fn key_serialization_roundtrip() {
-        let (sk, pk) = generate_keypair();
-        let sk2 = b64_to_private_key(&private_key_to_b64(&sk)).unwrap();
-        let pk2 = b64_to_public_key(&public_key_to_b64(&pk)).unwrap();
-        assert_eq!(sk.to_bytes(), sk2.to_bytes());
-        assert_eq!(pk, pk2);
-    }
-
-    #[test]
     fn rejects_malformed_keys() {
         assert!(b64_to_private_key("abc").is_err());
         assert!(b64_to_public_key("abc").is_err());

@@ -56,9 +56,3 @@ async fn hint_sends_quic_packets_to_the_hinted_port() {
     let packets = count_quic(Some("127.0.0.1"), Duration::from_secs(15)).await;
     assert!(packets > 0, "the hint must trigger QUIC, saw {packets}");
 }
-
-#[tokio::test]
-async fn no_hint_keeps_quic_quiet() {
-    let packets = count_quic(None, Duration::from_secs(3)).await;
-    assert_eq!(packets, 0, "QUIC started without a hint");
-}

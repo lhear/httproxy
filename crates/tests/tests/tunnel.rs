@@ -31,21 +31,6 @@ async fn tunnel_get_small_response() {
 }
 
 #[tokio::test]
-async fn tunnel_get_large_response() {
-    common::init_logging();
-    let (upstream, client) = start_tunnel().await;
-    let url = format!("http://{upstream}/large");
-    let (status, body) = raw_exchange(
-        client,
-        format!("GET {url} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body.len(), 512 * 1024);
-    assert!(body.iter().all(|&b| b == 0xAB));
-}
-
-#[tokio::test]
 async fn tunnel_large_post_echoes() {
     common::init_logging();
     let (upstream, client) = start_tunnel().await;

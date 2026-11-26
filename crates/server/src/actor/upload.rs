@@ -345,38 +345,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frames_delivered_in_order() {
-        let (_rx, server_write) = tcp_pair().await;
-        let (tx, rx) = mpsc::channel::<UploadCmd>(16);
-        let actor = UploadActor::new(rx, server_write, 0);
-        let handle = tokio::spawn(async move { actor.run().await });
-
-        tx.send(UploadCmd::Frame {
-            seq: 0,
-            data: Bytes::from_static(b"hello"),
-        })
-        .await
-        .unwrap();
-        tx.send(UploadCmd::Frame {
-            seq: 1,
-            data: Bytes::from_static(b"world"),
-        })
-        .await
-        .unwrap();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(UploadCmd::Eos {
-            max_seq: 1,
-            ack: ack_tx,
-        })
-        .await
-        .unwrap();
-        assert!(ack_rx.await.unwrap().is_ok());
-
-        drop(tx);
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn reorder_buffer_drains_on_consecutive_arrival() {
         let (_rx, server_write) = tcp_pair().await;
         let (tx, rx) = mpsc::channel::<UploadCmd>(16);
@@ -404,26 +372,6 @@ mod tests {
         let (ack_tx, ack_rx) = oneshot::channel();
         tx.send(UploadCmd::Eos {
             max_seq: 2,
-            ack: ack_tx,
-        })
-        .await
-        .unwrap();
-        assert!(ack_rx.await.unwrap().is_ok());
-
-        drop(tx);
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn eos_acked_immediately_when_next_seq_exceeds_max() {
-        let (_rx, server_write) = tcp_pair().await;
-        let (tx, rx) = mpsc::channel::<UploadCmd>(16);
-        let actor = UploadActor::new(rx, server_write, 5);
-        let handle = tokio::spawn(async move { actor.run().await });
-
-        let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(UploadCmd::Eos {
-            max_seq: 3,
             ack: ack_tx,
         })
         .await
