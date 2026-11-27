@@ -39,36 +39,29 @@ fn build_user_agent(version: &str) -> Option<CString> {
     .ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Http3<'a> {
+    Auto,
+    Hint { host: &'a str, port: u16 },
+    Off,
+}
+
 pub struct Client {
     exec: Arc<Executor>,
 }
 
 impl Client {
     pub fn new(resolve: Option<&str>) -> Result<Arc<Self>> {
-        Self::with_options(resolve, None, false)
+        Self::with_options(resolve, None, Http3::Auto)
     }
 
     pub fn with_options(
         resolve: Option<&str>,
         trusted_pem: Option<&[u8]>,
-        disable_http3: bool,
-    ) -> Result<Arc<Self>> {
-        Self::with_http3_options(resolve, trusted_pem, disable_http3, None)
-    }
-
-    pub fn with_http3_options(
-        resolve: Option<&str>,
-        trusted_pem: Option<&[u8]>,
-        disable_http3: bool,
-        http3_hint: Option<(&str, u16)>,
+        http3: Http3<'_>,
     ) -> Result<Arc<Self>> {
         sys::load().map_err(|error| anyhow!(error))?;
-        let engine = Arc::new(Engine::start(
-            resolve,
-            trusted_pem,
-            disable_http3,
-            http3_hint,
-        )?);
+        let engine = Arc::new(Engine::start(resolve, trusted_pem, http3)?);
         let callback = Arc::new(Callback::new()?);
         let exec = Executor::new(Arc::clone(&engine), Arc::clone(&callback))?;
         Ok(Arc::new(Self { exec }))
@@ -94,19 +87,14 @@ impl Client {
 pub(crate) struct Engine(Ptr, AtomicBool);
 
 impl Engine {
-    fn start(
-        resolve: Option<&str>,
-        trusted: Option<&[u8]>,
-        disable_http3: bool,
-        http3_hint: Option<(&str, u16)>,
-    ) -> Result<Self> {
-        if disable_http3 && http3_hint.is_some() {
-            bail!("cronet: an HTTP/3 hint cannot be used while HTTP/3 is disabled");
-        }
-        let http3_hint_host = http3_hint
-            .map(|(host, port)| CString::new(host).map(|host| (host, port)))
-            .transpose()
-            .context("cronet: invalid HTTP/3 hint host")?;
+    fn start(resolve: Option<&str>, trusted: Option<&[u8]>, http3: Http3<'_>) -> Result<Self> {
+        let http3_hint = match http3 {
+            Http3::Hint { host, port } => Some((
+                CString::new(host).context("cronet: invalid HTTP/3 hint host")?,
+                port,
+            )),
+            Http3::Auto | Http3::Off => None,
+        };
         let options = resolve.map(experimental_options).transpose()?;
         let api = sys::api();
         let engine = api.engine_create();
@@ -123,12 +111,12 @@ impl Engine {
             api.engine_destroy(engine);
             bail!("cronet: engine params create failed");
         }
-        api.engine_params_quic(params, !disable_http3);
+        api.engine_params_quic(params, http3 != Http3::Off);
         api.engine_params_http2(params, true);
         api.engine_params_brotli(params, true);
         api.engine_params_cache_mode(params, sys::HTTP_CACHE_DISABLED);
         api.engine_params_user_agent(params, user_agent.as_ptr());
-        if let Some((host, port)) = http3_hint_host {
+        if let Some((host, port)) = http3_hint {
             let hint = api.quic_hint_create();
             if hint.is_null() {
                 api.engine_params_destroy(params);
@@ -406,9 +394,17 @@ mod tests {
 
     #[test]
     fn http3_hint_starts_an_engine_and_rejects_a_bad_host() {
-        drop(Client::with_http3_options(None, None, false, Some(("example.com", 443))).unwrap());
+        let hint = Http3::Hint {
+            host: "example.com",
+            port: 443,
+        };
+        drop(Client::with_options(None, None, hint).unwrap());
 
-        let error = Client::with_http3_options(None, None, false, Some(("exa\0mple.com", 443)))
+        let bad = Http3::Hint {
+            host: "exa\0mple.com",
+            port: 443,
+        };
+        let error = Client::with_options(None, None, bad)
             .err()
             .expect("a host with an interior nul byte must be rejected");
         assert!(
@@ -453,13 +449,13 @@ mod tests {
         let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
-        let client = Client::with_options(None, Some(cert.pem().as_bytes()), false);
+        let client = Client::with_options(None, Some(cert.pem().as_bytes()), Http3::Auto);
         assert!(client.is_ok(), "{:?}", client.err().map(|e| e.to_string()));
     }
 
     #[test]
     fn an_invalid_custom_root_is_rejected() {
-        let error = Client::with_options(None, Some(b"not a certificate"), false)
+        let error = Client::with_options(None, Some(b"not a certificate"), Http3::Auto)
             .err()
             .expect("an unparsable root store must be rejected");
         assert!(

@@ -58,6 +58,21 @@ pub struct ServerSection {
     pub private_key: String,
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Http3Mode {
+    Auto,
+    Hint,
+    Off,
+}
+
+impl Default for Http3Mode {
+    #[inline]
+    fn default() -> Self {
+        Http3Mode::Auto
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ClientSection {
@@ -68,9 +83,7 @@ pub struct ClientSection {
     #[serde(default)]
     pub proxy_auth: Option<ClientProxyAuth>,
     #[serde(default)]
-    pub disable_http3: bool,
-    #[serde(default)]
-    pub http3_hint: bool,
+    pub http3: Http3Mode,
 }
 
 #[derive(Deserialize, Debug, Clone)]

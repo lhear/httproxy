@@ -56,8 +56,7 @@ listen = "127.0.0.1:8080"
 remote = "https://your-server-domain/YOUR_SECRET_PATH"
 public_key = "your-public-key"       # required (§1.2)
 # address = "your-server-ip"
-# disable_http3 = false
-# http3_hint = false
+# http3 = "auto"                     # "auto" | "hint" | "off"
 
 # [client.proxy_auth]                # local proxy basic auth (§2.2)
 # username = "proxyuser"
@@ -90,8 +89,7 @@ padding_threshold = 500
 | `address`             | string  | no       | system DNS  | Connection address override. TLS SNI and `Host` still use the `remote` domain. |
 | `public_key`          | string  | yes      | —           | Server's X25519 public key; required for the tunnel handshake. |
 | `proxy_auth`          | table   | no       | —           | Local proxy authentication (§2.2). |
-| `disable_http3`       | boolean | no       | `false`     | Set `true` to turn HTTP/3 off; the tunnel then falls back to HTTP/2 over TCP. |
-| `http3_hint`         | boolean | no       | `false`     | Try HTTP/3 for `remote` without waiting for `alt-svc`. Requires HTTPS and conflicts with `disable_http3`; Cronet may still fall back to HTTP/2. |
+| `http3`               | string  | no       | `"auto"`    | HTTP/3 policy: `"auto"` follows `alt-svc`, `"hint"` races QUIC for `remote` (HTTPS only), `"off"` forces HTTP/2 over TCP. |
 
 ### 2.2 `[client.proxy_auth]` — Local Proxy Authentication
 

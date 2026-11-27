@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use httproxy_core::config::{
-    AuthSection, BypassConfig, ClientAuthSection, ClientSection, ClientTopConfig, ServerSection,
-    ServerTopConfig,
+    AuthSection, BypassConfig, ClientAuthSection, ClientSection, ClientTopConfig, Http3Mode,
+    ServerSection, ServerTopConfig,
 };
 use httproxy_core::shaper::{EncodingType, TrafficConfig};
 use std::collections::HashMap;
@@ -91,8 +91,7 @@ pub fn client_config(
             address: None,
             public_key: keys.public_key.clone(),
             proxy_auth: None,
-            disable_http3: false,
-            http3_hint: false,
+            http3: Http3Mode::Auto,
         },
         auth: ClientAuthSection {
             token: token.unwrap_or_else(valid_token),

@@ -11,8 +11,8 @@ pub mod state;
 pub mod utils;
 
 use crate::constants::{MAX_IN_FLIGHT_BYTES, MAX_LOCAL_CONNECTIONS, UPLOAD_CONCURRENCY};
-use crate::cronet::Client;
-use httproxy_core::config::ClientTopConfig;
+use crate::cronet::{Client, Http3};
+use httproxy_core::config::{ClientTopConfig, Http3Mode};
 use httproxy_core::crypto;
 use httproxy_core::shaper::ResolvedShaperConfig;
 
@@ -34,35 +34,24 @@ pub fn build_http_client(
             "trusting only the supplied certificate; the built-in Mozilla roots are disabled"
         );
     }
-    if cfg.client.disable_http3 && cfg.client.http3_hint {
-        bail!("client.disable_http3 and client.http3_hint cannot both be enabled");
-    }
-    let http3_hint = if cfg.client.http3_hint {
-        let remote: url::Url = cfg.client.remote.parse().context("invalid client.remote")?;
-        if remote.scheme() != "https" {
-            bail!("client.http3_hint requires an https client.remote");
+    let remote: url::Url = cfg.client.remote.parse().context("invalid client.remote")?;
+    let http3 = match cfg.client.http3 {
+        Http3Mode::Off => Http3::Off,
+        Http3Mode::Auto => Http3::Auto,
+        Http3Mode::Hint => {
+            if remote.scheme() != "https" {
+                bail!("client.http3 = \"hint\" requires an https client.remote");
+            }
+            Http3::Hint {
+                host: remote.host_str().context("client.remote has no host")?,
+                port: remote
+                    .port_or_known_default()
+                    .context("client.remote has no port")?,
+            }
         }
-        Some((
-            remote
-                .host_str()
-                .context("client.remote has no host")?
-                .to_owned(),
-            remote
-                .port_or_known_default()
-                .context("client.remote has no port")?,
-        ))
-    } else {
-        None
     };
-    Client::with_http3_options(
-        cfg.client.address.as_deref(),
-        trusted_pem.as_deref(),
-        cfg.client.disable_http3,
-        http3_hint
-            .as_ref()
-            .map(|(host, port)| (host.as_str(), *port)),
-    )
-    .context("failed to start cronet engine")
+    Client::with_options(cfg.client.address.as_deref(), trusted_pem.as_deref(), http3)
+        .context("failed to start cronet engine")
 }
 
 fn read_trusted_cert(path: &Path) -> Result<Vec<u8>> {
@@ -174,14 +163,10 @@ padding_threshold = 50
     }
 
     #[test]
-    fn http3_hint_requires_https_and_conflicts_with_disable_http3() {
+    fn http3_hint_requires_an_https_remote() {
         let mut cfg = minimal_client_cfg();
         cfg.client.remote = "http://example.com/secret".to_owned();
-        cfg.client.http3_hint = true;
-        assert!(build_http_client(&cfg, None).is_err());
-
-        cfg.client.remote = "https://example.com/secret".to_owned();
-        cfg.client.disable_http3 = true;
+        cfg.client.http3 = Http3Mode::Hint;
         assert!(build_http_client(&cfg, None).is_err());
     }
 }

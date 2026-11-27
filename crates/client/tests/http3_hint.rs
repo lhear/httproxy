@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use httproxy_client::cronet::Client;
+use httproxy_client::cronet::{Client, Http3};
 use tokio::net::{TcpListener, UdpSocket};
 
 fn is_quic_initial(packet: &[u8]) -> bool {
@@ -32,8 +32,11 @@ async fn count_quic(hint: Option<&str>, window: Duration) -> usize {
         }
     });
 
-    let client = Client::with_http3_options(None, None, false, hint.map(|host| (host, port)))
-        .expect("cronet engine");
+    let http3 = match hint {
+        Some(host) => Http3::Hint { host, port },
+        None => Http3::Auto,
+    };
+    let client = Client::with_options(None, None, http3).expect("cronet engine");
     let url = format!("https://127.0.0.1:{port}/probe");
     let request = tokio::spawn(async move {
         let _ = client
