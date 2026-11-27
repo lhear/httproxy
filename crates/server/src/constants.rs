@@ -27,7 +27,7 @@ pub const SEGMENT_DONE_CHANNEL_CAPACITY: usize = 2;
 pub const TUNNEL_CMD_CHANNEL_CAPACITY: usize = 32;
 pub const UPLOAD_CMD_CHANNEL_CAPACITY: usize = 8;
 
-pub const MAX_TUNNELS: usize = 1024;
+pub const MAX_TUNNELS_PER_USER: usize = 256;
 pub const MAX_SESSIONS: usize = 65_536;
 
 pub const MASTER_EXPIRY: Duration = Duration::from_secs(1200);

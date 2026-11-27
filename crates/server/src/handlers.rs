@@ -98,20 +98,24 @@ impl TunnelGuard {
     }
 }
 
-async fn setup_tunnel_response(
-    state: &Arc<AppState>,
+struct TunnelRequest {
+    user: Arc<str>,
     body: Body,
-    host: &str,
+    host: String,
     port: u16,
     stream_id: Uuid,
     upload_cipher: Arc<dyn FrameCipher>,
     download_cipher: Arc<dyn FrameCipher>,
+}
+
+async fn setup_tunnel_response(
+    state: &Arc<AppState>,
+    request: TunnelRequest,
 ) -> Result<Response, ServerError> {
     let tunnel_permit = state
-        .tunnel_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ServerError::service_unavailable("too many concurrent tunnels"))?;
+        .tunnel_quota
+        .try_acquire(&request.user)
+        .ok_or_else(|| ServerError::service_unavailable("too many concurrent tunnels"))?;
 
     let encoding = state.traffic_config.encoding_type;
 
@@ -122,18 +126,20 @@ async fn setup_tunnel_response(
 
     let (actor_tx, actor_rx) = tokio::sync::mpsc::channel::<TunnelCmd>(TUNNEL_CMD_CHANNEL_CAPACITY);
 
-    let upstream = open_upstream(state, host, port).await?;
+    let upstream = open_upstream(state, &request.host, request.port).await?;
 
     let (upstream_read, upstream_write) = upstream.into_split();
 
     let (upload_tx, upload_handle) = spawn_upload_actor(upstream_write);
-    pump_initial_body(body, &upload_tx, upload_cipher.clone(), encoding).await?;
+
+    let upload_cipher = request.upload_cipher;
+    pump_initial_body(request.body, &upload_tx, upload_cipher.clone(), encoding).await?;
 
     let upload_tx_for_actor = upload_tx.clone();
 
     let mut actor = crate::actor::tunnel::TunnelActor::new(
         actor_rx,
-        stream_id,
+        request.stream_id,
         Arc::clone(&state.stream_registry),
         max_download_bytes,
         Arc::clone(&last_activity),
@@ -144,7 +150,7 @@ async fn setup_tunnel_response(
         upstream_read,
         None,
         &state.resolved_traffic,
-        download_cipher,
+        request.download_cipher,
         0,
         Some(TlsInspector::new()),
     );
@@ -161,10 +167,10 @@ async fn setup_tunnel_response(
         upload_cipher,
         encoding,
     };
-    state.actors.insert(stream_id, handle);
-    let mut early_guard = ActorGuard::new(Arc::clone(&state.actors), stream_id);
+    state.actors.insert(request.stream_id, handle);
+    let mut early_guard = ActorGuard::new(Arc::clone(&state.actors), request.stream_id);
 
-    let key = stream_id;
+    let key = request.stream_id;
     let actors_ref2 = Arc::clone(&state.actors);
     let actor_handle = tokio::spawn(
         async move {
@@ -372,12 +378,15 @@ async fn spawn_encrypted_tunnel(
 
     let response = setup_tunnel_response(
         &state,
-        body,
-        host,
-        port,
-        stream_id,
-        upload_cipher,
-        download_cipher,
+        TunnelRequest {
+            user: username,
+            body,
+            host: host.to_owned(),
+            port,
+            stream_id,
+            upload_cipher,
+            download_cipher,
+        },
     )
     .await?;
 

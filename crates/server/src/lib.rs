@@ -7,6 +7,7 @@ pub mod janitor;
 pub mod stream;
 pub mod stream_registry;
 pub mod token;
+pub mod tunnel_quota;
 pub mod upstream;
 pub mod utils;
 
@@ -29,16 +30,17 @@ use std::{
     },
 };
 use stream_registry::StreamRegistry;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+use tunnel_quota::TunnelQuota;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::actor::tunnel::TunnelCmd;
 use crate::actor::upload::UploadCmd;
-use crate::constants::{MAX_SESSIONS, MAX_TUNNELS, TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
+use crate::constants::{MAX_SESSIONS, TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
 
 pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
 
@@ -70,7 +72,7 @@ pub struct AppState {
     pub max_sessions: usize,
     pub stream_registry: Arc<StreamRegistry>,
     pub actors: Arc<DashMap<Uuid, SessionHandle>>,
-    pub tunnel_semaphore: Arc<Semaphore>,
+    pub tunnel_quota: Arc<TunnelQuota>,
     pub stream_id_counter: Arc<AtomicU64>,
     pub token_cache: moka::future::Cache<Box<str>, Arc<str>>,
 }
@@ -114,7 +116,6 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
     let token_key = token::key_from_secret(config.auth.secret.as_bytes());
     config.auth.secret.zeroize();
 
-    let max_tunnels = config.server.max_tunnels.unwrap_or(MAX_TUNNELS);
     let max_sessions = config.server.max_sessions.unwrap_or(MAX_SESSIONS);
 
     Ok(Arc::new(AppState {
@@ -134,7 +135,7 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         max_sessions,
         stream_registry: Arc::new(StreamRegistry::new()),
         actors: Arc::new(DashMap::new()),
-        tunnel_semaphore: Arc::new(Semaphore::new(max_tunnels)),
+        tunnel_quota: Arc::new(TunnelQuota::new()),
         stream_id_counter: Arc::new(AtomicU64::new(1)),
         token_cache: moka::future::Cache::builder()
             .max_capacity(TOKEN_CACHE_CAPACITY)
