@@ -18,9 +18,8 @@ pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
 pub const BATCH_BUF_INITIAL_CAPACITY: usize = 32 * 1024;
 pub const MAX_IN_FLIGHT_BYTES: usize = 2 * 1024 * 1024;
 pub const UPLOAD_CONCURRENCY: usize = 128;
-pub const MIN_IN_FLIGHT_BYTES: usize = 20 * 1024;
 
-pub const MAX_LOCAL_CONNECTIONS: usize = 1024;
+pub const MAX_LOCAL_CONNECTIONS: usize = 256;
 pub const PREFETCH_LEAD_BYTES: u64 = 20 * 1024 * 1024;
 
 pub const PREFETCH_ROTATE_TIMEOUT: Duration = Duration::from_secs(5);

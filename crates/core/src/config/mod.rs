@@ -72,12 +72,6 @@ pub struct ClientSection {
     #[serde(default)]
     pub proxy_auth: Option<ClientProxyAuth>,
     #[serde(default)]
-    pub max_connections: Option<usize>,
-    #[serde(default)]
-    pub max_in_flight_bytes: Option<usize>,
-    #[serde(default)]
-    pub upload_concurrency: Option<usize>,
-    #[serde(default)]
     pub disable_http3: bool,
     #[serde(default)]
     pub http3_hint: bool,
