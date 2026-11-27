@@ -585,7 +585,7 @@ async fn handle_fresh_handshake(
 
     let session_id = Uuid::new_v4().to_string();
     let now = httproxy_core::monotonic_secs();
-    janitor::ensure_session_capacity(&state.master_store, now, state.max_sessions);
+    janitor::ensure_user_session_quota(&state.master_store, &user, now);
     state
         .master_store
         .insert(session_id.clone(), (user, master, now));

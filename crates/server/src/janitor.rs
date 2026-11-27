@@ -3,7 +3,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::SessionHandle;
-use crate::constants::{JANITOR_INTERVAL, MASTER_CLEANUP_INTERVAL, MASTER_EXPIRY, monotonic_secs};
+use crate::constants::{
+    JANITOR_INTERVAL, MASTER_CLEANUP_INTERVAL, MASTER_EXPIRY, MAX_SESSIONS_PER_USER, monotonic_secs,
+};
 use crate::stream_registry::StreamRegistry;
 
 pub async fn master_and_stream_janitor(
@@ -52,47 +54,34 @@ pub fn prune_expired_masters(
     pruned
 }
 
-const EVICT_BATCH_DIVISOR: usize = 8;
-
-pub fn ensure_session_capacity(
+pub fn ensure_user_session_quota(
     master_store: &DashMap<String, super::MasterStoreEntry>,
+    user: &str,
     now: u64,
-    capacity: usize,
 ) {
-    if master_store.len() < capacity {
-        return;
-    }
-    prune_expired_masters(master_store, now);
-    if master_store.len() < capacity {
-        return;
-    }
-    let batch = (capacity / EVICT_BATCH_DIVISOR).max(1);
-    let evicted = evict_oldest_sessions(master_store, batch);
-    tracing::debug!(
-        capacity,
-        evicted,
-        "master session store full, evicted oldest sessions"
-    );
-}
+    let expiry_limit = MASTER_EXPIRY.as_secs();
+    let mut live: Vec<(u64, String)> = master_store
+        .iter()
+        .filter(|entry| {
+            let (owner, _, created) = entry.value();
+            owner.as_ref() == user && now.saturating_sub(*created) < expiry_limit
+        })
+        .map(|entry| (entry.value().2, entry.key().clone()))
+        .collect();
 
-fn evict_oldest_sessions(
-    master_store: &DashMap<String, super::MasterStoreEntry>,
-    count: usize,
-) -> usize {
-    let mut created: Vec<u64> = master_store.iter().map(|entry| entry.value().2).collect();
-    if created.is_empty() {
-        return 0;
+    if live.len() < MAX_SESSIONS_PER_USER {
+        return;
     }
-    let index = count.min(created.len()) - 1;
-    let (_, cutoff, _) = created.select_nth_unstable(index);
-    let cutoff = *cutoff;
-    let mut evicted = 0;
-    master_store.retain(|_, (_, _, ts)| {
-        let keep = *ts > cutoff;
-        evicted += usize::from(!keep);
-        keep
-    });
-    evicted
+
+    let evict = live.len() - MAX_SESSIONS_PER_USER + 1;
+    live.select_nth_unstable(evict - 1);
+    live.truncate(evict);
+    let evicted = live
+        .into_iter()
+        .filter(|(_, key)| master_store.remove(key).is_some())
+        .count();
+
+    tracing::debug!(user, evicted, "evicted oldest sessions over user quota");
 }
 
 pub fn prune_dead_actors(actors: &DashMap<Uuid, SessionHandle>) -> usize {
@@ -169,43 +158,90 @@ mod tests {
         assert!(store.contains_key("fresh"));
     }
 
-    fn insert_session(store: &DashMap<String, crate::MasterStoreEntry>, key: &str, created: u64) {
+    fn insert_session(
+        store: &DashMap<String, crate::MasterStoreEntry>,
+        key: &str,
+        user: &str,
+        created: u64,
+    ) {
         store.insert(
             key.to_string(),
             (
-                Arc::<str>::from("u"),
+                Arc::<str>::from(user),
                 zeroize::Zeroizing::new([0u8; 32]),
                 created,
             ),
         );
     }
 
-    #[test]
-    fn ensure_session_capacity_prunes_expired_before_evicting() {
-        let store = DashMap::new();
-        let now = 10_000u64;
-        insert_session(&store, "expired", now - MASTER_EXPIRY.as_secs());
-        insert_session(&store, "fresh-a", now - 10);
-        insert_session(&store, "fresh-b", now - 5);
-        ensure_session_capacity(&store, now, 3);
-        assert_eq!(store.len(), 2);
-        assert!(!store.contains_key("expired"));
-        assert!(store.contains_key("fresh-a"));
-        assert!(store.contains_key("fresh-b"));
+    fn count_user(store: &DashMap<String, crate::MasterStoreEntry>, user: &str) -> usize {
+        store
+            .iter()
+            .filter(|entry| entry.value().0.as_ref() == user)
+            .count()
     }
 
     #[test]
-    fn ensure_session_capacity_evicts_oldest_when_full() {
+    fn user_quota_evicts_oldest_of_that_user_only() {
         let store = DashMap::new();
         let now = 50_000u64;
-        for i in 0..16u64 {
-            insert_session(&store, &format!("s{i:02}"), now - 100 + i);
+        for i in 0..MAX_SESSIONS_PER_USER as u64 {
+            insert_session(&store, &format!("a{i:02}"), "alice", now - 1000 + i);
         }
-        ensure_session_capacity(&store, now, 16);
-        assert_eq!(store.len(), 14);
-        assert!(!store.contains_key("s00"));
-        assert!(!store.contains_key("s01"));
-        assert!(store.contains_key("s15"));
+        for i in 0..3u64 {
+            insert_session(&store, &format!("b{i:02}"), "bob", now - 1000 + i);
+        }
+
+        ensure_user_session_quota(&store, "alice", now);
+        assert!(!store.contains_key("a00"));
+        assert!(store.contains_key("a01"));
+        assert_eq!(count_user(&store, "alice"), MAX_SESSIONS_PER_USER - 1);
+        assert_eq!(count_user(&store, "bob"), 3);
+    }
+
+    #[test]
+    fn user_quota_evicts_exactly_one_when_timestamps_tie() {
+        let store = DashMap::new();
+        let now = 50_000u64;
+        for i in 0..MAX_SESSIONS_PER_USER {
+            insert_session(&store, &format!("s{i:02}"), "alice", now);
+        }
+
+        ensure_user_session_quota(&store, "alice", now);
+        assert_eq!(store.len(), MAX_SESSIONS_PER_USER - 1);
+    }
+
+    #[test]
+    fn user_quota_ignores_expired_sessions() {
+        let store = DashMap::new();
+        let now = 50_000u64;
+        let expired_at = now - MASTER_EXPIRY.as_secs() - 1;
+        for i in 0..MAX_SESSIONS_PER_USER as u64 {
+            insert_session(&store, &format!("stale{i:02}"), "alice", expired_at);
+        }
+        for i in 0..(MAX_SESSIONS_PER_USER - 1) as u64 {
+            insert_session(&store, &format!("live{i:02}"), "alice", now - 10 + i);
+        }
+
+        ensure_user_session_quota(&store, "alice", now);
+        assert_eq!(store.len(), MAX_SESSIONS_PER_USER * 2 - 1);
+        for i in 0..(MAX_SESSIONS_PER_USER - 1) as u64 {
+            assert!(store.contains_key(&format!("live{i:02}")));
+        }
+    }
+
+    #[test]
+    fn user_quota_evicts_enough_sessions_to_admit_one() {
+        let store = DashMap::new();
+        let now = 50_000u64;
+        for i in 0..MAX_SESSIONS_PER_USER + 8 {
+            insert_session(&store, &format!("s{i:02}"), "alice", now - 500 + i as u64);
+        }
+
+        ensure_user_session_quota(&store, "alice", now);
+        assert_eq!(store.len(), MAX_SESSIONS_PER_USER - 1);
+        assert!(!store.contains_key("s08"));
+        assert!(store.contains_key("s09"));
     }
 
     #[test]

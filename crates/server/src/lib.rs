@@ -40,7 +40,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::actor::tunnel::TunnelCmd;
 use crate::actor::upload::UploadCmd;
-use crate::constants::{MAX_SESSIONS, TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
+use crate::constants::{TOKEN_CACHE_CAPACITY, TOKEN_CACHE_TTL};
 
 pub type MasterStoreEntry = (Arc<str>, Zeroizing<[u8; 32]>, u64);
 
@@ -69,7 +69,6 @@ pub struct AppState {
     pub resolved_traffic: Arc<ResolvedShaperConfig>,
     pub private_key: Arc<crypto::StaticSecret>,
     pub master_store: Arc<DashMap<String, MasterStoreEntry>>,
-    pub max_sessions: usize,
     pub stream_registry: Arc<StreamRegistry>,
     pub actors: Arc<DashMap<Uuid, SessionHandle>>,
     pub tunnel_quota: Arc<TunnelQuota>,
@@ -116,8 +115,6 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
     let token_key = token::key_from_secret(config.auth.secret.as_bytes());
     config.auth.secret.zeroize();
 
-    let max_sessions = config.server.max_sessions.unwrap_or(MAX_SESSIONS);
-
     Ok(Arc::new(AppState {
         token_key: Arc::new(token_key),
         socks5_proxy: config
@@ -132,7 +129,6 @@ pub async fn build_state(config: &mut ServerTopConfig) -> anyhow::Result<Arc<App
         resolved_traffic: Arc::new(ResolvedShaperConfig::resolve(&config.traffic_shaping)),
         private_key: Arc::new(private_key),
         master_store: Arc::new(DashMap::new()),
-        max_sessions,
         stream_registry: Arc::new(StreamRegistry::new()),
         actors: Arc::new(DashMap::new()),
         tunnel_quota: Arc::new(TunnelQuota::new()),
