@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn start_tunnel() -> (SocketAddr, SocketAddr) {
     let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys)).await;
     let client = spawn_client(
         client_config(traffic(true, None), &keys, None, vec![]),
         server,
@@ -70,7 +70,7 @@ async fn session_resumption_reuses_ticket() {
     common::init_logging();
     let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys)).await;
     let client = spawn_client(
         client_config(traffic(true, None), &keys, None, vec![]),
         server,

@@ -60,18 +60,12 @@ pub fn test_keys() -> TestKeys {
     }
 }
 
-pub fn server_config(
-    traffic: TrafficConfig,
-    keys: &TestKeys,
-    max_tunnels: Option<usize>,
-) -> ServerTopConfig {
+pub fn server_config(traffic: TrafficConfig, keys: &TestKeys) -> ServerTopConfig {
     ServerTopConfig {
         server: ServerSection {
             listen: "127.0.0.1:0".to_string(),
             path: PATH.to_string(),
             private_key: keys.private_key.clone(),
-            max_tunnels,
-            max_sessions: None,
         },
         auth: AuthSection {
             secret: SECRET.to_string(),

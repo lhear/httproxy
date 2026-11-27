@@ -10,7 +10,7 @@ async fn bad_token_rejected() {
     common::init_logging();
     let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys)).await;
     let client = spawn_client(
         client_config(
             traffic(true, None),
@@ -36,7 +36,7 @@ async fn bad_token_rejected() {
 async fn unreachable_upstream_yields_connection_error() {
     common::init_logging();
     let keys = test_keys();
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys)).await;
     let client = spawn_client(
         client_config(traffic(true, None), &keys, None, vec![]),
         server,
@@ -65,7 +65,7 @@ async fn handshake_survives_max_padding() {
     traffic.handshake = Some(httproxy_core::shaper::HandshakePadding {
         padding_range: [14_000, 14_000],
     });
-    let server = spawn_server(server_config(traffic.clone(), &keys, None)).await;
+    let server = spawn_server(server_config(traffic.clone(), &keys)).await;
     let client = spawn_client(client_config(traffic, &keys, None, vec![]), server).await;
 
     let url = format!("http://{upstream}/hello");
@@ -80,7 +80,7 @@ async fn concurrent_tunnels_work_independently() {
     common::init_logging();
     let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys)).await;
     let client = spawn_client(
         client_config(traffic(true, None), &keys, None, vec![]),
         server,
@@ -104,52 +104,11 @@ async fn concurrent_tunnels_work_independently() {
 }
 
 #[tokio::test]
-async fn tunnel_admission_limit_rejects_excess() {
-    common::init_logging();
-    let keys = test_keys();
-    let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, Some(1))).await;
-    let client = spawn_client(
-        client_config(traffic(true, None), &keys, None, vec![]),
-        server,
-    )
-    .await;
-
-    let mut occupied = proxy_connect(client, upstream).await;
-    occupied
-        .write_all(b"GET /hello HTTP/1.1\r\nHost: test\r\n\r\n")
-        .await
-        .unwrap();
-    let (status, body) = read_response(&mut occupied).await;
-    assert_eq!(status, 200);
-    assert_eq!(body, b"hello upstream");
-
-    let small_req =
-        format!("GET http://{upstream}/hello HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-    let mut stream = TcpStream::connect(client).await.unwrap();
-    stream.write_all(small_req.as_bytes()).await.unwrap();
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await.unwrap();
-    assert_eq!(
-        n, 0,
-        "excess tunnel should be rejected (503 -> connection closed)"
-    );
-
-    occupied
-        .write_all(b"GET /hello HTTP/1.1\r\nHost: test\r\n\r\n")
-        .await
-        .unwrap();
-    let (status, body) = read_response(&mut occupied).await;
-    assert_eq!(status, 200);
-    assert_eq!(body, b"hello upstream");
-}
-
-#[tokio::test]
 async fn local_proxy_auth_challenges_and_accepts() {
     common::init_logging();
     let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys)).await;
     let mut cfg = client_config(traffic(true, None), &keys, None, vec![]);
     cfg.client.proxy_auth = Some(httproxy_core::config::ClientProxyAuth {
         username: "proxyuser".to_string(),

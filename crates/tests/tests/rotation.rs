@@ -10,7 +10,6 @@ async fn start_rotating(binary: bool, max_download_bytes: u64) -> (SocketAddr, S
     let server = spawn_server(server_config(
         traffic(binary, Some(max_download_bytes)),
         &keys,
-        None,
     ))
     .await;
     let client = spawn_client(

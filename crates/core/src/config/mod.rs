@@ -56,10 +56,6 @@ pub struct ServerSection {
     pub listen: String,
     pub path: String,
     pub private_key: String,
-    #[serde(default)]
-    pub max_tunnels: Option<usize>,
-    #[serde(default)]
-    pub max_sessions: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]

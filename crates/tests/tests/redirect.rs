@@ -33,7 +33,7 @@ async fn spawn_redirect(
     keys: &common::TestKeys,
 ) -> SocketAddr {
     let echo = spawn_tcp_echo().await;
-    let server = common::spawn_server(common::server_config(traffic.clone(), keys, None)).await;
+    let server = common::spawn_server(common::server_config(traffic.clone(), keys)).await;
 
     let mut cfg = common::client_config(traffic, keys, None, vec![]);
     cfg.redirect = vec![httproxy_core::config::RedirectSection {

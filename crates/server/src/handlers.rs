@@ -669,8 +669,6 @@ mod tests {
                 listen: "127.0.0.1:0".to_string(),
                 path: "/secret".to_string(),
                 private_key: crypto::private_key_to_b64(&private_key),
-                max_tunnels: None,
-                max_sessions: None,
             },
             auth: httproxy_core::config::AuthSection {
                 secret: "test-secret".to_string(),

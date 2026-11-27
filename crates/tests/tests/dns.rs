@@ -11,7 +11,7 @@ fn server_with_dns(
     mock_dns: std::net::SocketAddr,
     keys: &TestKeys,
 ) -> httproxy_core::config::ServerTopConfig {
-    let mut cfg = server_config(traffic(true, None), keys, None);
+    let mut cfg = server_config(traffic(true, None), keys);
     cfg.dns = Some(DnsConfig {
         upstream: mock_dns,
         tls_domain: None,

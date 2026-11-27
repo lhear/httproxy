@@ -239,7 +239,7 @@ async fn start_with_warp_and_dns(
         .await
         .unwrap();
 
-    let mut cfg = server_config(traffic(true, None), &keys, None);
+    let mut cfg = server_config(traffic(true, None), &keys);
     cfg.dns = dns_upstream.map(|upstream| httproxy_core::dns::DnsConfig {
         upstream,
         tls_domain: None,

@@ -19,7 +19,7 @@ fn write_bypass_file(rules: &str) -> String {
 async fn start_bypassed(rules: &str) -> (SocketAddr, SocketAddr) {
     let keys = test_keys();
     let upstream = spawn_upstream().await;
-    let server = spawn_server(server_config(traffic(true, None), &keys, None)).await;
+    let server = spawn_server(server_config(traffic(true, None), &keys)).await;
     let client = spawn_client(
         client_config(
             traffic(true, None),

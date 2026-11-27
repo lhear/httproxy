@@ -210,8 +210,6 @@ mod tests {
                 listen: "0.0.0.0:0".into(),
                 path: "/t".into(),
                 private_key: crypto::private_key_to_b64(&private_key),
-                max_tunnels: None,
-                max_sessions: None,
             },
             auth: AuthSection {
                 secret: "test-key".into(),

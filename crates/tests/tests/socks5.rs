@@ -65,7 +65,7 @@ async fn authenticated_socks_supports_tcp_and_only_udp_dns() {
     )
     .await;
     let dns_target = SocketAddr::from(([127, 0, 0, 1], 53));
-    let mut server_cfg = server_config(traffic(true, None), &keys, None);
+    let mut server_cfg = server_config(traffic(true, None), &keys);
     server_cfg.dns = Some(DnsConfig {
         upstream: dns_addr,
         tls_domain: None,
